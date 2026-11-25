@@ -118,6 +118,12 @@ def init_saccadion_params(cfg: SaccadionConfig, seed: int = 42) -> Dict[str, jnp
         "b_seed_down": u((cfg.seed_rank, d + cx), s_d),
         "b_seed_to_gamma": u((gamma_dim, cfg.seed_rank), 0.1),
         "b_seed_to_cent": u((cfg.acc_dim, cfg.seed_rank), 0.1),
+        # Lobula Dm/Pm Wide-Field 4-Head Retinotopic Spatial Interneurons (64x64 board vision)
+        "b_lob_q": u((d, d), s_d),
+        "b_lob_k": u((d, d), s_d),
+        "b_lob_v": u((d, d), s_d),
+        "b_lob_o": u((d, d), s_d * 0.5),
+        "b_lob_rel": jnp.zeros((4, 64, 64), dtype=jnp.float32),
         # Training-only AOTU -> LAL -> SMP 16-Causal-Concept Effectome Head (zero Rust latency!)
         "aux_causal_w": u((NUM_CAUSAL_CONCEPTS, d + cx), s_d),
         "aux_causal_b": jnp.full((NUM_CAUSAL_CONCEPTS,), -0.5, dtype=jnp.float32),
@@ -226,6 +232,8 @@ def forward_stream_a(
         wdl_logits = wdl_logits + jnp.stack([fast_shift, jnp.zeros_like(fast_shift), -fast_shift], axis=-1)
 
     mbon_summary = mbon_stm - 0.5 * mbon_opp
+    mbon_e = jnp.mean(jnp.abs(mbon_stm[:, :half_mbon]))
+    mbon_i = jnp.mean(jnp.abs(mbon_stm[:, half_mbon:]))
     return {
         "wdl_logits": wdl_logits,
         "lh_veto": lh_veto,
@@ -235,6 +243,8 @@ def forward_stream_a(
         "kc_gamma_stm": kc_gamma_stm,
         "kc_gamma_opp": kc_gamma_opp,
         "active_kc_ratio": active_kc_ratio,
+        "mbon_ei_ratio": mbon_e / (mbon_i + 1e-5),
+        "lh_veto_mean": jnp.mean(lh_veto),
     }
 
 
@@ -283,10 +293,35 @@ def forward_stream_b(
     w_cent = ste_quantize(params["b_cent_w"], 8, qat)
     w_b2s = ste_quantize(params["b_broad_to_sq"], 8, qat)
     w_squpd = ste_quantize(params["b_sq_upd"], 8, qat)
+    w_lq = ste_quantize(params["b_lob_q"], 8, qat)
+    w_lk = ste_quantize(params["b_lob_k"], 8, qat)
+    w_lv = ste_quantize(params["b_lob_v"], 8, qat)
+    w_lo = ste_quantize(params["b_lob_o"], 8, qat)
+    b_lrel = params["b_lob_rel"]
+
+    n_lob_h = 4
+    lob_hd = d // n_lob_h
+    inv_sqrt_hd = float(1.0 / (lob_hd ** 0.5))
+    shunt_gain = jnp.mean(exc.astype(jnp.float32) / (leak + inh.astype(jnp.float32)))
 
     # Weight-tied deliberation loop (unrolled via Python loop for clean per-tick Deep Supervision)
     per_tick_wdl = []
+    lob_focus = jnp.array(0.0, dtype=jnp.float32)
     for _ in range(num_ticks):
+        # Step 0: Lobula Dm/Pm Wide-Field 4-Head Retinotopic Spatial Attention (64x64 board vision!)
+        lq = jnp.einsum("bsd,ed->bse", sq_state, w_lq).reshape((bsz, 64, n_lob_h, lob_hd))
+        lk = jnp.einsum("bsd,ed->bse", sq_state, w_lk).reshape((bsz, 64, n_lob_h, lob_hd))
+        lv = jnp.einsum("bsd,ed->bse", sq_state, w_lv).reshape((bsz, 64, n_lob_h, lob_hd))
+        l_scores = jnp.einsum("buhd,bvhd->bhuv", lq, lk) * inv_sqrt_hd + b_lrel[None, :, :, :]
+        l_attn = jax.nn.softmax(l_scores, axis=-1)
+        lob_focus = jnp.mean(jnp.max(l_attn, axis=-1))  # Sharpness of square-to-square ray focus
+        l_ctx = jnp.einsum("bhuv,bvhd->buhd", l_attn, lv).reshape((bsz, 64, d))
+        sq_state = layer_norm(
+            sq_state + jnp.einsum("bse,de->bsd", l_ctx, w_lo),
+            params["b_sq_ln_g"],
+            params["b_sq_ln_b"],
+        )
+
         # Step A: Integrators Cross-Attention from 64 squares
         int_h = hubs[:, :n_int, :]
         q = jnp.einsum("bhd,ed->bhe", int_h, w_q)
@@ -385,6 +420,7 @@ def forward_stream_b(
     gamma_seed = jnp.einsum("br,gr->bg", seed_latent, params["b_seed_to_gamma"])
     cent_kc_mask = jax.nn.sigmoid(jnp.einsum("br,ar->ba", seed_latent, params["b_seed_to_cent"]))
 
+    plan_entropy = -jnp.mean(jnp.sum(plan_w * jnp.log(jnp.clip(plan_w, 1e-6, 1.0)), axis=-1))
     return {
         "wdl_logits": wdl_logits,
         "per_tick_wdl": per_tick_wdl,
@@ -399,6 +435,14 @@ def forward_stream_b(
         "cent_board_mask": cent_mask_64,
         "gamma_seed": gamma_seed,
         "cent_kc_mask": cent_kc_mask,
+        # Live brain-circuit health diagnostics
+        "shunt_gain": shunt_gain,
+        "lob_focus": lob_focus,
+        "rc_hub_norm": jnp.mean(jnp.sqrt(jnp.sum(hubs ** 2, axis=-1) + 1e-6)),
+        "cx_phasor_norm": jnp.mean(jnp.sqrt(jnp.sum(cx_phasor ** 2, axis=-1) + 1e-6)),
+        "cent_focus": jnp.mean(jnp.std(cent_mask_64, axis=-1)),
+        "plan_entropy": plan_entropy,
+        "pfl2_mean": jnp.mean(pfl2_sharpness),
     }
 
 

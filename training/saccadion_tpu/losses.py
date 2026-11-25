@@ -226,5 +226,15 @@ def compute_multitask_loss(
         "causal_f1": causal_f1,
         "vnc2": loss_vnc2,
         "active_kc_ratio": out_a["active_kc_ratio"],
+        # All-12 Drosophila Brain Circuits live telemetry
+        "shunt_gain": out_b["shunt_gain"],
+        "lob_focus": out_b["lob_focus"],
+        "mbon_ei_ratio": out_a["mbon_ei_ratio"],
+        "lh_veto_mean": out_a["lh_veto_mean"],
+        "rc_hub_norm": out_b["rc_hub_norm"],
+        "cx_phasor_norm": out_b["cx_phasor_norm"],
+        "cent_focus": out_b["cent_focus"],
+        "plan_entropy": out_b["plan_entropy"],
+        "pfl2_mean": out_b["pfl2_mean"],
     }
     return total, metrics

@@ -110,6 +110,14 @@ pub struct SaccadionWeights {
     pub b_seed_down: Vec<f32>,
     pub b_seed_to_gamma: Vec<f32>,
     pub b_seed_to_cent: Vec<f32>,
+
+    /// B6. Lobula Dm/Pm Wide-Field 4-Head Retinotopic Spatial Interneurons (64x64 board vision):
+    /// Links distant squares directly across ranks, files, diagonals, and knight leaps every tick!
+    pub b_lob_q: Vec<f32>,         // [stream_b_dim * stream_b_dim]
+    pub b_lob_k: Vec<f32>,         // [stream_b_dim * stream_b_dim]
+    pub b_lob_v: Vec<f32>,         // [stream_b_dim * stream_b_dim]
+    pub b_lob_o: Vec<f32>,         // [stream_b_dim * stream_b_dim]
+    pub b_lob_rel: Vec<f32>,       // [4 * 64 * 64] learned relative chess-geometry bias
 }
 
 fn rand_uniform_scaled(rng: &mut u64, scale: f32) -> f32 {
@@ -218,6 +226,11 @@ impl SaccadionWeights {
             b_seed_down: alloc_init(cfg.seed_rank * (d + cx), s_d, &mut rng),
             b_seed_to_gamma: alloc_init(gamma_dim * cfg.seed_rank, 0.1, &mut rng),
             b_seed_to_cent: alloc_init(cfg.acc_dim * cfg.seed_rank, 0.1, &mut rng),
+            b_lob_q: alloc_init(d * d, s_d, &mut rng),
+            b_lob_k: alloc_init(d * d, s_d, &mut rng),
+            b_lob_v: alloc_init(d * d, s_d, &mut rng),
+            b_lob_o: alloc_init(d * d, s_d * 0.5, &mut rng),
+            b_lob_rel: vec![0.0; 4 * 64 * 64],
             cfg,
         }
     }
@@ -279,7 +292,12 @@ impl SaccadionWeights {
             + 1
             + self.b_seed_down.len()
             + self.b_seed_to_gamma.len()
-            + self.b_seed_to_cent.len();
+            + self.b_seed_to_cent.len()
+            + self.b_lob_q.len()
+            + self.b_lob_k.len()
+            + self.b_lob_v.len()
+            + self.b_lob_o.len()
+            + self.b_lob_rel.len();
         (sparse, dense)
     }
 
@@ -379,6 +397,11 @@ impl SaccadionWeights {
         write_slice(&mut w, &self.b_seed_down)?;
         write_slice(&mut w, &self.b_seed_to_gamma)?;
         write_slice(&mut w, &self.b_seed_to_cent)?;
+        write_slice(&mut w, &self.b_lob_q)?;
+        write_slice(&mut w, &self.b_lob_k)?;
+        write_slice(&mut w, &self.b_lob_v)?;
+        write_slice(&mut w, &self.b_lob_o)?;
+        write_slice(&mut w, &self.b_lob_rel)?;
 
         w.flush()
     }
@@ -512,6 +535,11 @@ impl SaccadionWeights {
         let b_seed_down = read_vec(&mut r, cfg.seed_rank * (d + cx))?;
         let b_seed_to_gamma = read_vec(&mut r, gamma_dim * cfg.seed_rank)?;
         let b_seed_to_cent = read_vec(&mut r, cfg.acc_dim * cfg.seed_rank)?;
+        let b_lob_q = read_vec(&mut r, d * d)?;
+        let b_lob_k = read_vec(&mut r, d * d)?;
+        let b_lob_v = read_vec(&mut r, d * d)?;
+        let b_lob_o = read_vec(&mut r, d * d)?;
+        let b_lob_rel = read_vec(&mut r, 4 * 64 * 64)?;
 
         Ok(Self {
             cfg,
@@ -573,6 +601,11 @@ impl SaccadionWeights {
             b_seed_down,
             b_seed_to_gamma,
             b_seed_to_cent,
+            b_lob_q,
+            b_lob_k,
+            b_lob_v,
+            b_lob_o,
+            b_lob_rel,
         })
     }
 }

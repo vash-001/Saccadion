@@ -79,6 +79,11 @@ SACCNET_TENSOR_ORDER = [
     "b_seed_down",
     "b_seed_to_gamma",
     "b_seed_to_cent",
+    "b_lob_q",
+    "b_lob_k",
+    "b_lob_v",
+    "b_lob_o",
+    "b_lob_rel",
 ]
 
 
@@ -187,6 +192,11 @@ def init_numpy_params(cfg: SaccadionConfig, seed: int = 1234) -> Dict[str, np.nd
         "b_seed_down": u((cfg.seed_rank, d + cx), s_d),
         "b_seed_to_gamma": u((gamma_dim, cfg.seed_rank), 0.1),
         "b_seed_to_cent": u((cfg.acc_dim, cfg.seed_rank), 0.1),
+        "b_lob_q": u((d, d), s_d),
+        "b_lob_k": u((d, d), s_d),
+        "b_lob_v": u((d, d), s_d),
+        "b_lob_o": u((d, d), s_d * 0.5),
+        "b_lob_rel": np.zeros((4, 64, 64), dtype=np.float32),
     }
 
 
@@ -276,7 +286,20 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
     cx_p = np.zeros((sectors, cx_d), dtype=np.float32)
     inv_sd = 1.0 / np.sqrt(d)
 
+    n_lob_h = 4
+    lob_hd = d // n_lob_h
+    inv_shd = 1.0 / np.sqrt(lob_hd)
+
     for _ in range(cfg.cx_max_ticks):
+        # Step 0: Lobula Dm/Pm Wide-Field 4-Head Retinotopic Attention
+        lq = (sq_state @ params["b_lob_q"].T).reshape(64, n_lob_h, lob_hd)
+        lk = (sq_state @ params["b_lob_k"].T).reshape(64, n_lob_h, lob_hd)
+        lv = (sq_state @ params["b_lob_v"].T).reshape(64, n_lob_h, lob_hd)
+        l_scores = np.einsum("uhd,vhd->huv", lq, lk) * inv_shd + params["b_lob_rel"]
+        l_attn = _softmax(l_scores, axis=-1)
+        l_ctx = np.einsum("huv,vhd->uhd", l_attn, lv).reshape(64, d)
+        sq_state = _ln(sq_state + l_ctx @ params["b_lob_o"].T, params["b_sq_ln_g"], params["b_sq_ln_b"])
+
         int_h = hubs[:n_int]
         q = int_h @ params["b_int_q"].T
         k = sq_state @ params["b_int_k"].T

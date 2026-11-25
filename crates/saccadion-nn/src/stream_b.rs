@@ -112,6 +112,10 @@ pub fn evaluate_stream_b(
     let mut prev_phasor = vec![0.0f32; sectors * cx_d];
 
     // Preallocate tick scratch buffers
+    let mut lob_q = vec![0.0f32; 64 * d];
+    let mut lob_k = vec![0.0f32; 64 * d];
+    let mut lob_v = vec![0.0f32; 64 * d];
+    let mut lob_ctx = vec![0.0f32; 64 * d];
     let mut sq_k = vec![0.0f32; 64 * d];
     let mut sq_v = vec![0.0f32; 64 * d];
     let mut q_buf = vec![0.0f32; d];
@@ -133,16 +137,59 @@ pub fn evaluate_stream_b(
     let mut sq_tmp = vec![0.0f32; d];
     let mut sq_ln = vec![0.0f32; d];
 
+    let n_lob_heads = 4usize;
+    let lob_hd = d / n_lob_heads;
+    let inv_sqrt_hd = 1.0 / (lob_hd as f32).sqrt();
     let inv_sqrt_d = 1.0 / (d as f32).sqrt();
     let mut ticks_used = 0usize;
 
     // -------------------------------------------------------------------------
-    // B2-B4. Weight-Tied Central Complex + Rich-Club Recurrent Deliberation Loop
+    // B2-B4. Weight-Tied Lobula Dm/Pm + Central Complex + Rich-Club Loop
     //        (T = 1..=T_max matching FlyWire's 4.42-hop small-world diameter)
     // -------------------------------------------------------------------------
     for tick in 0..cfg.cx_max_ticks {
         ticks_used = tick + 1;
         prev_phasor.copy_from_slice(&cx_phasor);
+
+        // Step 0: Lobula Dm/Pm Wide-Field 4-Head Retinotopic Spatial Attention (64x64 board vision!)
+        // Direct square-to-square communication for pins, batteries, forks, x-rays, and zugzwang!
+        for sq in 0..64 {
+            let s = &sq_state[sq * d..(sq + 1) * d];
+            matvec(&w.b_lob_q, s, d, d, &mut lob_q[sq * d..(sq + 1) * d]);
+            matvec(&w.b_lob_k, s, d, d, &mut lob_k[sq * d..(sq + 1) * d]);
+            matvec(&w.b_lob_v, s, d, d, &mut lob_v[sq * d..(sq + 1) * d]);
+        }
+        lob_ctx.fill(0.0);
+        for h in 0..n_lob_heads {
+            let h_off = h * lob_hd;
+            let rel_head_off = h * 4096;
+            for u in 0..64 {
+                let qu = &lob_q[u * d + h_off..u * d + h_off + lob_hd];
+                let rel_row = &w.b_lob_rel[rel_head_off + u * 64..rel_head_off + (u + 1) * 64];
+                for v in 0..64 {
+                    let kv = &lob_k[v * d + h_off..v * d + h_off + lob_hd];
+                    attn_scores[v] = dot_f32(qu, kv) * inv_sqrt_hd + rel_row[v];
+                }
+                softmax_inplace(&mut attn_scores);
+                let dst = &mut lob_ctx[u * d + h_off..u * d + h_off + lob_hd];
+                for v in 0..64 {
+                    let a = attn_scores[v];
+                    let vv = &lob_v[v * d + h_off..v * d + h_off + lob_hd];
+                    for j in 0..lob_hd {
+                        dst[j] += a * vv[j];
+                    }
+                }
+            }
+        }
+        for sq in 0..64 {
+            matvec(&w.b_lob_o, &lob_ctx[sq * d..(sq + 1) * d], d, d, &mut o_buf);
+            let cur = &sq_state[sq * d..(sq + 1) * d];
+            for j in 0..d {
+                sq_tmp[j] = cur[j] + o_buf[j];
+            }
+            layer_norm(&sq_tmp, &w.b_sq_ln_g, &w.b_sq_ln_b, &mut sq_ln);
+            sq_state[sq * d..(sq + 1) * d].copy_from_slice(&sq_ln);
+        }
 
         // Step A: Integrators Cross-Attention pulling global board tension from 64 squares
         for sq in 0..64 {

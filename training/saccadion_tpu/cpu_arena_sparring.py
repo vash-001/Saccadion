@@ -326,7 +326,7 @@ class StockfishSparringArena:
         for cand in [
             repo_root / "target" / "release" / "saccadion",
             repo_root / "target" / "release" / "saccadion.exe",
-            Path("/content/drive/MyDrive/Saccadion_TPU/bin_v3/saccadion"),
+            Path("/content/drive/MyDrive/Saccadion_TPU/bin_v4/saccadion"),
         ]:
             if cand.exists():
                 return cand

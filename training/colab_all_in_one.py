@@ -120,9 +120,9 @@ def main() -> None:
     # 3. Install lightweight Python packages
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "optax", "python-chess", "zstandard", "matplotlib"])
 
-    # 4. Build or restore Pure-Rust tools (v3 = STM-oriented moves + 24-thread predecode + live Rust UCI!)
+    # 4. Build or restore Pure-Rust tools (v4 = SACCNET v2 Lobula Dm/Pm + STM move flip + live Rust UCI!)
     if in_colab and BUILD_RUST_TOOLS:
-        _ensure_rust_binaries(work_root, persist_root / "bin_v3")
+        _ensure_rust_binaries(work_root, persist_root / "bin_v4")
 
     # 5. Purge any stale in-memory `saccadion_tpu.*` submodules before importing!
     train_pkg_root = str(work_root / "training")

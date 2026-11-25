@@ -52,7 +52,7 @@ from .cpu_arena_sparring import StockfishSparringArena
 from .dataset import SaccShardDataset
 from .export_rust import export_params_to_saccnet
 from .live_ui import LiveTrainingHUD
-from .losses import compute_multitask_loss, soft_kl_loss
+from .losses import compute_multitask_loss, jepa_vicreg_loss, soft_kl_loss
 from .model import (
     forward_stream_a,
     forward_stream_b,
@@ -107,7 +107,7 @@ def build_muon_adamw_optimizer(
 
     labels = {}
     for k, v in params.items():
-        if k == "a_ft_weight" or v.ndim < 2 or "ln_" in k or "bias" in k or "meta_" in k:
+        if k == "a_ft_weight" or v.ndim < 2 or "ln_" in k or "bias" in k or "meta_" in k or "lob_rel" in k:
             labels[k] = "adamw"
         else:
             labels[k] = "muon"
@@ -333,11 +333,18 @@ def _print_epoch_banner(row: Dict[str, Any], is_best: bool) -> None:
     )
     print(
         f"  BIOLOGY : APL Active KCs={row['val_active_kc_pct']:5.2f}% (target={row['apl_target_pct']:.1f}%) | "
-        f"K=4 OrthErr={row['val_orth']:.4f} | DopamineGain={row['meta_dopamine_gain']:+.4f}"
+        f"K=4 OrthErr={row['val_orth']:.4f} | PlanH={row.get('c_plan_entropy', 0.0):.2f} | "
+        f"DopamineGain={row['meta_dopamine_gain']:+.4f} | JEPA={row.get('jepa_loss', 0.0):.4f}"
+    )
+    print(
+        f"  CIRCUITS: T4/T5={row.get('c_shunt_gain',0):.2f} | LobDmPm={row.get('c_lob_focus',0):.2f} | "
+        f"MBON_E/I={row.get('c_mbon_ei',0):.2f} | LH={row.get('c_lh_veto',0):.2f} | "
+        f"RC={row.get('c_rc_norm',0):.2f} | CX={row.get('c_cx_norm',0):.2f} | "
+        f"Cent={row.get('c_cent_focus',0):.2f} | PFL2={row.get('c_pfl2',0):.2f}"
     )
     print(
         f"  META-DA : PAM={row['eta_pam']:.4f} | PPL1={row['eta_ppl1']:.4f} | Dop1R2={row['eta_dop1r2']:.4f} | "
-        f"SOC={row['eta_soc']:.4f} | rho={row['trace_rho']:.4f} | HardReplay={row['replay_batches']}"
+        f"SOC={row['eta_soc']:.4f} | rho={row['trace_rho']:.4f}"
     )
     print("=" * 96)
 
@@ -556,9 +563,10 @@ def train_saccadion_smart(
         return vstep
 
     @jax.jit
-    def stage3_meta_step(p, ost, tbatch):
+    def stage_meta_jepa_step(p, ost, tbatch):
+        """Joint Stage 2/3 Meta-Dopamine (Dop1R1+Dop1R2+MBON->DAN SOC) + JEPA 2-Ply Simulation step."""
         def meta_loss_fn(cur_p):
-            out = meta_dopamine_trajectory_scan(cur_p, cfg, claws_idx, tbatch, qat=True)
+            out = meta_dopamine_trajectory_scan(cur_p, cfg, claws_idx, tbatch, qat=False)
             logits = out["traj_wdl_logits"]  # [B, K, 3]
             targets = tbatch["wdl_target"]
             k = logits.shape[1]
@@ -566,10 +574,29 @@ def train_saccadion_smart(
             step_w = jnp.linspace(0.5, 1.5, k)
             loss_traj = jnp.sum(per_step * step_w) / jnp.sum(step_w)
             loss_apl = jax.nn.relu(out["active_kc_ratio"] - 0.08) * 0.25
-            # Positive gain proves fast Dopamine reduced prediction error across the trajectory!
             adapt_gain = per_step[0] - per_step[-1]
-            return loss_traj + loss_apl, {
+
+            # JEPA 2-Ply Mental Simulation: predict future Stream B latent at t+2 from state t!
+            out_a0 = forward_stream_a(
+                cur_p, cfg, claws_idx,
+                tbatch["sparse_stm"][:, 0], tbatch["sparse_opp"][:, 0],
+                tbatch["lh_feat"][:, 0], tbatch["phase_bucket"][:, 0], qat=False,
+            )
+            out_b0 = forward_stream_b(
+                cur_p, cfg, tbatch["board_feats"][:, 0], out_a0["mbon_summary"], num_ticks=2, qat=False,
+            )
+            out_a2 = forward_stream_a(
+                cur_p, cfg, claws_idx,
+                tbatch["sparse_stm"][:, 2], tbatch["sparse_opp"][:, 2],
+                tbatch["lh_feat"][:, 2], tbatch["phase_bucket"][:, 2], qat=False,
+            )
+            out_b2 = forward_stream_b(
+                cur_p, cfg, tbatch["board_feats"][:, 2], out_a2["mbon_summary"], num_ticks=2, qat=False,
+            )
+            loss_jepa = jepa_vicreg_loss(out_b0["global_latent"], out_b2["global_latent"])
+            return loss_traj + loss_apl + 0.25 * loss_jepa, {
                 "meta_loss": loss_traj,
+                "jepa_loss": loss_jepa,
                 "adapt_gain": adapt_gain,
                 "active_kc_ratio": out["active_kc_ratio"],
             }
@@ -654,15 +681,18 @@ def train_saccadion_smart(
             host_params = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
             host_opt = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
 
-            # Stage 3: Differentiable Meta-Dopamine Trajectory Scan (Dop1R1 + Dop1R2 + MBON->DAN SOC)
+            # Stage 2 & 3: Active Meta-Dopamine Trajectory Scan (Dop1R1+Dop1R2+MBON->DAN SOC) + JEPA 2-Ply!
             meta_gain_vals: List[float] = []
-            if stage == 3 and len(traj_ds) >= 12:
-                traj_bsz = max(4, min(64, (len(traj_ds) // 12) // 2 or 1))
+            jepa_loss_vals: List[float] = []
+            if stage >= 2 and len(traj_ds) >= 12:
+                traj_bsz = max(4, min(32, (len(traj_ds) // 12) // 2 or 1))
+                max_t_batches = 12 if stage == 2 else 36
                 for t_i, tbatch_np in enumerate(traj_ds.iter_trajectory_batches(traj_bsz, window_k=12, seed=epoch * 31)):
                     tbatch = {k: jnp.asarray(v) for k, v in tbatch_np.items()}
-                    host_params, host_opt, mm = stage3_meta_step(host_params, host_opt, tbatch)
+                    host_params, host_opt, mm = stage_meta_jepa_step(host_params, host_opt, tbatch)
                     meta_gain_vals.append(float(mm["adapt_gain"]))
-                    if t_i >= 40:
+                    jepa_loss_vals.append(float(mm["jepa_loss"]))
+                    if t_i + 1 >= max_t_batches:
                         break
                 if use_pmap:
                     params_dev = jax.device_put_replicated(host_params, jax.local_devices())
@@ -677,6 +707,8 @@ def train_saccadion_smart(
                     "total", "wdl_b", "wdl_a", "policy", "pressure", "lh", "orth",
                     "noduli", "noduli_margin", "causal", "causal_f1", "vnc2",
                     "active_kc_ratio", "top1_acc", "top3_acc", "wdl_acc", "cp_mae",
+                    "shunt_gain", "lob_focus", "mbon_ei_ratio", "lh_veto_mean",
+                    "rc_hub_norm", "cx_phasor_norm", "cent_focus", "plan_entropy", "pfl2_mean",
                 ]
             }
             val_bsz = min(eff_bsz, max(1, len(val_ds)))
@@ -758,6 +790,16 @@ def train_saccadion_smart(
                 "val_active_kc_pct": v_mean["active_kc_ratio"] * 100.0,
                 "apl_target_pct": apl_target * 100.0,
                 "meta_dopamine_gain": float(np.mean(meta_gain_vals)) if meta_gain_vals else 0.0,
+                "jepa_loss": float(np.mean(jepa_loss_vals)) if jepa_loss_vals else 0.0,
+                "c_shunt_gain": v_mean["shunt_gain"],
+                "c_lob_focus": v_mean["lob_focus"],
+                "c_mbon_ei": v_mean["mbon_ei_ratio"],
+                "c_lh_veto": v_mean["lh_veto_mean"],
+                "c_rc_norm": v_mean["rc_hub_norm"],
+                "c_cx_norm": v_mean["cx_phasor_norm"],
+                "c_cent_focus": v_mean["cent_focus"],
+                "c_plan_entropy": v_mean["plan_entropy"],
+                "c_pfl2": v_mean["pfl2_mean"],
                 "eta_pam": eta_pam_v,
                 "eta_ppl1": eta_ppl1_v,
                 "eta_dop1r2": eta_dop1r2_v,

@@ -230,6 +230,43 @@ class LiveTrainingHUD:
             y_min_fixed=0.0,
         )
 
+        # Live 12-Circuit Drosophila Brain Health Monitor badges
+        def _cbadge(name: str, val_str: str, alive: bool) -> str:
+            dot = "#22c55e" if alive else "#f59e0b"
+            return (
+                f'<div style="background:#0f172a;padding:5px 7px;border-radius:6px;'
+                f'border:1px solid #1e293b;font-size:10px;display:flex;justify-content:space-between;align-items:center;">'
+                f'<span><span style="color:{dot};">&#9679;</span> {html.escape(name)}</span>'
+                f'<span style="color:#e2e8f0;font-weight:600;">{html.escape(val_str)}</span></div>'
+            )
+
+        c_shunt = float(last.get("c_shunt_gain", 0.0))
+        c_lob = float(last.get("c_lob_focus", 0.0))
+        c_mbon = float(last.get("c_mbon_ei", 0.0))
+        c_lh = float(last.get("c_lh_veto", 0.0))
+        c_rc = float(last.get("c_rc_norm", 0.0))
+        c_cx = float(last.get("c_cx_norm", 0.0))
+        c_cent = float(last.get("c_cent_focus", 0.0))
+        c_plan_h = float(last.get("c_plan_entropy", 0.0))
+        c_pfl2 = float(last.get("c_pfl2", 0.0))
+        c_jepa = float(last.get("jepa_loss", 0.0))
+        c_da = float(last.get("meta_dopamine_gain", 0.0))
+        c_f1 = float(last.get("val_causal_f1", 0.0)) * 100.0
+        circuits_html = "".join([
+            _cbadge("1. Bilateral HalfKA+Rays", f"WDL_A {last.get('val_wdl_a', 0):.2f}", bool(last)),
+            _cbadge("2. FlyHash + APL 92%", f"{step_kc_pct:4.1f}% active", 1.0 <= step_kc_pct <= 25.0),
+            _cbadge("3. Push-Pull MBON 2:1", f"E/I={c_mbon:.2f}", c_mbon > 0.01),
+            _cbadge("4. Lateral Horn 98.2%-I", f"veto={c_lh:.2f}", c_lh > 0.001),
+            _cbadge("5. T4/T5 Shunting Optic", f"gain={c_shunt:.2f}", c_shunt > 0.01),
+            _cbadge("6. Lobula Dm/Pm 64x64", f"focus={c_lob:.2f}", c_lob > 0.02),
+            _cbadge("7. Rich-Club 16I+16B", f"||h||={c_rc:.2f}", c_rc > 0.1),
+            _cbadge("8. CX Phasor 16-Sector", f"||cx||={c_cx:.2f}", c_cx > 0.05),
+            _cbadge("9. Centrifugal 71.8%-I", f"std={c_cent:.2f}", c_cent > 0.005),
+            _cbadge("10. K=4 Creative Plans", f"H={c_plan_h:.2f} O={orth_str}", c_plan_h > 0.1),
+            _cbadge("11. PFL3+PFL2+AOTU/Nod", f"F1={c_f1:.0f}% P2={c_pfl2:.2f}", c_pfl2 > 0.01),
+            _cbadge("12. Dop1R1/2+SOC+JEPA", f"DA={c_da:+.3f} J={c_jepa:.2f}", c_jepa > 0 or c_da != 0),
+        ])
+
         qat_badge = '<span style="background:#7c3aed;color:#fff;padding:2px 7px;border-radius:4px;font-size:11px;">QAT ON</span>' if qat else '<span style="background:#1e293b;color:#94a3b8;padding:2px 7px;border-radius:4px;font-size:11px;">FP32/BF16</span>'
 
         return f"""
@@ -298,11 +335,19 @@ padding:14px;border-radius:12px;border:1px solid #1e293b;max-width:1240px;">
   </div>
 
   <!-- 4 Live Inline SVG Charts -->
-  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:8px;">
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:8px;margin-bottom:10px;">
     {svg_loss}
     {svg_acc}
     {svg_elo}
     {svg_kc}
+  </div>
+
+  <!-- All 12 Drosophila Brain Circuits Live Status Monitor -->
+  <div style="font-size:10px;color:#64748b;margin-bottom:4px;letter-spacing:0.06em;">
+    ALL 12 DROSOPHILA BRAIN CIRCUITS — LIVE TELEMETRY (&#9679; GREEN = ACTIVE &amp; LEARNING)
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(195px,1fr));gap:5px;">
+    {circuits_html}
   </div>
 </div>
 """

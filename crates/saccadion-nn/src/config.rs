@@ -3,7 +3,7 @@
 use saccadion_chess::features::{LATERAL_HORN_DIM, STREAM_A_SPARSE_DIM, STREAM_B_SQ_FEAT_DIM};
 
 pub const SACCNET_MAGIC: [u8; 8] = *b"SACCNET1";
-pub const SACCNET_VERSION: u32 = 1;
+pub const SACCNET_VERSION: u32 = 2;
 
 /// Exact architectural dimensions matching FlyWire v783 biological ratios.
 #[derive(Clone, Debug, PartialEq, Eq)]
