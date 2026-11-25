@@ -1,0 +1,6 @@
+[package]
+name = "saccadion-connectome"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

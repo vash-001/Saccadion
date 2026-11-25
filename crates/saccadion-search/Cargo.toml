@@ -1,0 +1,8 @@
+[package]
+name = "saccadion-search"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+saccadion-chess = { path = "../saccadion-chess" }
+saccadion-nn = { path = "../saccadion-nn" }

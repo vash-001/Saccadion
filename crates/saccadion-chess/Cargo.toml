@@ -1,0 +1,6 @@
+[package]
+name = "saccadion-chess"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

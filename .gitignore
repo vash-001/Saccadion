@@ -1,0 +1,36 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Downloaded FlyWire datasets, chess PGNs, binary shards & weights (too large for git)
+connectome_lab/data/
+connectome_lab/.venv/
+data/
+tpu_runs/
+training/data/
+training/checkpoints/
+checkpoints*/
+exports*/
+*.tsv
+*.feather
+*.parquet
+*.bin
+*.sacc
+*.saccnet
+*.safetensors
+*.pgn
+*.pgn.gz
+*.pgn.zst
+*.zst
+*.zip
+*.pkl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

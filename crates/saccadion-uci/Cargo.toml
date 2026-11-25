@@ -1,0 +1,13 @@
+[package]
+name = "saccadion-uci"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "saccadion"
+path = "src/main.rs"
+
+[dependencies]
+saccadion-chess = { path = "../saccadion-chess" }
+saccadion-nn = { path = "../saccadion-nn" }
+saccadion-search = { path = "../saccadion-search" }
