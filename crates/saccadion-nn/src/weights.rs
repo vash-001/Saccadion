@@ -3,7 +3,9 @@
 //! Layout is shared identically with `training/saccadion_tpu/export_rust.py` so JAX-trained
 //! checkpoints load directly into Pure Rust with bit-verified numerical parity.
 
-use crate::config::{build_flyhash_claws, splitmix64, ModelConfig, SACCNET_MAGIC, SACCNET_VERSION};
+use crate::config::{
+    build_flyhash_claws, splitmix64, ModelConfig, OPTIC_LAYERS, SACCNET_MAGIC, SACCNET_VERSION,
+};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -111,13 +113,21 @@ pub struct SaccadionWeights {
     pub b_seed_to_gamma: Vec<f32>,
     pub b_seed_to_cent: Vec<f32>,
 
-    /// B6. Lobula Dm/Pm Wide-Field 4-Head Retinotopic Spatial Interneurons (64x64 board vision):
-    /// Links distant squares directly across ranks, files, diagonals, and knight leaps every tick!
-    pub b_lob_q: Vec<f32>,         // [stream_b_dim * stream_b_dim]
-    pub b_lob_k: Vec<f32>,         // [stream_b_dim * stream_b_dim]
-    pub b_lob_v: Vec<f32>,         // [stream_b_dim * stream_b_dim]
-    pub b_lob_o: Vec<f32>,         // [stream_b_dim * stream_b_dim]
-    pub b_lob_rel: Vec<f32>,       // [4 * 64 * 64] learned relative chess-geometry bias
+    /// B6. 3-Layer Untied FlyWire Optic Lobe Stack (Medulla -> Lobula -> Lobula Plate):
+    /// Each layer l in 0..3 executes Pre-LN -> Dm/Pm 4-Head 64x64 Retinotopic Attention ->
+    /// Pre-LN -> Tm/TmY Columnar SwiGLU FFN (D -> 2D -> D) for 3000+ Elo spatial chess vision!
+    pub b_opt_ln1_g: Vec<f32>,     // [OPTIC_LAYERS * stream_b_dim]
+    pub b_opt_ln1_b: Vec<f32>,     // [OPTIC_LAYERS * stream_b_dim]
+    pub b_opt_q: Vec<f32>,         // [OPTIC_LAYERS * stream_b_dim * stream_b_dim]
+    pub b_opt_k: Vec<f32>,         // [OPTIC_LAYERS * stream_b_dim * stream_b_dim]
+    pub b_opt_v: Vec<f32>,         // [OPTIC_LAYERS * stream_b_dim * stream_b_dim]
+    pub b_opt_o: Vec<f32>,         // [OPTIC_LAYERS * stream_b_dim * stream_b_dim]
+    pub b_opt_rel: Vec<f32>,       // [OPTIC_LAYERS * 4 * 64 * 64]
+    pub b_opt_ln2_g: Vec<f32>,     // [OPTIC_LAYERS * stream_b_dim]
+    pub b_opt_ln2_b: Vec<f32>,     // [OPTIC_LAYERS * stream_b_dim]
+    pub b_opt_fg: Vec<f32>,        // [OPTIC_LAYERS * (2 * stream_b_dim) * stream_b_dim]
+    pub b_opt_fu: Vec<f32>,        // [OPTIC_LAYERS * (2 * stream_b_dim) * stream_b_dim]
+    pub b_opt_fd: Vec<f32>,        // [OPTIC_LAYERS * stream_b_dim * (2 * stream_b_dim)]
 }
 
 fn rand_uniform_scaled(rng: &mut u64, scale: f32) -> f32 {
@@ -226,11 +236,18 @@ impl SaccadionWeights {
             b_seed_down: alloc_init(cfg.seed_rank * (d + cx), s_d, &mut rng),
             b_seed_to_gamma: alloc_init(gamma_dim * cfg.seed_rank, 0.1, &mut rng),
             b_seed_to_cent: alloc_init(cfg.acc_dim * cfg.seed_rank, 0.1, &mut rng),
-            b_lob_q: alloc_init(d * d, s_d, &mut rng),
-            b_lob_k: alloc_init(d * d, s_d, &mut rng),
-            b_lob_v: alloc_init(d * d, s_d, &mut rng),
-            b_lob_o: alloc_init(d * d, s_d * 0.5, &mut rng),
-            b_lob_rel: vec![0.0; 4 * 64 * 64],
+            b_opt_ln1_g: vec![1.0; OPTIC_LAYERS * d],
+            b_opt_ln1_b: vec![0.0; OPTIC_LAYERS * d],
+            b_opt_q: alloc_init(OPTIC_LAYERS * d * d, s_d, &mut rng),
+            b_opt_k: alloc_init(OPTIC_LAYERS * d * d, s_d, &mut rng),
+            b_opt_v: alloc_init(OPTIC_LAYERS * d * d, s_d, &mut rng),
+            b_opt_o: alloc_init(OPTIC_LAYERS * d * d, s_d * 0.5, &mut rng),
+            b_opt_rel: vec![0.0; OPTIC_LAYERS * 4 * 64 * 64],
+            b_opt_ln2_g: vec![1.0; OPTIC_LAYERS * d],
+            b_opt_ln2_b: vec![0.0; OPTIC_LAYERS * d],
+            b_opt_fg: alloc_init(OPTIC_LAYERS * (2 * d) * d, s_d, &mut rng),
+            b_opt_fu: alloc_init(OPTIC_LAYERS * (2 * d) * d, s_d, &mut rng),
+            b_opt_fd: alloc_init(OPTIC_LAYERS * d * (2 * d), s_d * 0.5, &mut rng),
             cfg,
         }
     }
@@ -293,11 +310,18 @@ impl SaccadionWeights {
             + self.b_seed_down.len()
             + self.b_seed_to_gamma.len()
             + self.b_seed_to_cent.len()
-            + self.b_lob_q.len()
-            + self.b_lob_k.len()
-            + self.b_lob_v.len()
-            + self.b_lob_o.len()
-            + self.b_lob_rel.len();
+            + self.b_opt_ln1_g.len()
+            + self.b_opt_ln1_b.len()
+            + self.b_opt_q.len()
+            + self.b_opt_k.len()
+            + self.b_opt_v.len()
+            + self.b_opt_o.len()
+            + self.b_opt_rel.len()
+            + self.b_opt_ln2_g.len()
+            + self.b_opt_ln2_b.len()
+            + self.b_opt_fg.len()
+            + self.b_opt_fu.len()
+            + self.b_opt_fd.len();
         (sparse, dense)
     }
 
@@ -397,11 +421,18 @@ impl SaccadionWeights {
         write_slice(&mut w, &self.b_seed_down)?;
         write_slice(&mut w, &self.b_seed_to_gamma)?;
         write_slice(&mut w, &self.b_seed_to_cent)?;
-        write_slice(&mut w, &self.b_lob_q)?;
-        write_slice(&mut w, &self.b_lob_k)?;
-        write_slice(&mut w, &self.b_lob_v)?;
-        write_slice(&mut w, &self.b_lob_o)?;
-        write_slice(&mut w, &self.b_lob_rel)?;
+        write_slice(&mut w, &self.b_opt_ln1_g)?;
+        write_slice(&mut w, &self.b_opt_ln1_b)?;
+        write_slice(&mut w, &self.b_opt_q)?;
+        write_slice(&mut w, &self.b_opt_k)?;
+        write_slice(&mut w, &self.b_opt_v)?;
+        write_slice(&mut w, &self.b_opt_o)?;
+        write_slice(&mut w, &self.b_opt_rel)?;
+        write_slice(&mut w, &self.b_opt_ln2_g)?;
+        write_slice(&mut w, &self.b_opt_ln2_b)?;
+        write_slice(&mut w, &self.b_opt_fg)?;
+        write_slice(&mut w, &self.b_opt_fu)?;
+        write_slice(&mut w, &self.b_opt_fd)?;
 
         w.flush()
     }
@@ -535,11 +566,18 @@ impl SaccadionWeights {
         let b_seed_down = read_vec(&mut r, cfg.seed_rank * (d + cx))?;
         let b_seed_to_gamma = read_vec(&mut r, gamma_dim * cfg.seed_rank)?;
         let b_seed_to_cent = read_vec(&mut r, cfg.acc_dim * cfg.seed_rank)?;
-        let b_lob_q = read_vec(&mut r, d * d)?;
-        let b_lob_k = read_vec(&mut r, d * d)?;
-        let b_lob_v = read_vec(&mut r, d * d)?;
-        let b_lob_o = read_vec(&mut r, d * d)?;
-        let b_lob_rel = read_vec(&mut r, 4 * 64 * 64)?;
+        let b_opt_ln1_g = read_vec(&mut r, OPTIC_LAYERS * d)?;
+        let b_opt_ln1_b = read_vec(&mut r, OPTIC_LAYERS * d)?;
+        let b_opt_q = read_vec(&mut r, OPTIC_LAYERS * d * d)?;
+        let b_opt_k = read_vec(&mut r, OPTIC_LAYERS * d * d)?;
+        let b_opt_v = read_vec(&mut r, OPTIC_LAYERS * d * d)?;
+        let b_opt_o = read_vec(&mut r, OPTIC_LAYERS * d * d)?;
+        let b_opt_rel = read_vec(&mut r, OPTIC_LAYERS * 4 * 64 * 64)?;
+        let b_opt_ln2_g = read_vec(&mut r, OPTIC_LAYERS * d)?;
+        let b_opt_ln2_b = read_vec(&mut r, OPTIC_LAYERS * d)?;
+        let b_opt_fg = read_vec(&mut r, OPTIC_LAYERS * (2 * d) * d)?;
+        let b_opt_fu = read_vec(&mut r, OPTIC_LAYERS * (2 * d) * d)?;
+        let b_opt_fd = read_vec(&mut r, OPTIC_LAYERS * d * (2 * d))?;
 
         Ok(Self {
             cfg,
@@ -601,11 +639,18 @@ impl SaccadionWeights {
             b_seed_down,
             b_seed_to_gamma,
             b_seed_to_cent,
-            b_lob_q,
-            b_lob_k,
-            b_lob_v,
-            b_lob_o,
-            b_lob_rel,
+            b_opt_ln1_g,
+            b_opt_ln1_b,
+            b_opt_q,
+            b_opt_k,
+            b_opt_v,
+            b_opt_o,
+            b_opt_rel,
+            b_opt_ln2_g,
+            b_opt_ln2_b,
+            b_opt_fg,
+            b_opt_fu,
+            b_opt_fd,
         })
     }
 }

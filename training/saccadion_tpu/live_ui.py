@@ -258,7 +258,7 @@ class LiveTrainingHUD:
             _cbadge("3. Push-Pull MBON 2:1", f"E/I={c_mbon:.2f}", c_mbon > 0.01),
             _cbadge("4. Lateral Horn 98.2%-I", f"veto={c_lh:.2f}", c_lh > 0.001),
             _cbadge("5. T4/T5 Shunting Optic", f"gain={c_shunt:.2f}", c_shunt > 0.01),
-            _cbadge("6. Lobula Dm/Pm 64x64", f"focus={c_lob:.2f}", c_lob > 0.02),
+            _cbadge("6. 3L Optic Dm/Pm+SwiGLU", f"focus={c_lob:.2f}", c_lob > 0.02),
             _cbadge("7. Rich-Club 16I+16B", f"||h||={c_rc:.2f}", c_rc > 0.1),
             _cbadge("8. CX Phasor 16-Sector", f"||cx||={c_cx:.2f}", c_cx > 0.05),
             _cbadge("9. Centrifugal 71.8%-I", f"std={c_cent:.2f}", c_cent > 0.005),

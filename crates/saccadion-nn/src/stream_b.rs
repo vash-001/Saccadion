@@ -9,8 +9,9 @@
 //! - B6. PFL3 (99% Contralateral) Policy, PFL2 (50/50) Urgency Gain, Noduli Efference Copy,
 //!       10-20 Ply Strategic Pressure Forecast, and Top-Down Seed Injection -> Stream A.
 
+use crate::config::OPTIC_LAYERS;
 use crate::plasticity::DopaminePlasticityState;
-use crate::simd::{dot_f32, layer_norm, sigmoid, softmax_inplace, softplus};
+use crate::simd::{dot_f32, layer_norm, sigmoid, silu, softmax_inplace, softplus};
 use crate::stream_a::wdl_to_cp;
 use crate::weights::SaccadionWeights;
 use saccadion_chess::features::extract_stream_b_board;
@@ -105,59 +106,42 @@ pub fn evaluate_stream_b(
         }
     }
 
-    // Initialize Rich-Club hubs (Integrators [0..n_int], Broadcasters [n_int..n_hubs])
-    let mut hubs = w.b_hub_init.clone();
-    // Initialize 16-sector Central Complex Phasor state C^{(0)} [16, cx_d]
-    let mut cx_phasor = vec![0.0f32; sectors * cx_d];
-    let mut prev_phasor = vec![0.0f32; sectors * cx_d];
+    // -------------------------------------------------------------------------
+    // B1b. 3-Layer Untied FlyWire Optic Lobe Stack (Medulla -> Lobula -> Lobula Plate):
+    //      Pre-LN -> Dm/Pm 4-Head 64x64 Retinotopic Attention -> Pre-LN -> Tm/TmY SwiGLU FFN!
+    //      Runs ONCE per Stream B evaluation (2x faster on CPU than 6x repeated attention,
+    //      while delivering deep 3-layer hierarchical chess vision across all 64 squares!)
+    // -------------------------------------------------------------------------
+    let n_lob_heads = 4usize;
+    let lob_hd = d / n_lob_heads;
+    let inv_sqrt_hd = 1.0 / (lob_hd as f32).sqrt();
+    let ffn_d = 2 * d;
 
-    // Preallocate tick scratch buffers
     let mut lob_q = vec![0.0f32; 64 * d];
     let mut lob_k = vec![0.0f32; 64 * d];
     let mut lob_v = vec![0.0f32; 64 * d];
     let mut lob_ctx = vec![0.0f32; 64 * d];
-    let mut sq_k = vec![0.0f32; 64 * d];
-    let mut sq_v = vec![0.0f32; 64 * d];
-    let mut q_buf = vec![0.0f32; d];
     let mut attn_scores = [0.0f32; 64];
-    let mut ctx_buf = vec![0.0f32; d];
     let mut o_buf = vec![0.0f32; d];
-    let mut hub_tmp = vec![0.0f32; d];
-    let mut hub_ln = vec![0.0f32; d];
-    let mut int_mean = vec![0.0f32; d];
-    let mut broad_mean = vec![0.0f32; d];
-    let mut pfn_stm = vec![0.0f32; sectors * cx_d];
-    let mut pfn_opp = vec![0.0f32; sectors * cx_d];
-    let mut u_phasor = vec![0.0f32; sectors * cx_d];
-    let mut delta7_scores = vec![0.0f32; sectors * cx_d];
-    let mut ring_in = vec![0.0f32; d + cfg.mbon_dim];
-    let mut ring_gate = vec![0.0f32; cx_d];
-    let mut cent_board_mask = [0.5f32; 64];
-    let mut broad_proj = vec![0.0f32; d];
-    let mut sq_tmp = vec![0.0f32; d];
     let mut sq_ln = vec![0.0f32; d];
+    let mut ffn_g = vec![0.0f32; ffn_d];
+    let mut ffn_u = vec![0.0f32; ffn_d];
 
-    let n_lob_heads = 4usize;
-    let lob_hd = d / n_lob_heads;
-    let inv_sqrt_hd = 1.0 / (lob_hd as f32).sqrt();
-    let inv_sqrt_d = 1.0 / (d as f32).sqrt();
-    let mut ticks_used = 0usize;
+    for l in 0..OPTIC_LAYERS {
+        let ln1_g = &w.b_opt_ln1_g[l * d..(l + 1) * d];
+        let ln1_b = &w.b_opt_ln1_b[l * d..(l + 1) * d];
+        let wq = &w.b_opt_q[l * d * d..(l + 1) * d * d];
+        let wk = &w.b_opt_k[l * d * d..(l + 1) * d * d];
+        let wv = &w.b_opt_v[l * d * d..(l + 1) * d * d];
+        let wo = &w.b_opt_o[l * d * d..(l + 1) * d * d];
+        let wrel = &w.b_opt_rel[l * 4 * 4096..(l + 1) * 4 * 4096];
 
-    // -------------------------------------------------------------------------
-    // B2-B4. Weight-Tied Lobula Dm/Pm + Central Complex + Rich-Club Loop
-    //        (T = 1..=T_max matching FlyWire's 4.42-hop small-world diameter)
-    // -------------------------------------------------------------------------
-    for tick in 0..cfg.cx_max_ticks {
-        ticks_used = tick + 1;
-        prev_phasor.copy_from_slice(&cx_phasor);
-
-        // Step 0: Lobula Dm/Pm Wide-Field 4-Head Retinotopic Spatial Attention (64x64 board vision!)
-        // Direct square-to-square communication for pins, batteries, forks, x-rays, and zugzwang!
+        // 1) Pre-LN + Dm/Pm 4-Head 64x64 Retinotopic Spatial Attention
         for sq in 0..64 {
-            let s = &sq_state[sq * d..(sq + 1) * d];
-            matvec(&w.b_lob_q, s, d, d, &mut lob_q[sq * d..(sq + 1) * d]);
-            matvec(&w.b_lob_k, s, d, d, &mut lob_k[sq * d..(sq + 1) * d]);
-            matvec(&w.b_lob_v, s, d, d, &mut lob_v[sq * d..(sq + 1) * d]);
+            layer_norm(&sq_state[sq * d..(sq + 1) * d], ln1_g, ln1_b, &mut sq_ln);
+            matvec(wq, &sq_ln, d, d, &mut lob_q[sq * d..(sq + 1) * d]);
+            matvec(wk, &sq_ln, d, d, &mut lob_k[sq * d..(sq + 1) * d]);
+            matvec(wv, &sq_ln, d, d, &mut lob_v[sq * d..(sq + 1) * d]);
         }
         lob_ctx.fill(0.0);
         for h in 0..n_lob_heads {
@@ -165,7 +149,7 @@ pub fn evaluate_stream_b(
             let rel_head_off = h * 4096;
             for u in 0..64 {
                 let qu = &lob_q[u * d + h_off..u * d + h_off + lob_hd];
-                let rel_row = &w.b_lob_rel[rel_head_off + u * 64..rel_head_off + (u + 1) * 64];
+                let rel_row = &wrel[rel_head_off + u * 64..rel_head_off + (u + 1) * 64];
                 for v in 0..64 {
                     let kv = &lob_k[v * d + h_off..v * d + h_off + lob_hd];
                     attn_scores[v] = dot_f32(qu, kv) * inv_sqrt_hd + rel_row[v];
@@ -182,14 +166,69 @@ pub fn evaluate_stream_b(
             }
         }
         for sq in 0..64 {
-            matvec(&w.b_lob_o, &lob_ctx[sq * d..(sq + 1) * d], d, d, &mut o_buf);
-            let cur = &sq_state[sq * d..(sq + 1) * d];
+            matvec(wo, &lob_ctx[sq * d..(sq + 1) * d], d, d, &mut o_buf);
+            let cur = &mut sq_state[sq * d..(sq + 1) * d];
             for j in 0..d {
-                sq_tmp[j] = cur[j] + o_buf[j];
+                cur[j] += o_buf[j];
             }
-            layer_norm(&sq_tmp, &w.b_sq_ln_g, &w.b_sq_ln_b, &mut sq_ln);
-            sq_state[sq * d..(sq + 1) * d].copy_from_slice(&sq_ln);
         }
+
+        // 2) Pre-LN + Tm/TmY Columnar SwiGLU FFN (D -> 2D -> D)
+        let ln2_g = &w.b_opt_ln2_g[l * d..(l + 1) * d];
+        let ln2_b = &w.b_opt_ln2_b[l * d..(l + 1) * d];
+        let wfg = &w.b_opt_fg[l * ffn_d * d..(l + 1) * ffn_d * d];
+        let wfu = &w.b_opt_fu[l * ffn_d * d..(l + 1) * ffn_d * d];
+        let wfd = &w.b_opt_fd[l * d * ffn_d..(l + 1) * d * ffn_d];
+
+        for sq in 0..64 {
+            layer_norm(&sq_state[sq * d..(sq + 1) * d], ln2_g, ln2_b, &mut sq_ln);
+            matvec(wfg, &sq_ln, ffn_d, d, &mut ffn_g);
+            matvec(wfu, &sq_ln, ffn_d, d, &mut ffn_u);
+            for j in 0..ffn_d {
+                ffn_g[j] = silu(ffn_g[j]) * ffn_u[j];
+            }
+            matvec(wfd, &ffn_g, d, ffn_d, &mut o_buf);
+            let cur = &mut sq_state[sq * d..(sq + 1) * d];
+            for j in 0..d {
+                cur[j] += o_buf[j];
+            }
+        }
+    }
+
+    // Initialize Rich-Club hubs (Integrators [0..n_int], Broadcasters [n_int..n_hubs])
+    let mut hubs = w.b_hub_init.clone();
+    // Initialize 16-sector Central Complex Phasor state C^{(0)} [16, cx_d]
+    let mut cx_phasor = vec![0.0f32; sectors * cx_d];
+    let mut prev_phasor = vec![0.0f32; sectors * cx_d];
+
+    // Preallocate tick scratch buffers
+    let mut sq_k = vec![0.0f32; 64 * d];
+    let mut sq_v = vec![0.0f32; 64 * d];
+    let mut q_buf = vec![0.0f32; d];
+    let mut ctx_buf = vec![0.0f32; d];
+    let mut hub_tmp = vec![0.0f32; d];
+    let mut hub_ln = vec![0.0f32; d];
+    let mut int_mean = vec![0.0f32; d];
+    let mut broad_mean = vec![0.0f32; d];
+    let mut pfn_stm = vec![0.0f32; sectors * cx_d];
+    let mut pfn_opp = vec![0.0f32; sectors * cx_d];
+    let mut u_phasor = vec![0.0f32; sectors * cx_d];
+    let mut delta7_scores = vec![0.0f32; sectors * cx_d];
+    let mut ring_in = vec![0.0f32; d + cfg.mbon_dim];
+    let mut ring_gate = vec![0.0f32; cx_d];
+    let mut cent_board_mask = [0.5f32; 64];
+    let mut broad_proj = vec![0.0f32; d];
+    let mut sq_tmp = vec![0.0f32; d];
+
+    let inv_sqrt_d = 1.0 / (d as f32).sqrt();
+    let mut ticks_used = 0usize;
+
+    // -------------------------------------------------------------------------
+    // B2-B4. Weight-Tied Central Complex + Rich-Club Recurrent Deliberation Loop
+    // -------------------------------------------------------------------------
+    for tick in 0..cfg.cx_max_ticks {
+        ticks_used = tick + 1;
+        prev_phasor.copy_from_slice(&cx_phasor);
 
         // Step A: Integrators Cross-Attention pulling global board tension from 64 squares
         for sq in 0..64 {

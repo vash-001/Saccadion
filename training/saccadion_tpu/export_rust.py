@@ -14,6 +14,7 @@ from typing import Dict, Tuple
 import numpy as np
 
 from .config import (
+    OPTIC_LAYERS,
     SACCNET_MAGIC,
     SACCNET_VERSION,
     SaccadionConfig,
@@ -79,11 +80,18 @@ SACCNET_TENSOR_ORDER = [
     "b_seed_down",
     "b_seed_to_gamma",
     "b_seed_to_cent",
-    "b_lob_q",
-    "b_lob_k",
-    "b_lob_v",
-    "b_lob_o",
-    "b_lob_rel",
+    "b_opt_ln1_g",
+    "b_opt_ln1_b",
+    "b_opt_q",
+    "b_opt_k",
+    "b_opt_v",
+    "b_opt_o",
+    "b_opt_rel",
+    "b_opt_ln2_g",
+    "b_opt_ln2_b",
+    "b_opt_fg",
+    "b_opt_fu",
+    "b_opt_fd",
 ]
 
 
@@ -192,11 +200,18 @@ def init_numpy_params(cfg: SaccadionConfig, seed: int = 1234) -> Dict[str, np.nd
         "b_seed_down": u((cfg.seed_rank, d + cx), s_d),
         "b_seed_to_gamma": u((gamma_dim, cfg.seed_rank), 0.1),
         "b_seed_to_cent": u((cfg.acc_dim, cfg.seed_rank), 0.1),
-        "b_lob_q": u((d, d), s_d),
-        "b_lob_k": u((d, d), s_d),
-        "b_lob_v": u((d, d), s_d),
-        "b_lob_o": u((d, d), s_d * 0.5),
-        "b_lob_rel": np.zeros((4, 64, 64), dtype=np.float32),
+        "b_opt_ln1_g": np.ones((OPTIC_LAYERS, d), dtype=np.float32),
+        "b_opt_ln1_b": np.zeros((OPTIC_LAYERS, d), dtype=np.float32),
+        "b_opt_q": u((OPTIC_LAYERS, d, d), s_d),
+        "b_opt_k": u((OPTIC_LAYERS, d, d), s_d),
+        "b_opt_v": u((OPTIC_LAYERS, d, d), s_d),
+        "b_opt_o": u((OPTIC_LAYERS, d, d), s_d * 0.5),
+        "b_opt_rel": np.zeros((OPTIC_LAYERS, 4, 64, 64), dtype=np.float32),
+        "b_opt_ln2_g": np.ones((OPTIC_LAYERS, d), dtype=np.float32),
+        "b_opt_ln2_b": np.zeros((OPTIC_LAYERS, d), dtype=np.float32),
+        "b_opt_fg": u((OPTIC_LAYERS, 2 * d, d), s_d),
+        "b_opt_fu": u((OPTIC_LAYERS, 2 * d, d), s_d),
+        "b_opt_fd": u((OPTIC_LAYERS, d, 2 * d), s_d * 0.5),
     }
 
 
@@ -290,16 +305,23 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
     lob_hd = d // n_lob_h
     inv_shd = 1.0 / np.sqrt(lob_hd)
 
-    for _ in range(cfg.cx_max_ticks):
-        # Step 0: Lobula Dm/Pm Wide-Field 4-Head Retinotopic Attention
-        lq = (sq_state @ params["b_lob_q"].T).reshape(64, n_lob_h, lob_hd)
-        lk = (sq_state @ params["b_lob_k"].T).reshape(64, n_lob_h, lob_hd)
-        lv = (sq_state @ params["b_lob_v"].T).reshape(64, n_lob_h, lob_hd)
-        l_scores = np.einsum("uhd,vhd->huv", lq, lk) * inv_shd + params["b_lob_rel"]
+    # B1b. 3-Layer Untied FlyWire Optic Lobe Stack (Dm/Pm Attention + Tm/TmY SwiGLU FFN)
+    for l_idx in range(OPTIC_LAYERS):
+        x1 = _ln(sq_state, params["b_opt_ln1_g"][l_idx], params["b_opt_ln1_b"][l_idx])
+        lq = (x1 @ params["b_opt_q"][l_idx].T).reshape(64, n_lob_h, lob_hd)
+        lk = (x1 @ params["b_opt_k"][l_idx].T).reshape(64, n_lob_h, lob_hd)
+        lv = (x1 @ params["b_opt_v"][l_idx].T).reshape(64, n_lob_h, lob_hd)
+        l_scores = np.einsum("uhd,vhd->huv", lq, lk) * inv_shd + params["b_opt_rel"][l_idx]
         l_attn = _softmax(l_scores, axis=-1)
         l_ctx = np.einsum("huv,vhd->uhd", l_attn, lv).reshape(64, d)
-        sq_state = _ln(sq_state + l_ctx @ params["b_lob_o"].T, params["b_sq_ln_g"], params["b_sq_ln_b"])
+        sq_state = sq_state + l_ctx @ params["b_opt_o"][l_idx].T
 
+        x2 = _ln(sq_state, params["b_opt_ln2_g"][l_idx], params["b_opt_ln2_b"][l_idx])
+        fg = _silu(x2 @ params["b_opt_fg"][l_idx].T)
+        fu = x2 @ params["b_opt_fu"][l_idx].T
+        sq_state = sq_state + (fg * fu) @ params["b_opt_fd"][l_idx].T
+
+    for _ in range(cfg.cx_max_ticks):
         int_h = hubs[:n_int]
         q = int_h @ params["b_int_q"].T
         k = sq_state @ params["b_int_k"].T

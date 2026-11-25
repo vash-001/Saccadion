@@ -301,6 +301,18 @@ fn main() {
         if games.len() > max_games {
             games.truncate(max_games);
         }
+        // Deterministic Fisher-Yates shuffle BEFORE train/val split so train and val share
+        // the exact same source distribution (zero source-leakage skew!).
+        let mut rng_s: u64 = 0x5ACC_AD10_2026_1337;
+        for idx in (1..games.len()).rev() {
+            rng_s = rng_s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = rng_s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let swap_i = (z as usize) % (idx + 1);
+            games.swap(idx, swap_i);
+        }
         let val_count = ((games.len() * val_pct) / 100).max(1).min(games.len().saturating_sub(1));
         let split_idx = games.len().saturating_sub(val_count);
         let (train_games, val_games) = games.split_at(split_idx);

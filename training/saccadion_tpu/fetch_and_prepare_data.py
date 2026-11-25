@@ -119,9 +119,9 @@ def download_fishtest_pgn(raw_dir: Path, max_games: int = 5000) -> Optional[Path
         listing = json.loads(_http_get_text(api_url))
         dirs = sorted([e["path"] for e in listing if e.get("type") == "directory"])
         gz_paths: List[str] = []
-        for day_dir in reversed(dirs[-10:]):
+        for day_dir in reversed(dirs[-20:]):
             runs = json.loads(_http_get_text(f"{api_url}/{day_dir}"))
-            for run in runs[:8]:
+            for run in runs[:12]:
                 if run.get("type") == "directory":
                     files = json.loads(_http_get_text(f"{api_url}/{run['path']}"))
                     for f in files:
@@ -129,7 +129,9 @@ def download_fishtest_pgn(raw_dir: Path, max_games: int = 5000) -> Optional[Path
                             gz_paths.append(f["path"])
                 elif run.get("path", "").endswith(".pgn.gz"):
                     gz_paths.append(run["path"])
-            if len(gz_paths) >= 6:
+                if len(gz_paths) >= 24:
+                    break
+            if len(gz_paths) >= 24:
                 break
 
         if not gz_paths:
@@ -685,16 +687,32 @@ def fetch_and_prepare(
     if local_pgn is not None and local_pgn.exists():
         pgn_files.append(local_pgn)
     else:
-        if source in ("auto", "lichess_elite"):
-            p = download_lichess_elite(raw_dir, max_games=max_games // 2 if source == "auto" else max_games)
+        if source == "auto":
+            # 100% ENGINE-EVALUATED ELITE BLEND (Zero unannotated material-fallback label noise!):
+            # 85% Stockfish Fishtest 3600+ per-ply evaluated games + 15% Lichess 2200+ [%eval] human games
+            ft_n = max(100, int(round(max_games * 0.85)))
+            le_n = max(0, max_games - ft_n)
+            p_ft = download_fishtest_pgn(raw_dir, max_games=ft_n)
+            if p_ft:
+                pgn_files.append(p_ft)
+            if le_n > 0:
+                p_le = download_lichess_standard_eval_stream(raw_dir, max_games=le_n, min_elo=2200)
+                if p_le:
+                    pgn_files.append(p_le)
+            if not pgn_files:
+                p_el = download_lichess_elite(raw_dir, max_games=max_games)
+                if p_el:
+                    pgn_files.append(p_el)
+        elif source == "fishtest":
+            p = download_fishtest_pgn(raw_dir, max_games=max_games)
             if p:
                 pgn_files.append(p)
-        if source in ("auto", "fishtest"):
-            p = download_fishtest_pgn(raw_dir, max_games=max_games // 2 if source == "auto" else max_games)
+        elif source == "lichess_eval":
+            p = download_lichess_standard_eval_stream(raw_dir, max_games=max_games, min_elo=2200)
             if p:
                 pgn_files.append(p)
-        if source == "lichess_eval" or (source == "auto" and not pgn_files):
-            p = download_lichess_standard_eval_stream(raw_dir, max_games=max_games)
+        elif source == "lichess_elite":
+            p = download_lichess_elite(raw_dir, max_games=max_games)
             if p:
                 pgn_files.append(p)
 

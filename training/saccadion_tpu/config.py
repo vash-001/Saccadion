@@ -4,7 +4,8 @@ from dataclasses import dataclass
 import numpy as np
 
 SACCNET_MAGIC = b"SACCNET1"
-SACCNET_VERSION = 2
+SACCNET_VERSION = 3
+OPTIC_LAYERS = 3
 
 HALFKA_DIM = 16 * 768
 RAY_SPARSE_DIM = 256

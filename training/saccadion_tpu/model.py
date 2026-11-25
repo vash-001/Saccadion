@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .config import NUM_CAUSAL_CONCEPTS, SaccadionConfig, build_flyhash_claws
+from .config import NUM_CAUSAL_CONCEPTS, OPTIC_LAYERS, SaccadionConfig, build_flyhash_claws
 
 
 def ste_quantize(w: jnp.ndarray, bits: int = 8, enabled: bool = False) -> jnp.ndarray:
@@ -118,12 +118,20 @@ def init_saccadion_params(cfg: SaccadionConfig, seed: int = 42) -> Dict[str, jnp
         "b_seed_down": u((cfg.seed_rank, d + cx), s_d),
         "b_seed_to_gamma": u((gamma_dim, cfg.seed_rank), 0.1),
         "b_seed_to_cent": u((cfg.acc_dim, cfg.seed_rank), 0.1),
-        # Lobula Dm/Pm Wide-Field 4-Head Retinotopic Spatial Interneurons (64x64 board vision)
-        "b_lob_q": u((d, d), s_d),
-        "b_lob_k": u((d, d), s_d),
-        "b_lob_v": u((d, d), s_d),
-        "b_lob_o": u((d, d), s_d * 0.5),
-        "b_lob_rel": jnp.zeros((4, 64, 64), dtype=jnp.float32),
+        # 3-Layer Untied FlyWire Optic Lobe Stack (Medulla -> Lobula -> Lobula Plate):
+        # Each layer: Pre-LN -> Dm/Pm 4-Head 64x64 Attention -> Pre-LN -> Tm/TmY SwiGLU FFN!
+        "b_opt_ln1_g": jnp.ones((OPTIC_LAYERS, d), dtype=jnp.float32),
+        "b_opt_ln1_b": jnp.zeros((OPTIC_LAYERS, d), dtype=jnp.float32),
+        "b_opt_q": u((OPTIC_LAYERS, d, d), s_d),
+        "b_opt_k": u((OPTIC_LAYERS, d, d), s_d),
+        "b_opt_v": u((OPTIC_LAYERS, d, d), s_d),
+        "b_opt_o": u((OPTIC_LAYERS, d, d), s_d * 0.5),
+        "b_opt_rel": jnp.zeros((OPTIC_LAYERS, 4, 64, 64), dtype=jnp.float32),
+        "b_opt_ln2_g": jnp.ones((OPTIC_LAYERS, d), dtype=jnp.float32),
+        "b_opt_ln2_b": jnp.zeros((OPTIC_LAYERS, d), dtype=jnp.float32),
+        "b_opt_fg": u((OPTIC_LAYERS, 2 * d, d), s_d),
+        "b_opt_fu": u((OPTIC_LAYERS, 2 * d, d), s_d),
+        "b_opt_fd": u((OPTIC_LAYERS, d, 2 * d), s_d * 0.5),
         # Training-only AOTU -> LAL -> SMP 16-Causal-Concept Effectome Head (zero Rust latency!)
         "aux_causal_w": u((NUM_CAUSAL_CONCEPTS, d + cx), s_d),
         "aux_causal_b": jnp.full((NUM_CAUSAL_CONCEPTS,), -0.5, dtype=jnp.float32),
@@ -293,35 +301,43 @@ def forward_stream_b(
     w_cent = ste_quantize(params["b_cent_w"], 8, qat)
     w_b2s = ste_quantize(params["b_broad_to_sq"], 8, qat)
     w_squpd = ste_quantize(params["b_sq_upd"], 8, qat)
-    w_lq = ste_quantize(params["b_lob_q"], 8, qat)
-    w_lk = ste_quantize(params["b_lob_k"], 8, qat)
-    w_lv = ste_quantize(params["b_lob_v"], 8, qat)
-    w_lo = ste_quantize(params["b_lob_o"], 8, qat)
-    b_lrel = params["b_lob_rel"]
 
     n_lob_h = 4
     lob_hd = d // n_lob_h
     inv_sqrt_hd = float(1.0 / (lob_hd ** 0.5))
     shunt_gain = jnp.mean(exc.astype(jnp.float32) / (leak + inh.astype(jnp.float32)))
 
-    # Weight-tied deliberation loop (unrolled via Python loop for clean per-tick Deep Supervision)
-    per_tick_wdl = []
+    # B1b. 3-Layer Untied FlyWire Optic Lobe Stack (Medulla -> Lobula -> Lobula Plate):
+    # Pre-LN -> Dm/Pm 4-Head 64x64 Retinotopic Attention -> Pre-LN -> Tm/TmY SwiGLU FFN
     lob_focus = jnp.array(0.0, dtype=jnp.float32)
-    for _ in range(num_ticks):
-        # Step 0: Lobula Dm/Pm Wide-Field 4-Head Retinotopic Spatial Attention (64x64 board vision!)
-        lq = jnp.einsum("bsd,ed->bse", sq_state, w_lq).reshape((bsz, 64, n_lob_h, lob_hd))
-        lk = jnp.einsum("bsd,ed->bse", sq_state, w_lk).reshape((bsz, 64, n_lob_h, lob_hd))
-        lv = jnp.einsum("bsd,ed->bse", sq_state, w_lv).reshape((bsz, 64, n_lob_h, lob_hd))
-        l_scores = jnp.einsum("buhd,bvhd->bhuv", lq, lk) * inv_sqrt_hd + b_lrel[None, :, :, :]
-        l_attn = jax.nn.softmax(l_scores, axis=-1)
-        lob_focus = jnp.mean(jnp.max(l_attn, axis=-1))  # Sharpness of square-to-square ray focus
-        l_ctx = jnp.einsum("bhuv,bvhd->buhd", l_attn, lv).reshape((bsz, 64, d))
-        sq_state = layer_norm(
-            sq_state + jnp.einsum("bse,de->bsd", l_ctx, w_lo),
-            params["b_sq_ln_g"],
-            params["b_sq_ln_b"],
-        )
+    for l_idx in range(OPTIC_LAYERS):
+        x1 = layer_norm(sq_state, params["b_opt_ln1_g"][l_idx], params["b_opt_ln1_b"][l_idx])
+        wq_l = ste_quantize(params["b_opt_q"][l_idx], 8, qat)
+        wk_l = ste_quantize(params["b_opt_k"][l_idx], 8, qat)
+        wv_l = ste_quantize(params["b_opt_v"][l_idx], 8, qat)
+        wo_l = ste_quantize(params["b_opt_o"][l_idx], 8, qat)
+        rel_l = params["b_opt_rel"][l_idx]
 
+        lq = jnp.einsum("bsd,ed->bse", x1, wq_l).reshape((bsz, 64, n_lob_h, lob_hd))
+        lk = jnp.einsum("bsd,ed->bse", x1, wk_l).reshape((bsz, 64, n_lob_h, lob_hd))
+        lv = jnp.einsum("bsd,ed->bse", x1, wv_l).reshape((bsz, 64, n_lob_h, lob_hd))
+        l_scores = jnp.einsum("buhd,bvhd->bhuv", lq, lk) * inv_sqrt_hd + rel_l[None, :, :, :]
+        l_attn = jax.nn.softmax(l_scores, axis=-1)
+        lob_focus = jnp.mean(jnp.max(l_attn, axis=-1))
+        l_ctx = jnp.einsum("bhuv,bvhd->buhd", l_attn, lv).reshape((bsz, 64, d))
+        sq_state = sq_state + jnp.einsum("bse,de->bsd", l_ctx, wo_l)
+
+        x2 = layer_norm(sq_state, params["b_opt_ln2_g"][l_idx], params["b_opt_ln2_b"][l_idx])
+        wfg_l = ste_quantize(params["b_opt_fg"][l_idx], 8, qat)
+        wfu_l = ste_quantize(params["b_opt_fu"][l_idx], 8, qat)
+        wfd_l = ste_quantize(params["b_opt_fd"][l_idx], 8, qat)
+        fg = jax.nn.silu(jnp.einsum("bsd,fd->bsf", x2, wfg_l))
+        fu = jnp.einsum("bsd,fd->bsf", x2, wfu_l)
+        sq_state = sq_state + jnp.einsum("bsf,df->bsd", fg * fu, wfd_l)
+
+    # Weight-tied Central Complex + Rich-Club deliberation loop
+    per_tick_wdl = []
+    for _ in range(num_ticks):
         # Step A: Integrators Cross-Attention from 64 squares
         int_h = hubs[:, :n_int, :]
         q = jnp.einsum("bhd,ed->bhe", int_h, w_q)

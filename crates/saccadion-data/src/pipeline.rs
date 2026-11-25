@@ -67,7 +67,8 @@ pub fn game_to_sacc_records(game: &ParsedGame) -> Vec<SaccRecord> {
         };
         let eval_wdl = cp_to_wdl_probs(evals_stm[ply]);
         let has_engine_eval = game.moves[ply].1.is_some();
-        let (w_ev, w_out) = if has_engine_eval { (0.75, 0.25) } else { (0.25, 0.75) };
+        // Engine-evaluated Fishtest/Lichess positions carry +/-10 cp ground truth (85% eval / 15% outcome!)
+        let (w_ev, w_out) = if has_engine_eval { (0.85, 0.15) } else { (0.20, 0.80) };
         let wdl_target = [
             w_ev * eval_wdl[0] + w_out * out_wdl[0],
             w_ev * eval_wdl[1] + w_out * out_wdl[1],

@@ -131,7 +131,7 @@ def build_muon_adamw_optimizer(
 
     labels = {}
     for k, v in params.items():
-        if k == "a_ft_weight" or v.ndim < 2 or "ln_" in k or "bias" in k or "meta_" in k or "lob_rel" in k:
+        if k == "a_ft_weight" or v.ndim < 2 or "ln" in k or "bias" in k or "meta_" in k or "_rel" in k:
             labels[k] = "adamw"
         else:
             labels[k] = "muon"
@@ -139,7 +139,7 @@ def build_muon_adamw_optimizer(
     if hasattr(optax, "contrib") and hasattr(optax.contrib, "muon"):
         muon_tx = optax.chain(
             optax.contrib.muon(learning_rate=sched_muon, beta=0.95),
-            _signed_decoupled_weight_decay(sched_muon, weight_decay=0.02),
+            _signed_decoupled_weight_decay(sched_muon, weight_decay=0.005),
         )
     else:
         def init_fn(p):
@@ -157,11 +157,11 @@ def build_muon_adamw_optimizer(
 
         muon_tx = optax.chain(
             optax.GradientTransformation(init_fn, update_fn),
-            _signed_decoupled_weight_decay(sched_muon, weight_decay=0.02),
+            _signed_decoupled_weight_decay(sched_muon, weight_decay=0.005),
         )
 
-    # Strong decoupled weight decay (1e-2) prevents 55M sparse table `a_ft_weight` memorization!
-    adamw_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=1.0e-2)
+    # Calibrated decoupled weight decay (5e-3) prevents sparse table memorization without crushing T4/T5
+    adamw_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=5.0e-3)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.multi_transform({"muon": muon_tx, "adamw": adamw_tx}, labels),
@@ -482,6 +482,7 @@ def train_saccadion_smart(
             weights_path=export_dir / "saccadion_best.saccnet",
             harvest_shard_path=sparring_shard,
             status_json_path=checkpoint_dir / "arena_status.json",
+            movetime_ms=120,
         )
         arena.start()
 
@@ -640,11 +641,11 @@ def train_saccadion_smart(
         for epoch in range(start_epoch, epochs + 1):
             t_ep0 = time.time()
             if epoch <= stage1_end:
-                stage, stage_name, num_ticks, apl_target, qat = 1, "Embryo-Vision", 2, 0.25, False
+                stage, stage_name, num_ticks, apl_target, qat = 1, "Optic-Vision", 3, 0.16, False
             elif epoch <= stage2_end:
-                stage, stage_name, num_ticks, apl_target, qat = 2, "Phasor-Causal", cfg.cx_max_ticks, 0.12, False
+                stage, stage_name, num_ticks, apl_target, qat = 2, "Phasor-Causal", min(4, cfg.cx_max_ticks), 0.10, False
             else:
-                stage, stage_name, num_ticks, apl_target, qat = 3, "Meta-Dopamine+QAT", cfg.cx_max_ticks, 0.08, True
+                stage, stage_name, num_ticks, apl_target, qat = 3, "Meta-Dopamine+QAT", min(4, cfg.cx_max_ticks), 0.08, True
 
             train_fn = get_train_step(num_ticks, qat)
             val_fn = get_val_step(num_ticks, qat)

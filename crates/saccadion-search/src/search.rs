@@ -43,7 +43,7 @@ impl Default for SearchConfig {
             max_depth: 64,
             max_nodes: u64::MAX,
             time_limit_ms: 0,
-            cx_min_depth: 4,
+            cx_min_depth: 5,
             use_stream_b: true,
             use_dopamine: true,
             use_lateral_horn: true,
@@ -375,6 +375,7 @@ impl SearchEngine {
         }
 
         // 2. Fast Stream A Leaf Evaluation + Lateral Horn Innate Veto
+        //    Also fuse cached Stream B `deep_cp` from StrategicTT when available!
         let out_a = evaluate_stream_a(
             pos,
             &self.weights,
@@ -383,7 +384,16 @@ impl SearchEngine {
             parent_cent_mask,
             self.cfg.octopamine,
         );
-        let static_eval = out_a.total_cp.round() as i32;
+        let cached_strat_hit = if self.cfg.use_stream_b {
+            self.strategic_tt.probe(pos.hash).cloned()
+        } else {
+            None
+        };
+        let static_eval = if let Some(ref hit) = cached_strat_hit {
+            (0.75 * hit.deep_cp + 0.25 * out_a.total_cp).round() as i32
+        } else {
+            out_a.total_cp.round() as i32
+        };
 
         // Accumulate decaying eligibility trace on search stack for retroactive Dopamine credit
         // and trigger MBON -> DAN Second-Order Conditioning on stable alpha/beta valuation shifts
@@ -441,31 +451,29 @@ impl SearchEngine {
             return if in_check { -MATE_SCORE + ply as i32 } else { 0 };
         }
 
-        // 5. Selective Stream B Central Complex Oracle (only ~1-2% of nodes, cached in StrategicTT!)
+        // 5. Selective Stream B Central Complex Oracle (only ~1% of nodes: root, high-depth PV,
+        //    depth >= cx_min_depth, or surprise — keeps PRO 62M searching deep on CPU!)
         let need_stream_b = self.cfg.use_stream_b
-            && (depth >= self.cfg.cx_min_depth || (is_pv && depth >= 2) || efference_surprise);
+            && (depth >= self.cfg.cx_min_depth || (is_pv && depth >= 4) || (efference_surprise && depth >= 3));
 
-        let mut local_strat: Option<StrategicEntry> = None;
-        if need_stream_b {
-            if let Some(hit) = self.strategic_tt.probe(pos.hash) {
-                self.strategic_tt_hits += 1;
-                local_strat = Some(hit.clone());
-            } else {
-                let novelty = self.plasticity.mbon_alpha_prime3_novelty(&out_a.active_apbp_stm, false);
-                let out_b = evaluate_stream_b(
-                    pos,
-                    &moves,
-                    &self.weights,
-                    &out_a.mbon_summary,
-                    Some(&self.plasticity),
-                    novelty,
-                    self.cfg.serotonin,
-                    true,
-                );
-                self.stream_b_evals += 1;
-                self.strategic_tt.store(pos.hash, &out_b);
-                local_strat = self.strategic_tt.probe(pos.hash).cloned();
-            }
+        let mut local_strat: Option<StrategicEntry> = cached_strat_hit;
+        if local_strat.is_some() {
+            self.strategic_tt_hits += 1;
+        } else if need_stream_b {
+            let novelty = self.plasticity.mbon_alpha_prime3_novelty(&out_a.active_apbp_stm, false);
+            let out_b = evaluate_stream_b(
+                pos,
+                &moves,
+                &self.weights,
+                &out_a.mbon_summary,
+                Some(&self.plasticity),
+                novelty,
+                self.cfg.serotonin,
+                true,
+            );
+            self.stream_b_evals += 1;
+            self.strategic_tt.store(pos.hash, &out_b);
+            local_strat = self.strategic_tt.probe(pos.hash).cloned();
         }
 
         // PFL2 Sharpness-driven depth extension on critical turning points

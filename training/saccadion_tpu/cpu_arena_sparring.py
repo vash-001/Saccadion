@@ -68,16 +68,18 @@ def estimate_mle_elo(results: List[Tuple[int, float]]) -> Tuple[float, float]:
 
 
 def find_or_install_stockfish() -> Optional[Path]:
-    """Locates Stockfish binary or installs it cleanly on Linux/Colab if available."""
+    """Locates Stockfish binary, installs via apt, or fetches official Linux AVX2 binary on Colab."""
     for cand in [
         shutil.which("stockfish"),
+        "/content/bin/stockfish",
         "/usr/games/stockfish",
         "/usr/bin/stockfish",
         "/usr/local/bin/stockfish",
     ]:
         if cand and Path(cand).exists():
             return Path(cand)
-    # Auto-install on Colab Linux VM (`apt-get update` first so fresh containers find stockfish!)
+
+    # 1. Try apt-get on Colab Linux VM
     if Path("/content").exists() and shutil.which("apt-get"):
         try:
             subprocess.run(
@@ -97,6 +99,35 @@ def find_or_install_stockfish() -> Optional[Path]:
             for cand in [shutil.which("stockfish"), "/usr/games/stockfish", "/usr/bin/stockfish"]:
                 if cand and Path(cand).exists():
                     return Path(cand)
+        except Exception:
+            pass
+
+    # 2. Direct fallback: download official Stockfish Linux x86-64 AVX2 release tarball (~2s!)
+    if Path("/content").exists():
+        try:
+            import os
+            import tarfile
+            import urllib.request
+
+            sf_dir = Path("/content/bin")
+            sf_dir.mkdir(parents=True, exist_ok=True)
+            tar_path = sf_dir / "sf.tar"
+            url = "https://github.com/official-stockfish/Stockfish/releases/latest/download/stockfish-ubuntu-x86-64-avx2.tar"
+            req = urllib.request.Request(url, headers={"User-Agent": "Saccadion-Arena/1.0"})
+            with urllib.request.urlopen(req, timeout=45) as resp, open(tar_path, "wb") as out:
+                shutil.copyfileobj(resp, out)
+            with tarfile.open(tar_path, "r") as tf:
+                for member in tf.getmembers():
+                    if member.isfile() and "stockfish-ubuntu" in Path(member.name).name:
+                        src = tf.extractfile(member)
+                        if src is not None:
+                            dst = sf_dir / "stockfish"
+                            with open(dst, "wb") as f_out:
+                                shutil.copyfileobj(src, f_out)
+                            os.chmod(dst, 0o755)
+                            tar_path.unlink(missing_ok=True)
+                            return dst
+            tar_path.unlink(missing_ok=True)
         except Exception:
             pass
     return None
@@ -326,7 +357,7 @@ class StockfishSparringArena:
         for cand in [
             repo_root / "target" / "release" / "saccadion",
             repo_root / "target" / "release" / "saccadion.exe",
-            Path("/content/drive/MyDrive/Saccadion_TPU/bin_v4/saccadion"),
+            Path("/content/drive/MyDrive/Saccadion_TPU/bin_v5/saccadion"),
         ]:
             if cand.exists():
                 return cand
