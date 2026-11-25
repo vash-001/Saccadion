@@ -6,9 +6,11 @@ use saccadion_chess::types::{Move, MoveList, Piece, Square};
 
 #[derive(Clone, Debug)]
 pub struct ParsedGame {
+    /// Optional starting FEN for book/Fishtest PGNs (`[FEN "..."]`).
+    pub start_fen: Option<String>,
     /// Result from White's perspective: 1.0 = White win, 0.5 = Draw, 0.0 = Black win.
     pub white_result: f32,
-    /// Sequence of (legal move, optional centipawn eval from White's perspective parsed from [%eval]).
+    /// Sequence of (legal move, optional centipawn eval from STM perspective BEFORE playing move).
     pub moves: Vec<(Move, Option<f32>)>,
 }
 
@@ -105,46 +107,56 @@ pub fn parse_san_move(pos: &mut Position, raw_san: &str) -> Option<Move> {
     None
 }
 
-fn extract_eval_cp(comment: &str) -> Option<f32> {
-    // Format 1: Lichess PGN comment `[%eval 0.42]` or `[%eval #5]`
+/// Returns `(eval_cp, is_white_pov)`.
+/// Lichess `[%eval ...]` is always White POV; Fishtest/CuteChess `{+1.84/19 1.7s}` is moving-side POV.
+fn extract_eval_cp(comment: &str) -> Option<(f32, bool)> {
+    // Format 1: Lichess PGN comment `[%eval 0.42]` or `[%eval #5]` (White POV)
     if let Some(idx) = comment.find("[%eval ") {
         let tail = &comment[idx + 7..];
         let end = tail.find(']')?;
         let val_str = tail[..end].trim();
         if let Some(m_str) = val_str.strip_prefix('#') {
             let mate_in = m_str.parse::<i32>().ok()?;
-            return Some(if mate_in > 0 { 2500.0 } else { -2500.0 });
+            return Some((if mate_in > 0 { 2500.0 } else { -2500.0 }, true));
         }
         let pawns = val_str.parse::<f32>().ok()?;
-        return Some((pawns * 100.0).clamp(-2500.0, 2500.0));
+        return Some(((pawns * 100.0).clamp(-2500.0, 2500.0), true));
     }
-    // Format 2: Fishtest / CuteChess / TCEC comment `{ +0.42/22 0.15s }` or `{ +M5/30 ... }`
+    // Format 2: Fishtest / CuteChess / TCEC comment `{+1.84/19 1.7s}` or `{+M5/30 ...}` (STM POV)
     let first = comment.split_whitespace().next()?;
     if let Some((score_part, _depth_part)) = first.split_once('/') {
         let s = score_part.trim();
         if s.contains('M') || s.contains('m') {
-            return Some(if s.starts_with('-') { -2500.0 } else { 2500.0 });
+            return Some((if s.starts_with('-') { -2500.0 } else { 2500.0 }, false));
         }
         if let Ok(pawns) = s.parse::<f32>() {
-            return Some((pawns * 100.0).clamp(-2500.0, 2500.0));
+            return Some(((pawns * 100.0).clamp(-2500.0, 2500.0), false));
         }
     }
     None
 }
 
-/// Parses a multi-game PGN text string into structured games with moves and optional eval comments.
+/// Parses a multi-game PGN text string into structured games with [FEN] & eval comment support.
 pub fn parse_pgn_text(text: &str) -> Vec<ParsedGame> {
     let mut games = Vec::new();
     let mut in_movetext = false;
     let mut white_result = 0.5f32;
+    let mut start_fen: Option<String> = None;
     let mut move_buf = String::new();
 
-    let flush_game = |buf: &str, res: f32, out: &mut Vec<ParsedGame>| {
+    let flush_game = |buf: &str, res: f32, fen_opt: Option<String>, out: &mut Vec<ParsedGame>| {
         if buf.trim().is_empty() {
             return;
         }
-        let mut pos = Position::startpos();
+        let mut pos = match &fen_opt {
+            Some(f) => match Position::from_fen(f) {
+                Ok(p) => p,
+                Err(_) => return,
+            },
+            None => Position::startpos(),
+        };
         let mut moves: Vec<(Move, Option<f32>)> = Vec::new();
+        let mut mover_colors: Vec<saccadion_chess::types::Color> = Vec::new();
         let chars: Vec<char> = buf.chars().collect();
         let mut i = 0usize;
         let mut paren_depth = 0usize;
@@ -171,8 +183,21 @@ pub fn parse_pgn_text(text: &str) -> Vec<ParsedGame> {
                     i += 1;
                 }
                 let comment: String = chars[start..i].iter().collect();
-                if let (Some(eval), Some(last)) = (extract_eval_cp(&comment), moves.last_mut()) {
-                    last.1 = Some(eval);
+                if let (Some((raw_cp, is_white_pov)), Some(last), Some(&mover_c)) = (
+                    extract_eval_cp(&comment),
+                    moves.last_mut(),
+                    mover_colors.last(),
+                ) {
+                    let stm_cp = if is_white_pov {
+                        if mover_c == saccadion_chess::types::Color::White {
+                            raw_cp
+                        } else {
+                            -raw_cp
+                        }
+                    } else {
+                        raw_cp
+                    };
+                    last.1 = Some(stm_cp);
                 }
                 i += 1;
                 continue;
@@ -197,15 +222,18 @@ pub fn parse_pgn_text(text: &str) -> Vec<ParsedGame> {
             if san.is_empty() {
                 continue;
             }
+            let cur_stm = pos.side_to_move;
             if let Some(mv) = parse_san_move(&mut pos, san) {
                 pos.make_move(mv);
                 moves.push((mv, None));
+                mover_colors.push(cur_stm);
             } else {
                 break;
             }
         }
         if moves.len() >= 6 {
             out.push(ParsedGame {
+                start_fen: fen_opt,
                 white_result: res,
                 moves,
             });
@@ -216,7 +244,7 @@ pub fn parse_pgn_text(text: &str) -> Vec<ParsedGame> {
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             if in_movetext {
-                flush_game(&move_buf, white_result, &mut games);
+                flush_game(&move_buf, white_result, start_fen.take(), &mut games);
                 move_buf.clear();
                 white_result = 0.5;
                 in_movetext = false;
@@ -229,6 +257,10 @@ pub fn parse_pgn_text(text: &str) -> Vec<ParsedGame> {
                 } else {
                     white_result = 0.5;
                 }
+            } else if let Some(rest) = trimmed.strip_prefix("[FEN \"") {
+                if let Some(end_q) = rest.find('"') {
+                    start_fen = Some(rest[..end_q].to_string());
+                }
             }
         } else if !trimmed.is_empty() {
             in_movetext = true;
@@ -237,7 +269,7 @@ pub fn parse_pgn_text(text: &str) -> Vec<ParsedGame> {
         }
     }
     if in_movetext {
-        flush_game(&move_buf, white_result, &mut games);
+        flush_game(&move_buf, white_result, start_fen.take(), &mut games);
     }
 
     games

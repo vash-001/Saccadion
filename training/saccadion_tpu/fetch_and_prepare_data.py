@@ -264,23 +264,24 @@ def _pack_pgn_with_python_chess(
         s = w + d + l
         return (w / s, d / s, l / s)
 
-    def parse_comment_cp(comment: str) -> Optional[float]:
+    def parse_comment_cp(comment: str) -> Optional[Tuple[float, bool]]:
+        # Returns (eval_cp, is_white_pov): Lichess [%eval] is White POV, Fishtest {+1.84/19} is STM POV
         m = re.search(r"\[%eval\s+([^\]]+)\]", comment)
         if m:
             s = m.group(1).strip()
             if s.startswith("#"):
-                return 2500.0 if not s.startswith("#-") else -2500.0
+                return (2500.0 if not s.startswith("#-") else -2500.0, True)
             try:
-                return max(-2500.0, min(2500.0, float(s) * 100.0))
+                return (max(-2500.0, min(2500.0, float(s) * 100.0)), True)
             except ValueError:
                 return None
         tok = comment.strip().split()[0] if comment.strip() else ""
         if "/" in tok:
             s = tok.split("/")[0]
             if "M" in s or "m" in s:
-                return -2500.0 if s.startswith("-") else 2500.0
+                return (-2500.0 if s.startswith("-") else 2500.0, False)
             try:
-                return max(-2500.0, min(2500.0, float(s) * 100.0))
+                return (max(-2500.0, min(2500.0, float(s) * 100.0)), False)
             except ValueError:
                 return None
         return None
@@ -353,9 +354,10 @@ def _pack_pgn_with_python_chess(
 
                 n = len(nodes_data)
                 evals_stm = []
-                for b, _, ev_w, _ in nodes_data:
-                    if ev_w is not None:
-                        ev = ev_w if b.turn == chess.WHITE else -ev_w
+                for b, _, ev_info, _ in nodes_data:
+                    if ev_info is not None:
+                        ev_raw, is_white_pov = ev_info
+                        ev = (ev_raw if b.turn == chess.WHITE else -ev_raw) if is_white_pov else ev_raw
                     else:
                         mat = sum(
                             (piece_cp[piece_map[pc.piece_type]] if pc.color == b.turn else -piece_cp[piece_map[pc.piece_type]])

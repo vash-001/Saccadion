@@ -23,19 +23,20 @@ pub fn game_to_sacc_records(game: &ParsedGame) -> Vec<SaccRecord> {
         return Vec::new();
     }
 
-    // Pass 1: Replay full game to collect positions, STM colors, and pressure snapshots
-    let mut pos = Position::startpos();
+    // Pass 1: Replay full game (respecting [FEN] header for Fishtest/opening-book games)
+    let mut pos = match &game.start_fen {
+        Some(fen) => Position::from_fen(fen).unwrap_or_else(|_| Position::startpos()),
+        None => Position::startpos(),
+    };
     let mut positions = Vec::with_capacity(n_moves);
     let mut snapshots = Vec::with_capacity(n_moves);
     let mut stm_colors = Vec::with_capacity(n_moves);
     let mut evals_stm = Vec::with_capacity(n_moves);
 
-    for &(mv, eval_white_opt) in &game.moves {
+    for &(mv, eval_stm_opt) in &game.moves {
         let stm = pos.side_to_move;
         let snap = compute_pressure_snapshot(&pos);
-        let eval_stm = eval_white_opt
-            .map(|ew| if stm == Color::White { ew } else { -ew })
-            .unwrap_or_else(|| pos.material_balance_stm() as f32);
+        let eval_stm = eval_stm_opt.unwrap_or_else(|| pos.material_balance_stm() as f32);
 
         positions.push(pos.clone());
         snapshots.push(snap);
