@@ -539,7 +539,7 @@ def _find_rust_data_binary() -> Optional[Path]:
     for cand in [
         repo_root / "target" / "release" / "saccadion-data",
         repo_root / "target" / "release" / "saccadion-data.exe",
-        Path("/content/drive/MyDrive/Saccadion_TPU/bin/saccadion-data"),
+        Path("/content/drive/MyDrive/Saccadion_TPU/bin_v3/saccadion-data"),
     ]:
         if cand.exists():
             return cand
@@ -558,6 +558,23 @@ def _shards_fingerprint(shard_paths: List[Path]) -> str:
     return h.hexdigest()[:16]
 
 
+def _orient_move_u16_vec(moves: np.ndarray, stm: np.ndarray) -> np.ndarray:
+    """Flips (from_sq, to_sq) vertically (sq ^ 56) when stm == 1 (Black) so all policy,
+    Noduli, and VNC-2Ply targets match Stream B's STM-oriented board perspective 100%."""
+    m = moves.astype(np.int32)
+    mask = (stm != 0) & (m != 0)
+    u = ((m >> 6) & 63) ^ 56
+    v = (m & 63) ^ 56
+    flipped = (u << 6) | v
+    return np.where(mask, flipped, m).astype(np.uint16)
+
+
+def _orient_move_u16_scalar(mv: int, stm: int) -> int:
+    if stm == 0 or mv == 0:
+        return mv
+    return ((((mv >> 6) & 63) ^ 56) << 6) | ((mv & 63) ^ 56)
+
+
 def build_or_open_memmap_cache(
     shard_paths: List[Path],
     cache_root: Path,
@@ -572,12 +589,12 @@ def build_or_open_memmap_cache(
     if not shard_paths:
         return None
     fp = _shards_fingerprint(shard_paths)
-    cdir = cache_root / f"{split_name}_{fp}"
+    cdir = cache_root / f"{split_name}_v3_{fp}"
     meta_file = cdir / "meta.json"
     if meta_file.exists():
         try:
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
-            if meta.get("version") == 2 and int(meta.get("count", 0)) > 0:
+            if meta.get("version") == 3 and int(meta.get("count", 0)) > 0:
                 return cdir
         except Exception:
             pass
@@ -593,9 +610,14 @@ def build_or_open_memmap_cache(
             check=False,
         )
         if res.returncode == 0 and meta_file.exists():
-            print(" ", res.stdout.strip())
-            return cdir
-        print(f"[Warn] Rust predecode failed ({res.stderr.strip()}); falling back to Python multiprocessing.")
+            try:
+                m_chk = json.loads(meta_file.read_text(encoding="utf-8"))
+                if m_chk.get("version") == 3:
+                    print(" ", res.stdout.strip())
+                    return cdir
+            except Exception:
+                pass
+        print(f"[Warn] Rust predecode unavailable/outdated ({res.stderr.strip()}); using Python multiprocessing.")
 
     # Multi-process Python fallback (bypasses GIL across all CPU cores!)
     t0 = time.time()
@@ -659,13 +681,16 @@ def build_or_open_memmap_cache(
     lh.flush()
     ph.flush()
 
-    # Vectorized extraction of target arrays (instant in C/NumPy!)
+    # Vectorized extraction of target arrays with exact STM move orientation!
+    stm_arr = (all_recs["meta_flags"] & np.uint32(1)).astype(np.int32)
     np.ascontiguousarray(all_recs["wdl_target"], dtype="<f4").tofile(cdir / "wdl.f32")
-    np.ascontiguousarray(all_recs["top4_moves"], dtype="<u2").tofile(cdir / "top4_moves.u16")
+    top4_oriented = _orient_move_u16_vec(all_recs["top4_moves"], stm_arr[:, None])
+    np.ascontiguousarray(top4_oriented, dtype="<u2").tofile(cdir / "top4_moves.u16")
     probs = all_recs["top4_probs_u16"].astype(np.float32) / 65535.0
     probs_sum = np.maximum(np.sum(probs, axis=-1, keepdims=True), 1e-6)
     np.ascontiguousarray(probs / probs_sum, dtype="<f4").tofile(cdir / "top4_probs.f32")
-    np.ascontiguousarray(all_recs["next_move_u16"], dtype="<u2").tofile(cdir / "next_move.u16")
+    next_oriented = _orient_move_u16_vec(all_recs["next_move_u16"], stm_arr)
+    np.ascontiguousarray(next_oriented, dtype="<u2").tofile(cdir / "next_move.u16")
     np.ascontiguousarray(all_recs["pressure_targets"], dtype="<f4").tofile(cdir / "pressure.f32")
     np.ascontiguousarray(all_recs["lh_targets"], dtype="<f4").tofile(cdir / "lh_targets.f32")
     np.ascontiguousarray(all_recs["volatility"], dtype="<f4").tofile(cdir / "vol.f32")
@@ -677,7 +702,7 @@ def build_or_open_memmap_cache(
     np.ascontiguousarray(all_concepts, dtype="<u2").tofile(cdir / "causal_bits.u16")
 
     meta_file.write_text(
-        json.dumps({"count": n, "max_sparse": max_sparse, "version": 2, "num_shards": len(shard_paths)}),
+        json.dumps({"count": n, "max_sparse": max_sparse, "version": 3, "num_shards": len(shard_paths)}),
         encoding="utf-8",
     )
     dt = max(1e-3, time.time() - t0)
@@ -797,13 +822,14 @@ class SaccShardDataset:
         for i, ridx in enumerate(indices):
             ii = int(ridx)
             rec = self.records[ii]
+            stm_i = int(rec["meta_flags"]) & 1
             sp_s[i], sp_o[i], board[i], lh[i], phase[i] = decode_record_features(rec, self.max_sparse)
             wdl[i] = rec["wdl_target"]
-            top4_m[i] = rec["top4_moves"].astype(np.int32)
+            top4_m[i] = [_orient_move_u16_scalar(int(m), stm_i) for m in rec["top4_moves"]]
             probs = rec["top4_probs_u16"].astype(np.float32) / 65535.0
             probs_sum = float(np.sum(probs))
             top4_p[i] = probs / max(probs_sum, 1e-6)
-            next_m[i] = int(rec["next_move_u16"])
+            next_m[i] = _orient_move_u16_scalar(int(rec["next_move_u16"]), stm_i)
             press[i] = rec["pressure_targets"]
             lh_t[i] = rec["lh_targets"]
             vol[i] = float(rec["volatility"])
@@ -856,55 +882,80 @@ class SaccShardDataset:
         }
 
     def iter_batches(
-        self, batch_size: int, seed: int = 0, prefetch: int = 8
+        self, batch_size: int, seed: int = 0, prefetch: int = 3
     ) -> Iterator[Dict[str, np.ndarray]]:
-        """Yields shuffled mini-batches using sequential multi-block RAM streaming (30x faster I/O!).
+        """Yields shuffled mini-batches using low-RAM leak-free sequential block streaming.
 
-        For cached datasets (>100 MB), random scatter indexing across a 7+ GB memmap triggers
-        1,024 disk page faults per batch (~1,400 pos/s). Instead, we shuffle 16k-record contiguous
-        blocks, load 2-4 random blocks sequentially into RAM (mixing games + puzzles globally!),
-        shuffle in RAM, and emit batches at ~40,000+ pos/s with async prefetch!
+        Uses `stop_evt` + `try/finally` so early `break` (e.g. validation) NEVER leaks zombie
+        threads or pinned RAM buffers, and keeps RAM footprint under ~150 MB at all times!
         """
         rng = np.random.default_rng(seed)
 
-        if self._cached and self._count >= batch_size * 4:
-            block_sz = max(batch_size * 4, 8192)
+        if self._cached and self._count >= batch_size * 2:
+            block_sz = max(batch_size * 2, 4096)
             blocks = [
                 (s, min(self._count, s + block_sz))
                 for s in range(0, self._count, block_sz)
             ]
             block_order = rng.permutation(len(blocks))
-            # Combine 4 random blocks (~32,768 records = ~400 MB float32) at a time so every batch
-            # mixes Fishtest + Lichess Elite + Elite Causal Puzzles seamlessly in RAM!
-            mix_k = min(4, len(blocks))
+            mix_k = min(2, len(blocks))  # ~8,192 records (~96 MB RAM peak, zero OOM!)
 
-            q: queue.Queue = queue.Queue(maxsize=prefetch)
+            q: queue.Queue = queue.Queue(maxsize=max(1, prefetch))
+            stop_evt = threading.Event()
             sentinel = object()
+
+            def _put_safe(item: object) -> bool:
+                while not stop_evt.is_set():
+                    try:
+                        q.put(item, timeout=0.1)
+                        return True
+                    except queue.Full:
+                        continue
+                return False
 
             def fast_producer() -> None:
                 try:
                     for bi in range(0, len(block_order), mix_k):
+                        if stop_evt.is_set():
+                            break
                         chosen = block_order[bi : bi + mix_k]
                         chunks = [self._load_contiguous_chunk(*blocks[int(idx)]) for idx in chosen]
                         if len(chunks) == 1:
                             merged = chunks[0]
                         else:
                             merged = {k: np.concatenate([c[k] for c in chunks], axis=0) for k in chunks[0]}
+                        del chunks
                         m_len = len(merged["phase_bucket"])
                         local_perm = rng.permutation(m_len)
                         for pos in range(0, m_len - batch_size + 1, batch_size):
+                            if stop_evt.is_set():
+                                break
                             idx_sl = local_perm[pos : pos + batch_size]
-                            q.put({k: v[idx_sl] for k, v in merged.items()})
+                            if not _put_safe({k: v[idx_sl] for k, v in merged.items()}):
+                                break
+                        del merged
                 finally:
-                    q.put(sentinel)
+                    try:
+                        q.put(sentinel, timeout=0.2)
+                    except queue.Full:
+                        pass
 
             t = threading.Thread(target=fast_producer, daemon=True)
             t.start()
-            while True:
-                item = q.get()
-                if item is sentinel:
-                    break
-                yield item
+            try:
+                while True:
+                    item = q.get()
+                    if item is sentinel:
+                        break
+                    yield item
+            finally:
+                stop_evt.set()
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
+                t.join(timeout=1.0)
             return
 
         perm = rng.permutation(self._count)
@@ -912,28 +963,8 @@ class SaccShardDataset:
             perm[start : start + batch_size]
             for start in range(0, len(perm) - batch_size + 1, batch_size)
         ]
-        if len(slices) <= 2:
-            for sl in slices:
-                yield self._collate(sl)
-            return
-
-        q2: queue.Queue = queue.Queue(maxsize=prefetch)
-        sentinel2 = object()
-
-        def producer() -> None:
-            try:
-                for sl in slices:
-                    q2.put(self._collate(sl))
-            finally:
-                q2.put(sentinel2)
-
-        t2 = threading.Thread(target=producer, daemon=True)
-        t2.start()
-        while True:
-            item = q2.get()
-            if item is sentinel2:
-                break
-            yield item
+        for sl in slices:
+            yield self._collate(sl)
 
     def iter_trajectory_batches(
         self, batch_size: int, window_k: int = 12, seed: int = 0

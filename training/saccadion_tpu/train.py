@@ -24,12 +24,23 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
+import gc
 import json
 import math
 import pickle
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def _reclaim_host_ram() -> None:
+    """Explicitly reclaims Python + glibc heap arenas after each epoch to keep Colab RAM flat."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 import jax
 import jax.numpy as jnp
@@ -102,7 +113,10 @@ def build_muon_adamw_optimizer(
             labels[k] = "muon"
 
     if hasattr(optax, "contrib") and hasattr(optax.contrib, "muon"):
-        muon_tx = optax.contrib.muon(learning_rate=sched_muon, beta=0.95)
+        muon_tx = optax.chain(
+            optax.contrib.muon(learning_rate=sched_muon, beta=0.95),
+            optax.add_decayed_weights(weight_decay=1.5e-3),
+        )
     else:
         def init_fn(p):
             return (jnp.array(0, dtype=jnp.int32), jax.tree_util.tree_map(jnp.zeros_like, p))
@@ -117,9 +131,13 @@ def build_muon_adamw_optimizer(
             )
             return orth, (step + 1, new_mom)
 
-        muon_tx = optax.GradientTransformation(init_fn, update_fn)
+        muon_tx = optax.chain(
+            optax.GradientTransformation(init_fn, update_fn),
+            optax.add_decayed_weights(weight_decay=1.5e-3),
+        )
 
-    adamw_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=5e-4)
+    # Strong decoupled weight decay (1e-2) prevents 55M sparse table `a_ft_weight` memorization!
+    adamw_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=1.0e-2)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.multi_transform({"muon": muon_tx, "adamw": adamw_tx}, labels),
@@ -352,7 +370,9 @@ def train_saccadion_smart(
     if sparring_shard.exists() and sparring_shard not in train_shards:
         train_shards.append(sparring_shard)
 
-    val_shards = sorted(shard_dir.glob("val_*.sacc"))
+    val_game_shards = sorted(p for p in shard_dir.glob("val_*.sacc") if "puzzles" not in p.name)
+    val_puzzle_shards = sorted(shard_dir.glob("val_puzzles*.sacc"))
+    val_shards = val_game_shards if val_game_shards else sorted(shard_dir.glob("val_*.sacc"))
     traj_shards = sorted(shard_dir.glob("train_traj_*.sacc"))
 
     if not train_shards:
@@ -364,6 +384,11 @@ def train_saccadion_smart(
 
     train_ds = SaccShardDataset(train_shards, cache_dir=fast_cache_dir, split_name="train")
     val_ds = SaccShardDataset(val_shards, cache_dir=fast_cache_dir, split_name="val") if val_shards else train_ds
+    val_puz_ds = (
+        SaccShardDataset(val_puzzle_shards, cache_dir=fast_cache_dir, split_name="val_puz")
+        if val_puzzle_shards
+        else None
+    )
     # Stage-3 trajectory windows only run 40 batches/epoch -> no need to pre-cache 2.2M board_feats upfront!
     traj_ds = SaccShardDataset(traj_shards, cache_dir=None, split_name="traj") if traj_shards else train_ds
 
@@ -419,11 +444,11 @@ def train_saccadion_smart(
         params_dev = params
         opt_dev = opt_state
 
-    # Start Background CPU Stockfish Sparring & Real-Elo Arena (uses idle CPU cores!)
+    # Start Background CPU Stockfish Sparring & Real-Elo Arena using BEST generalizing weights!
     arena: Optional[StockfishSparringArena] = None
     if enable_cpu_arena:
         arena = StockfishSparringArena(
-            weights_path=export_dir / "saccadion_latest.saccnet",
+            weights_path=export_dir / "saccadion_best.saccnet",
             harvest_shard_path=sparring_shard,
             status_json_path=checkpoint_dir / "arena_status.json",
         )
@@ -574,8 +599,6 @@ def train_saccadion_smart(
             val_fn = get_val_step(num_ticks, qat)
 
             ep_losses: List[float] = []
-            hard_buffer: List[Tuple[float, Dict[str, np.ndarray]]] = []
-            max_hard_keep = max(2, steps_per_epoch // 8)
             pos_seen = 0
             ema_step_ms = 25.0
 
@@ -597,13 +620,6 @@ def train_saccadion_smart(
                 ep_losses.append(loss_val)
                 global_step += 1
                 pos_seen += eff_bsz
-
-                # Smart Hard-Example Surprise Replay Buffer (keeps top hardest batches)
-                if len(hard_buffer) < max_hard_keep:
-                    hard_buffer.append((loss_val, batch_np))
-                elif loss_val > hard_buffer[0][0]:
-                    hard_buffer[0] = (loss_val, batch_np)
-                    hard_buffer.sort(key=lambda x: x[0])
 
                 # Smooth 20 Hz Live Cockpit update (zero flicker, throttled to <= 20 fps!)
                 elapsed_ep = max(1e-3, time.time() - t_ep0)
@@ -634,17 +650,6 @@ def train_saccadion_smart(
                     save_checkpoint(ckpt_file, host_p, host_o, epoch - 1, global_step, best_val_loss, history)
                     last_ckpt_time = time.time()
 
-            # Hard-Example Surprise Replay pass (enabled in Stages 2-3 to prevent Stage-1 overfitting)
-            if stage >= 2:
-                for _, hard_b in hard_buffer:
-                    if use_pmap:
-                        b_in = _shard_batch_for_pmap(hard_b, n_dev)
-                        params_dev, opt_dev, _ = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight)
-                    else:
-                        b_in = {k: jnp.asarray(v) for k, v in hard_b.items()}
-                        params_dev, opt_dev, _ = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight)
-                    pos_seen += eff_bsz
-
             # Unwrap single-host copy for Stage-3 Meta-Dopamine scan & Validation
             host_params = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
             host_opt = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
@@ -665,7 +670,7 @@ def train_saccadion_smart(
                 else:
                     params_dev, opt_dev = host_params, host_opt
 
-            # Full Held-Out Validation Evaluation (including 16-Causal-Concept F1 & Noduli Gap!)
+            # Full Held-Out Validation Evaluation (Games + Dedicated 16-Causal-Concept Puzzles!)
             val_acc: Dict[str, List[float]] = {
                 k: []
                 for k in [
@@ -679,9 +684,19 @@ def train_saccadion_smart(
                 vb = {k: jnp.asarray(v) for k, v in vbatch_np.items()}
                 vm = val_fn(host_params, vb, apl_target, apl_weight)
                 for k in val_acc:
-                    val_acc[k].append(float(vm[k]))
-                if v_i >= 30:
+                    if k not in ("causal", "causal_f1"):
+                        val_acc[k].append(float(vm[k]))
+                if v_i >= 24:
                     break
+
+            # Dedicated held-out evaluation on 16-Causal-Concept Elite Puzzles!
+            if val_puz_ds is not None and len(val_puz_ds) > 0:
+                p_bsz = min(eff_bsz, len(val_puz_ds))
+                for pbatch_np in val_puz_ds.iter_batches(p_bsz, seed=12345):
+                    pb = {k: jnp.asarray(v) for k, v in pbatch_np.items()}
+                    pm = val_fn(host_params, pb, apl_target, apl_weight)
+                    val_acc["causal"].append(float(pm["causal"]))
+                    val_acc["causal_f1"].append(float(pm["causal_f1"]))
 
             v_mean = {k: float(np.mean(v)) if v else 0.0 for k, v in val_acc.items()}
             ep_sec = max(1e-3, time.time() - t_ep0)
@@ -750,7 +765,7 @@ def train_saccadion_smart(
                 "trace_rho": rho_v,
                 "lr_muon": float(sched_muon(global_step)),
                 "lr_adamw": float(sched_adamw(global_step)),
-                "replay_batches": len(hard_buffer) if stage >= 2 else 0,
+                "replay_batches": 0,
                 "epoch_sec": ep_sec,
                 "pos_per_sec": pos_seen / ep_sec,
             }
@@ -776,6 +791,8 @@ def train_saccadion_smart(
             _print_epoch_banner(row, is_best)
             save_checkpoint(ckpt_file, host_params, host_opt, epoch, global_step, best_val_loss, history)
             last_ckpt_time = time.time()
+            # Reclaim Python + glibc host RAM cleanly every epoch so Colab RAM never climbs!
+            _reclaim_host_ram()
     finally:
         if arena is not None:
             arena.stop()

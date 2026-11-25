@@ -66,10 +66,12 @@ pub fn game_to_sacc_records(game: &ParsedGame) -> Vec<SaccRecord> {
             [0.08, 0.84, 0.08]
         };
         let eval_wdl = cp_to_wdl_probs(evals_stm[ply]);
+        let has_engine_eval = game.moves[ply].1.is_some();
+        let (w_ev, w_out) = if has_engine_eval { (0.75, 0.25) } else { (0.25, 0.75) };
         let wdl_target = [
-            0.60 * eval_wdl[0] + 0.40 * out_wdl[0],
-            0.60 * eval_wdl[1] + 0.40 * out_wdl[1],
-            0.60 * eval_wdl[2] + 0.40 * out_wdl[2],
+            w_ev * eval_wdl[0] + w_out * out_wdl[0],
+            w_ev * eval_wdl[1] + w_out * out_wdl[1],
+            w_ev * eval_wdl[2] + w_out * out_wdl[2],
         ];
 
         let best_mv = game.moves[ply].0;

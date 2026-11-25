@@ -120,7 +120,7 @@ def init_saccadion_params(cfg: SaccadionConfig, seed: int = 42) -> Dict[str, jnp
         "b_seed_to_cent": u((cfg.acc_dim, cfg.seed_rank), 0.1),
         # Training-only AOTU -> LAL -> SMP 16-Causal-Concept Effectome Head (zero Rust latency!)
         "aux_causal_w": u((NUM_CAUSAL_CONCEPTS, d + cx), s_d),
-        "aux_causal_b": jnp.full((NUM_CAUSAL_CONCEPTS,), -1.5, dtype=jnp.float32),
+        "aux_causal_b": jnp.full((NUM_CAUSAL_CONCEPTS,), -0.5, dtype=jnp.float32),
         # Training-only 2-Ply VNC Causal Consequence Head (predicts m_{t+2} enabled by m_t)
         "aux_vnc2_q": u((cx, d), s_d),
         "aux_vnc2_k": u((cx, d), s_d),

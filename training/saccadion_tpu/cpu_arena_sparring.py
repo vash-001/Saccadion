@@ -77,9 +77,16 @@ def find_or_install_stockfish() -> Optional[Path]:
     ]:
         if cand and Path(cand).exists():
             return Path(cand)
-    # Auto-install on Colab Linux VM (quiet, ~4 seconds)
+    # Auto-install on Colab Linux VM (`apt-get update` first so fresh containers find stockfish!)
     if Path("/content").exists() and shutil.which("apt-get"):
         try:
+            subprocess.run(
+                ["apt-get", "update", "-qq"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=45,
+                check=False,
+            )
             subprocess.run(
                 ["apt-get", "install", "-qq", "-y", "stockfish"],
                 stdout=subprocess.DEVNULL,
@@ -218,8 +225,15 @@ class _UciProcess:
         except Exception:
             try:
                 self.proc.kill()
+                self.proc.wait(timeout=2.0)
             except Exception:
                 pass
+        for stream in (self.proc.stdin, self.proc.stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
 
 @dataclass
@@ -312,7 +326,7 @@ class StockfishSparringArena:
         for cand in [
             repo_root / "target" / "release" / "saccadion",
             repo_root / "target" / "release" / "saccadion.exe",
-            Path("/content/drive/MyDrive/Saccadion_TPU/bin/saccadion"),
+            Path("/content/drive/MyDrive/Saccadion_TPU/bin_v3/saccadion"),
         ]:
             if cand.exists():
                 return cand

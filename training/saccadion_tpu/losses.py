@@ -33,10 +33,14 @@ def sparse_topk_policy_loss(
     policy_logits: jnp.ndarray,  # [B, 4096]
     top4_moves: jnp.ndarray,     # [B, 4] int32
     top4_probs: jnp.ndarray,     # [B, 4] float32 (sums to 1.0)
+    label_smoothing: float = 0.05,
 ) -> jnp.ndarray:
     log_p = jax.nn.log_softmax(policy_logits, axis=-1)
     gathered = jnp.take_along_axis(log_p, top4_moves, axis=-1)
-    return -jnp.mean(jnp.sum(top4_probs * gathered, axis=-1))
+    nll = -jnp.mean(jnp.sum(top4_probs * gathered, axis=-1))
+    # Smooth entropy regularizer prevents overconfident logit memorization on 4096 classes
+    smooth = -jnp.mean(log_p)
+    return (1.0 - label_smoothing) * nll + label_smoothing * smooth
 
 
 def creative_orthogonality_loss(plans: jnp.ndarray) -> jnp.ndarray:
@@ -92,16 +96,22 @@ def causal_concept_loss(
     causal_logits: jnp.ndarray,   # [B, 16]
     causal_targets: jnp.ndarray,  # [B, 16] in {0, 1}
     causal_mask: jnp.ndarray,     # [B] in {0, 1} (1 only on elite causal-tagged records)
+    pos_weight: float = 4.0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Masked multi-label binary cross-entropy over the 16 Elite Causal Chess Concepts."""
-    # Numerically stable sigmoid BCE
-    bce = jnp.maximum(causal_logits, 0.0) - causal_logits * causal_targets + jnp.log1p(jnp.exp(-jnp.abs(causal_logits)))
+    """Positive-weighted masked multi-label BCE over the 16 Elite Causal Chess Concepts.
+
+    Each puzzle activates ~2 of 16 concepts (12.5% positive rate); pos_weight=4.0 prevents
+    trivial all-zero collapse and drives crisp recall/F1 across all 16 causal concepts!
+    """
+    log_sig = jax.nn.log_sigmoid(causal_logits)
+    log_1msig = jax.nn.log_sigmoid(-causal_logits)
+    bce = -(pos_weight * causal_targets * log_sig + (1.0 - causal_targets) * log_1msig)
     per_sample = jnp.mean(bce, axis=-1)  # [B]
     denom = jnp.maximum(jnp.sum(causal_mask), 1.0)
     loss = jnp.sum(per_sample * causal_mask) / denom
 
-    # Soft F1 telemetry on tagged samples
-    preds = (jax.nn.sigmoid(causal_logits) >= 0.5).astype(jnp.float32) * causal_mask[:, None]
+    # Soft F1 telemetry on tagged samples (threshold 0.45 calibrated for pos_weight=4)
+    preds = (jax.nn.sigmoid(causal_logits) >= 0.45).astype(jnp.float32) * causal_mask[:, None]
     targs = causal_targets * causal_mask[:, None]
     tp = jnp.sum(preds * targs)
     fp = jnp.sum(preds * (1.0 - targs))
@@ -190,7 +200,7 @@ def compute_multitask_loss(
 
     total = (
         loss_wdl
-        + 0.60 * loss_policy
+        + 0.65 * loss_policy
         + 0.40 * loss_pressure
         + 0.30 * loss_threat
         + 0.20 * loss_vol
@@ -198,8 +208,8 @@ def compute_multitask_loss(
         + 0.25 * loss_jepa
         + 0.10 * loss_orth
         + apl_weight * loss_apl
-        + 0.22 * loss_noduli
-        + 0.25 * loss_causal
+        + 0.25 * loss_noduli
+        + 0.65 * loss_causal
         + 0.12 * loss_vnc2
     )
     metrics = {

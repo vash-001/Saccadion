@@ -16,6 +16,17 @@ use std::time::Instant;
 
 const MAX_SPARSE_CACHE: usize = 80;
 
+#[inline(always)]
+fn orient_move_u16(mv: u16, stm: u32) -> u16 {
+    if stm == 0 || mv == 0 {
+        mv
+    } else {
+        let u = ((mv >> 6) & 63) ^ 56;
+        let v = (mv & 63) ^ 56;
+        (u << 6) | v
+    }
+}
+
 fn read_optional_concepts(shard_path: &Path, expected_len: usize) -> Vec<u16> {
     let mut name = shard_path.file_name().unwrap_or_default().to_os_string();
     name.push(".concepts.u16");
@@ -157,9 +168,12 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
                     let lh = extract_lateral_horn_features(&pos);
                     c_lh[i * LATERAL_HORN_DIM..(i + 1) * LATERAL_HORN_DIM].copy_from_slice(&lh);
 
+                    let stm = rec.meta_flags & 1;
                     c_ph[i] = ((rec.meta_flags >> 17) & 0x07) as u8;
                     c_wdl[i * 3..(i + 1) * 3].copy_from_slice(&rec.wdl_target);
-                    c_t4m[i * 4..(i + 1) * 4].copy_from_slice(&rec.top4_moves);
+                    for k in 0..4 {
+                        c_t4m[i * 4 + k] = orient_move_u16(rec.top4_moves[k], stm);
+                    }
                     let mut psum = 0.0f32;
                     let mut pf = [0.0f32; 4];
                     for k in 0..4 {
@@ -170,7 +184,7 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
                     for k in 0..4 {
                         c_t4p[i * 4 + k] = pf[k] * inv;
                     }
-                    c_nm[i] = rec.next_move_u16;
+                    c_nm[i] = orient_move_u16(rec.next_move_u16, stm);
                     c_pr[i * 5..(i + 1) * 5].copy_from_slice(&rec.pressure_targets);
                     c_lht[i * 4..(i + 1) * 4].copy_from_slice(&rec.lh_targets);
                     c_vol[i] = rec.volatility;
@@ -199,7 +213,7 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
     write_raw_slice(&out_cache_dir.join("causal_bits.u16"), &all_concepts).expect("write causal_bits");
 
     let meta_json = format!(
-        "{{\"count\": {}, \"max_sparse\": {}, \"version\": 2, \"num_shards\": {}}}",
+        "{{\"count\": {}, \"max_sparse\": {}, \"version\": 3, \"num_shards\": {}}}",
         n,
         MAX_SPARSE_CACHE,
         shard_paths.len()
