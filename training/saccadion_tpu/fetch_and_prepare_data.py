@@ -68,13 +68,15 @@ def download_lichess_elite(raw_dir: Path, max_games: int = 5000) -> Optional[Pat
     """Fetches the latest monthly Lichess Elite 2500+ PGN archive from database.nikonoel.fr."""
     try:
         html = _http_get_text("https://database.nikonoel.fr/")
-        zips = re.findall(r'href="(lichess_elite_\d{4}-\d{2}\.zip)"', html)
+        zips = re.findall(
+            r'href="((?:https?://[^"]*/)?lichess_elite_\d{4}-\d{2}\.zip)"', html
+        )
         if not zips:
             print("[Warn] Could not parse Lichess Elite links from database.nikonoel.fr")
             return None
         latest = sorted(set(zips))[-1]
-        url = f"https://database.nikonoel.fr/{latest}"
-        zip_path = raw_dir / latest
+        url = latest if latest.startswith("http") else f"https://database.nikonoel.fr/{latest}"
+        zip_path = raw_dir / Path(url).name
         if not zip_path.exists():
             _http_download(url, zip_path)
         out_pgn = raw_dir / f"elite_{max_games}.pgn"
@@ -113,57 +115,57 @@ def download_fishtest_pgn(raw_dir: Path, max_games: int = 5000) -> Optional[Path
     try:
         api_url = "https://huggingface.co/api/datasets/official-stockfish/fishtest_pgns/tree/main"
         listing = json.loads(_http_get_text(api_url))
-        # Find a recent directory or .pgn.gz file
-        gz_files = [e["path"] for e in listing if e.get("path", "").endswith(".pgn.gz")]
-        if not gz_files:
-            dirs = sorted([e["path"] for e in listing if e.get("type") == "directory"])
-            for d in reversed(dirs[-4:]):
-                sub = json.loads(_http_get_text(f"{api_url}/{d}"))
-                gz_files = [e["path"] for e in sub if e.get("path", "").endswith(".pgn.gz")]
-                if gz_files:
-                    break
-                # Go one level deeper if organized by year/month
-                sub_dirs = sorted([e["path"] for e in sub if e.get("type") == "directory"])
-                if sub_dirs:
-                    sub2 = json.loads(_http_get_text(f"{api_url}/{sub_dirs[-1]}"))
-                    gz_files = [e["path"] for e in sub2 if e.get("path", "").endswith(".pgn.gz")]
-                    if gz_files:
-                        break
-        if not gz_files:
+        dirs = sorted([e["path"] for e in listing if e.get("type") == "directory"])
+        gz_paths: List[str] = []
+        for day_dir in reversed(dirs[-10:]):
+            runs = json.loads(_http_get_text(f"{api_url}/{day_dir}"))
+            for run in runs[:8]:
+                if run.get("type") == "directory":
+                    files = json.loads(_http_get_text(f"{api_url}/{run['path']}"))
+                    for f in files:
+                        if f.get("path", "").endswith(".pgn.gz"):
+                            gz_paths.append(f["path"])
+                elif run.get("path", "").endswith(".pgn.gz"):
+                    gz_paths.append(run["path"])
+            if len(gz_paths) >= 6:
+                break
+
+        if not gz_paths:
             print("[Warn] No .pgn.gz files located in official-stockfish/fishtest_pgns")
             return None
 
-        target_path = gz_files[-1]
-        dl_url = f"https://huggingface.co/datasets/official-stockfish/fishtest_pgns/resolve/main/{target_path}"
-        gz_local = raw_dir / Path(target_path).name
-        if not gz_local.exists():
-            _http_download(dl_url, gz_local, max_bytes=45 * 1024 * 1024)
-
         out_pgn = raw_dir / f"fishtest_{max_games}.pgn"
         count = 0
-        with gzip.open(gz_local, "rt", encoding="utf-8", errors="ignore") as src, open(
-            out_pgn, "w", encoding="utf-8"
-        ) as dst:
-            buf: List[str] = []
-            in_moves = False
-            try:
-                for line in src:
-                    if line.startswith("[Event ") and in_moves:
+        with open(out_pgn, "w", encoding="utf-8") as dst:
+            for target_path in gz_paths:
+                if count >= max_games:
+                    break
+                dl_url = f"https://huggingface.co/datasets/official-stockfish/fishtest_pgns/resolve/main/{target_path}"
+                gz_local = raw_dir / Path(target_path).name
+                if not gz_local.exists():
+                    _http_download(dl_url, gz_local, max_bytes=30 * 1024 * 1024)
+                with gzip.open(gz_local, "rt", encoding="utf-8", errors="ignore") as src:
+                    buf: List[str] = []
+                    in_moves = False
+                    try:
+                        for line in src:
+                            if line.startswith("[Event ") and in_moves:
+                                dst.writelines(buf)
+                                dst.write("\n")
+                                buf.clear()
+                                in_moves = False
+                                count += 1
+                                if count >= max_games:
+                                    break
+                            elif not line.startswith("[") and line.strip():
+                                in_moves = True
+                            buf.append(line)
+                    except EOFError:
+                        pass
+                    if buf and count < max_games and in_moves:
                         dst.writelines(buf)
                         dst.write("\n")
-                        buf.clear()
-                        in_moves = False
                         count += 1
-                        if count >= max_games:
-                            break
-                    elif not line.startswith("[") and line.strip():
-                        in_moves = True
-                    buf.append(line)
-            except EOFError:
-                pass  # Expected if capped by max_bytes stream download
-            if buf and count < max_games and in_moves:
-                dst.writelines(buf)
-                count += 1
         print(f"Extracted {count:,} Stockfish Fishtest evaluated games -> {out_pgn}")
         return out_pgn if count > 0 else None
     except Exception as exc:
