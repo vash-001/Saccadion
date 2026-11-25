@@ -118,10 +118,10 @@ def init_saccadion_params(cfg: SaccadionConfig, seed: int = 42) -> Dict[str, jnp
         "b_seed_down": u((cfg.seed_rank, d + cx), s_d),
         "b_seed_to_gamma": u((gamma_dim, cfg.seed_rank), 0.1),
         "b_seed_to_cent": u((cfg.acc_dim, cfg.seed_rank), 0.1),
-        # Learnable meta-plasticity scalars (trained in Stage 3 via lax.scan)
-        "meta_eta_pam": jnp.array(0.08, dtype=jnp.float32),
-        "meta_eta_ppl1": jnp.array(0.28, dtype=jnp.float32),
-        "meta_trace_decay": jnp.array(0.65, dtype=jnp.float32),
+        # Learnable meta-plasticity scalars (initialized via inverse-softplus -> 0.08, 0.28, 0.65)
+        "meta_eta_pam": jnp.array(-2.484, dtype=jnp.float32),
+        "meta_eta_ppl1": jnp.array(-1.130, dtype=jnp.float32),
+        "meta_trace_decay": jnp.array(0.619, dtype=jnp.float32),
     }
 
 

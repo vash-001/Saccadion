@@ -23,9 +23,11 @@ from pathlib import Path
 REPO_URL = "https://github.com/vash-001/Saccadion.git"
 MODEL_TIER = "nano"          # "tiny" (smoke test) | "nano" (fast ablation) | "pro" (full 62M)
 DATA_SOURCE = "auto"         # "auto" (Elite + Fishtest) | "lichess_elite" | "fishtest" | "lichess_eval"
-MAX_GAMES = 4000             # Increase to 20000-100000 for serious Pro training
+MAX_GAMES = 12000            # ~1.2M positions (prevents overfitting on Nano!)
 EPOCHS = 15                  # Smart 3-stage Neurodevelopmental curriculum across all epochs
 BATCH_SIZE = 1024            # Divisible by 8 for TPU v2-8 pmap sharding
+LR_MUON = 4.0e-3             # Calibrated Muon peak LR for smooth generalization
+LR_ADAMW = 6.0e-4            # Calibrated AdamW peak LR
 USE_GOOGLE_DRIVE = True      # Saves checkpoints & best .saccnet safely across Colab disconnects
 # ====================================================================
 
@@ -97,6 +99,8 @@ def main() -> None:
         export_dir=export_dir,
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
+        lr_muon=LR_MUON,
+        lr_adamw=LR_ADAMW,
     )
 
     # 7. Display visual 6-panel dashboard inline in Colab

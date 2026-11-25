@@ -558,11 +558,43 @@ class SaccShardDataset:
             "threat_map_64": threat,
         }
 
-    def iter_batches(self, batch_size: int, seed: int = 0) -> Iterator[Dict[str, np.ndarray]]:
+    def iter_batches(
+        self, batch_size: int, seed: int = 0, num_workers: int = 4, prefetch: int = 4
+    ) -> Iterator[Dict[str, np.ndarray]]:
+        """Yields shuffled mini-batches with multi-threaded CPU decoding & async TPU prefetch."""
+        from concurrent.futures import ThreadPoolExecutor
+        import queue
+        import threading
+
         rng = np.random.default_rng(seed)
         perm = rng.permutation(len(self.records))
-        for start in range(0, len(perm) - batch_size + 1, batch_size):
-            yield self._collate(perm[start : start + batch_size])
+        slices = [
+            perm[start : start + batch_size]
+            for start in range(0, len(perm) - batch_size + 1, batch_size)
+        ]
+        if num_workers <= 1 or len(slices) <= 2:
+            for sl in slices:
+                yield self._collate(sl)
+            return
+
+        q: queue.Queue = queue.Queue(maxsize=prefetch)
+        sentinel = object()
+
+        def producer() -> None:
+            try:
+                with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                    for batch in pool.map(self._collate, slices):
+                        q.put(batch)
+            finally:
+                q.put(sentinel)
+
+        t = threading.Thread(target=producer, daemon=True)
+        t.start()
+        while True:
+            item = q.get()
+            if item is sentinel:
+                break
+            yield item
 
     def iter_trajectory_batches(
         self, batch_size: int, window_k: int = 12, seed: int = 0
