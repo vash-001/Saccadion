@@ -192,31 +192,37 @@ class LiveTrainingHUD:
         eta_h, eta_m = divmod(eta_m, 60)
         eta_fmt = f"{eta_h:d}h {eta_m:02d}m {eta_s:02d}s" if eta_h > 0 else f"{eta_m:02d}m {eta_s:02d}s"
 
-        # Build live SVG charts
+        # Build live SVG charts safely (handles migrated Saccadion-1 history rows missing new keys!)
         loss_series: List[Tuple[str, str, List[float]]] = [
             ("StepLoss", "#38bdf8", self.step_loss_ring[-120:]),
         ]
-        if history:
-            loss_series.append(("ValLoss", "#f472b6", [r["val_loss"] for r in history]))
+        val_losses = [r["val_loss"] for r in history if "val_loss" in r]
+        if val_losses:
+            loss_series.append(("ValLoss", "#f472b6", val_losses))
         svg_loss = _svg_line_chart("Loss (Live Step & Val)", loss_series)
 
         acc_series: List[Tuple[str, str, List[float]]] = [
-            ("Top1%", "#34d399", [r["val_top1_acc"] for r in history]),
-            ("WDL%", "#fbbf24", [r["val_wdl_acc"] for r in history]),
+            ("Top1%", "#34d399", [r.get("val_top1_acc", 0.0) for r in history]),
+            ("WDL%", "#fbbf24", [r.get("val_wdl_acc", 0.0) for r in history]),
             ("CausalF1%", "#c084fc", [r.get("val_causal_f1", 0.0) * 100.0 for r in history]),
         ]
         svg_acc = _svg_line_chart("Chess & Causal IQ (%)", acc_series, y_min_fixed=0.0, y_max_fixed=100.0)
 
-        elo_series: List[Tuple[str, str, List[float]]] = [
-            ("Est+PVS", "#22d3ee", [r["est_search_elo"] for r in history]),
-            ("EstNet", "#4ade80", [r["est_raw_elo"] for r in history]),
-        ]
+        elo_series: List[Tuple[str, str, List[float]]] = []
+        pvs_elos = [r["est_search_elo"] for r in history if "est_search_elo" in r]
+        raw_elos = [r["est_raw_elo"] for r in history if "est_raw_elo" in r]
         real_elos = [r["real_arena_elo"] for r in history if r.get("real_arena_elo", 0.0) > 0]
+        if pvs_elos:
+            elo_series.append(("Est+PVS", "#22d3ee", pvs_elos))
+        if raw_elos:
+            elo_series.append(("EstNet", "#4ade80", raw_elos))
         if real_elos:
             elo_series.append(("RealSF", "#fb7185", real_elos))
+        elif real_elo_val > 0:
+            elo_series.append(("RealSF", "#fb7185", [real_elo_val]))
         svg_elo = _svg_line_chart("Real Arena vs Proxy Elo", elo_series)
 
-        kc_vals = [r["val_active_kc_pct"] for r in history] if history else self.step_kc_ring[-80:]
+        kc_vals = [r.get("val_active_kc_pct", 0.0) for r in history] if history else self.step_kc_ring[-80:]
         svg_kc = _svg_line_chart(
             "APL Sparsity (Target 8.0%)",
             [("ActiveKC%", "#a78bfa", kc_vals)],

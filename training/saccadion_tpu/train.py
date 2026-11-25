@@ -182,9 +182,10 @@ def _save_metrics_and_dashboard(history: List[Dict[str, Any]], ckpt_dir: Path) -
             f.write(json.dumps(row) + "\n")
 
     csv_path = ckpt_dir / "metrics_history.csv"
-    keys = list(history[0].keys())
+    # Take ordered union of keys across all epochs so migrated checkpoints never fail CSV export
+    keys = list(dict.fromkeys(k for row in history for k in row.keys()))
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+        writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore", restval="")
         writer.writeheader()
         writer.writerows(history)
 
@@ -194,14 +195,14 @@ def _save_metrics_and_dashboard(history: List[Dict[str, Any]], ckpt_dir: Path) -
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        epochs = [r["epoch"] for r in history]
+        epochs = [r.get("epoch", i + 1) for i, r in enumerate(history)]
         fig, axes = plt.subplots(2, 3, figsize=(16, 9))
-        fig.suptitle("Saccadion-1 Smart TPU Training Telemetry", fontsize=14, fontweight="bold")
+        fig.suptitle("Saccadion-2 Causal Smart TPU Training Telemetry", fontsize=14, fontweight="bold")
 
         # Panel 1: Total Train vs Val Loss
         ax = axes[0, 0]
-        ax.plot(epochs, [r["train_loss"] for r in history], label="Train Total", marker="o")
-        ax.plot(epochs, [r["val_loss"] for r in history], label="Val Total", marker="s")
+        ax.plot(epochs, [r.get("train_loss", 0.0) for r in history], label="Train Total", marker="o")
+        ax.plot(epochs, [r.get("val_loss", 0.0) for r in history], label="Val Total", marker="s")
         ax.set_title("Total Loss (Train vs Val)")
         ax.set_xlabel("Epoch")
         ax.grid(True, alpha=0.3)
@@ -209,10 +210,10 @@ def _save_metrics_and_dashboard(history: List[Dict[str, Any]], ckpt_dir: Path) -
 
         # Panel 2: Multi-Sensor Breakdown (Val)
         ax = axes[0, 1]
-        ax.plot(epochs, [r["val_wdl_b"] for r in history], label="WDL Deep (B)")
-        ax.plot(epochs, [r["val_wdl_a"] for r in history], label="WDL Fast (A)")
-        ax.plot(epochs, [r["val_policy"] for r in history], label="PFL3 Policy")
-        ax.plot(epochs, [r["val_pressure"] for r in history], label="Pressure 10-20ply")
+        ax.plot(epochs, [r.get("val_wdl_b", 0.0) for r in history], label="WDL Deep (B)")
+        ax.plot(epochs, [r.get("val_wdl_a", 0.0) for r in history], label="WDL Fast (A)")
+        ax.plot(epochs, [r.get("val_policy", 0.0) for r in history], label="PFL3 Policy")
+        ax.plot(epochs, [r.get("val_pressure", 0.0) for r in history], label="Pressure 10-20ply")
         ax.set_title("Validation Multi-Sensor Losses")
         ax.set_xlabel("Epoch")
         ax.grid(True, alpha=0.3)
@@ -220,17 +221,18 @@ def _save_metrics_and_dashboard(history: List[Dict[str, Any]], ckpt_dir: Path) -
 
         # Panel 3: Chess Accuracies (%)
         ax = axes[0, 2]
-        ax.plot(epochs, [r["val_top1_acc"] for r in history], label="Move Top-1 %", marker="o")
-        ax.plot(epochs, [r["val_top3_acc"] for r in history], label="Move Top-3 %", marker="^")
-        ax.plot(epochs, [r["val_wdl_acc"] for r in history], label="WDL Outcome %", marker="s")
-        ax.set_title("Chess Accuracy Metrics (%)")
+        ax.plot(epochs, [r.get("val_top1_acc", 0.0) for r in history], label="Move Top-1 %", marker="o")
+        ax.plot(epochs, [r.get("val_top3_acc", 0.0) for r in history], label="Move Top-3 %", marker="^")
+        ax.plot(epochs, [r.get("val_wdl_acc", 0.0) for r in history], label="WDL Outcome %", marker="s")
+        ax.plot(epochs, [r.get("val_causal_f1", 0.0) * 100.0 for r in history], label="Causal Concept F1 %", marker="d")
+        ax.set_title("Chess & Causal Accuracy Metrics (%)")
         ax.set_xlabel("Epoch")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
 
         # Panel 4: Centipawn MAE & Strategic Pressure MAE
         ax = axes[1, 0]
-        ax.plot(epochs, [r["val_cp_mae"] for r in history], label="Eval MAE (cp)", color="tab:red", marker="o")
+        ax.plot(epochs, [r.get("val_cp_mae", 0.0) for r in history], label="Eval MAE (cp)", color="tab:red", marker="o")
         ax.set_title("Evaluation Error (Centipawns MAE)")
         ax.set_xlabel("Epoch")
         ax.grid(True, alpha=0.3)
@@ -238,7 +240,7 @@ def _save_metrics_and_dashboard(history: List[Dict[str, Any]], ckpt_dir: Path) -
 
         # Panel 5: APL Sparsity % vs 8% Biological Target
         ax = axes[1, 1]
-        ax.plot(epochs, [r["val_active_kc_pct"] for r in history], label="Active KCs %", color="tab:purple", marker="o")
+        ax.plot(epochs, [r.get("val_active_kc_pct", 0.0) for r in history], label="Active KCs %", color="tab:purple", marker="o")
         ax.axhline(8.0, color="tab:green", linestyle="--", label="FlyWire Target (8% = 92% zeros)")
         ax.set_title("APL GABA Sparsity (Active Kenyon Cells %)")
         ax.set_xlabel("Epoch")
@@ -247,9 +249,13 @@ def _save_metrics_and_dashboard(history: List[Dict[str, Any]], ckpt_dir: Path) -
 
         # Panel 6: Real Stockfish Arena Elo & Proxy Elo Curve
         ax = axes[1, 2]
-        ax.plot(epochs, [r["est_raw_elo"] for r in history], label="Est. Raw Net Elo", color="tab:green", marker="o", linewidth=1.8)
-        ax.plot(epochs, [r["est_search_elo"] for r in history], label="Est. +Rust PVS Elo", color="tab:cyan", linestyle="--", marker="^")
-        real_pts = [(r["epoch"], r["real_arena_elo"]) for r in history if r.get("real_arena_elo", 0.0) > 0]
+        raw_pts = [(r.get("epoch", i + 1), r["est_raw_elo"]) for i, r in enumerate(history) if "est_raw_elo" in r]
+        pvs_pts = [(r.get("epoch", i + 1), r["est_search_elo"]) for i, r in enumerate(history) if "est_search_elo" in r]
+        if raw_pts:
+            ax.plot([p[0] for p in raw_pts], [p[1] for p in raw_pts], label="Est. Raw Net Elo", color="tab:green", marker="o", linewidth=1.8)
+        if pvs_pts:
+            ax.plot([p[0] for p in pvs_pts], [p[1] for p in pvs_pts], label="Est. +Rust PVS Elo", color="tab:cyan", linestyle="--", marker="^")
+        real_pts = [(r.get("epoch", i + 1), r["real_arena_elo"]) for i, r in enumerate(history) if r.get("real_arena_elo", 0.0) > 0]
         if real_pts:
             ax.plot([p[0] for p in real_pts], [p[1] for p in real_pts], label="REAL Stockfish Arena Elo", color="tab:red", marker="D", linewidth=2.4)
         ax.set_title("Real Stockfish Arena vs Proxy Elo")
@@ -358,7 +364,8 @@ def train_saccadion_smart(
 
     train_ds = SaccShardDataset(train_shards, cache_dir=fast_cache_dir, split_name="train")
     val_ds = SaccShardDataset(val_shards, cache_dir=fast_cache_dir, split_name="val") if val_shards else train_ds
-    traj_ds = SaccShardDataset(traj_shards, cache_dir=fast_cache_dir, split_name="traj") if traj_shards else train_ds
+    # Stage-3 trajectory windows only run 40 batches/epoch -> no need to pre-cache 2.2M board_feats upfront!
+    traj_ds = SaccShardDataset(traj_shards, cache_dir=None, split_name="traj") if traj_shards else train_ds
 
     n_dev = jax.local_device_count()
     use_pmap = n_dev > 1
