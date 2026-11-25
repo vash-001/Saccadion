@@ -79,6 +79,30 @@ def _newton_schulz_5(g: jnp.ndarray, eps: float = 1e-7) -> jnp.ndarray:
     return m.reshape(orig_shape).astype(g.dtype)
 
 
+def _signed_decoupled_weight_decay(
+    sched_lr: Any, weight_decay: float
+) -> optax.GradientTransformation:
+    """Applies true negative decoupled weight decay: `u <- u - lr(step) * wd * p`.
+
+    Safe to place AFTER `optax.contrib.muon` (which already applies `-lr`), unlike
+    `optax.add_decayed_weights` which adds `+wd * p` expecting a downstream `-lr` scaler!
+    """
+    def init_fn(params):
+        del params
+        return jnp.array(0, dtype=jnp.int32)
+
+    def update_fn(updates, state, params=None):
+        step = state
+        lr = sched_lr(step)
+        if params is not None and weight_decay > 0.0:
+            updates = jax.tree_util.tree_map(
+                lambda u, p: u - (lr * weight_decay) * p, updates, params
+            )
+        return updates, step + 1
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
 def build_muon_adamw_optimizer(
     params: Dict[str, jnp.ndarray],
     total_steps: int,
@@ -115,7 +139,7 @@ def build_muon_adamw_optimizer(
     if hasattr(optax, "contrib") and hasattr(optax.contrib, "muon"):
         muon_tx = optax.chain(
             optax.contrib.muon(learning_rate=sched_muon, beta=0.95),
-            optax.add_decayed_weights(weight_decay=1.5e-3),
+            _signed_decoupled_weight_decay(sched_muon, weight_decay=0.02),
         )
     else:
         def init_fn(p):
@@ -133,7 +157,7 @@ def build_muon_adamw_optimizer(
 
         muon_tx = optax.chain(
             optax.GradientTransformation(init_fn, update_fn),
-            optax.add_decayed_weights(weight_decay=1.5e-3),
+            _signed_decoupled_weight_decay(sched_muon, weight_decay=0.02),
         )
 
     # Strong decoupled weight decay (1e-2) prevents 55M sparse table `a_ft_weight` memorization!
