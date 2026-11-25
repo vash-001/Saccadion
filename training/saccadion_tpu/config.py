@@ -12,6 +12,29 @@ STREAM_A_SPARSE_DIM = HALFKA_DIM + RAY_SPARSE_DIM  # 12,544
 STREAM_B_SQ_FEAT_DIM = 48
 LATERAL_HORN_DIM = 32
 
+# 16 Elite Causal Chess Concepts (AOTU -> LAL -> SMP Effectome Curriculum)
+# Curated strictly for deep strategic/causal understanding without diluting training.
+CAUSAL_CONCEPTS: tuple[str, ...] = (
+    "quietMove",
+    "zugzwang",
+    "sacrifice",
+    "clearance",
+    "interference",
+    "deflection",
+    "overloading",
+    "attraction",
+    "discoveredAttack",
+    "pin",
+    "trappedPiece",
+    "defensiveMove",
+    "exposedKing",
+    "kingsideAttack",
+    "queensideAttack",
+    "advancedPawn",
+)
+NUM_CAUSAL_CONCEPTS = len(CAUSAL_CONCEPTS)
+CAUSAL_CONCEPT_TO_IDX = {name: i for i, name in enumerate(CAUSAL_CONCEPTS)}
+
 
 @dataclass(frozen=True)
 class SaccadionConfig:

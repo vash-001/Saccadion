@@ -20,6 +20,7 @@ with a clean Pure-Python (`python-chess`) fallback so it ALWAYS succeeds on any 
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
 import io
 import json
@@ -35,6 +36,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .config import CAUSAL_CONCEPT_TO_IDX
 from .dataset import SACC_RECORD_DTYPE, SACC_SHARD_MAGIC
 
 USER_AGENT = "Saccadion-Research/0.1 (+https://github.com/vash-001/Saccadion)"
@@ -489,6 +491,180 @@ def _find_rust_packer(repo_root: Path) -> Optional[Path]:
     return None
 
 
+def download_and_pack_elite_causal_puzzles(
+    shard_dir: Path,
+    max_puzzles: int = 35000,
+    min_rating: int = 2000,
+    min_popularity: int = 85,
+    val_pct: int = 5,
+) -> Dict[str, int]:
+    """Streams Lichess 4M+ Tagged Puzzles (`database.lichess.org/lichess_db_puzzle.csv.zst`),
+    strictly filtering for Elite (Rating >= 2000, Popularity >= 85) positions tagged with our
+    16 Elite Causal Concepts (quietMove, zugzwang, sacrifice, clearance, interference, etc.).
+
+    Writes `train_random_puzzles.sacc` + `.concepts.u16` and `val_puzzles.sacc` + `.concepts.u16`
+    so the AOTU-SMP 16-Concept Head and 2-Ply VNC Consequence Head train on pure causal ground truth!
+    """
+    try:
+        import chess
+        import zstandard as zstd
+    except ImportError as exc:
+        print(f"[Warn] Skipping Elite Causal Puzzles (missing dependency: {exc})")
+        return {"puzzles_train": 0, "puzzles_val": 0}
+
+    url = "https://database.lichess.org/lichess_db_puzzle.csv.zst"
+    print(
+        f"Streaming Elite Causal Puzzles (Rating >= {min_rating}, Popularity >= {min_popularity}, "
+        f"target={max_puzzles:,}) from {url} ..."
+    )
+    piece_map = {
+        chess.PAWN: 0,
+        chess.KNIGHT: 1,
+        chess.BISHOP: 2,
+        chess.ROOK: 3,
+        chess.QUEEN: 4,
+        chess.KING: 5,
+    }
+
+    def orient_bb(bb: int, stm: int) -> int:
+        if stm == 0:
+            return bb
+        return int.from_bytes(bb.to_bytes(8, "little")[::-1], "little")
+
+    records: List[np.ndarray] = []
+    concept_bits_list: List[int] = []
+    seen = 0
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            dctx = zstd.ZstdDecompressor()
+            with dctx.stream_reader(resp) as reader:
+                text_stream = io.TextIOWrapper(reader, encoding="utf-8", errors="ignore")
+                csv_reader = csv.reader(text_stream)
+                for row in csv_reader:
+                    if len(row) < 8 or row[0] == "PuzzleId":
+                        continue
+                    seen += 1
+                    try:
+                        rating = int(row[3])
+                        popularity = int(row[5])
+                    except ValueError:
+                        continue
+                    if rating < min_rating or popularity < min_popularity:
+                        continue
+
+                    themes = row[7].split()
+                    cbits = 0
+                    for th in themes:
+                        idx = CAUSAL_CONCEPT_TO_IDX.get(th)
+                        if idx is not None:
+                            cbits |= 1 << idx
+                    if cbits == 0:
+                        continue
+
+                    moves_uci = row[2].split()
+                    if len(moves_uci) < 2:
+                        continue
+
+                    try:
+                        b = chess.Board(row[1])
+                        b.push_uci(moves_uci[0])  # Opponent setup move -> exact puzzle state!
+                        best_mv = chess.Move.from_uci(moves_uci[1])
+                        if best_mv not in b.legal_moves:
+                            continue
+                        next_mv = best_mv
+                        if len(moves_uci) >= 4:
+                            b_tmp = b.copy(stack=False)
+                            b_tmp.push(best_mv)
+                            b_tmp.push_uci(moves_uci[2])
+                            cand_next = chess.Move.from_uci(moves_uci[3])
+                            if cand_next in b_tmp.legal_moves:
+                                next_mv = cand_next
+                    except Exception:
+                        continue
+
+                    rec = np.zeros((), dtype=SACC_RECORD_DTYPE)
+                    atk_w, atk_b = chess.BB_EMPTY, chess.BB_EMPTY
+                    for sq, pc in b.piece_map().items():
+                        code = (1 if pc.color == chess.WHITE else 7) + piece_map[pc.piece_type]
+                        if (sq & 1) == 0:
+                            rec["board_nibbles"][sq >> 1] |= code
+                        else:
+                            rec["board_nibbles"][sq >> 1] |= code << 4
+                        atks = b.attacks_mask(sq)
+                        if pc.color == chess.WHITE:
+                            atk_w |= atks
+                        else:
+                            atk_b |= atks
+
+                    stm = 0 if b.turn == chess.WHITE else 1
+                    castling = (
+                        (1 if b.has_kingside_castling_rights(chess.WHITE) else 0)
+                        | (2 if b.has_queenside_castling_rights(chess.WHITE) else 0)
+                        | (4 if b.has_kingside_castling_rights(chess.BLACK) else 0)
+                        | (8 if b.has_queenside_castling_rights(chess.BLACK) else 0)
+                    )
+                    ep_f = (chess.square_file(b.ep_square) + 1) if b.ep_square is not None else 0
+                    phase = min(7, max(0, (len(b.piece_map()) - 2) // 4))
+                    rec["meta_flags"] = (
+                        stm | (castling << 1) | (ep_f << 5) | (min(255, b.halfmove_clock) << 9) | (phase << 17)
+                    )
+
+                    # Puzzle solver has a forced decisive causal win!
+                    is_defensive = bool(cbits & (1 << CAUSAL_CONCEPT_TO_IDX["defensiveMove"]))
+                    rec["wdl_target"] = [0.68, 0.24, 0.08] if is_defensive else [0.92, 0.05, 0.03]
+
+                    bm = (best_mv.from_square << 6) | best_mv.to_square
+                    nm = (next_mv.from_square << 6) | next_mv.to_square
+                    rec["best_move_u16"] = bm
+                    rec["next_move_u16"] = nm
+                    rec["top4_moves"] = [bm, 0, 0, 0]
+                    rec["top4_probs_u16"] = [65535, 0, 0, 0]
+
+                    # Causal strategic pressure profile derived from puzzle concepts
+                    king_atk = 0.75 if (cbits & ((1 << 12) | (1 << 13) | (1 << 14))) else 0.20
+                    proph = 0.75 if (cbits & ((1 << 0) | (1 << 1) | (1 << 11))) else 0.25
+                    squeeze = 0.80 if (cbits & ((1 << 1) | (1 << 10) | (1 << 6))) else 0.35
+                    rec["pressure_targets"] = [squeeze, squeeze * 0.8, king_atk, 0.35, proph]
+                    rec["lh_targets"] = [0.15, 0.0, 0.6 if b.is_check() else 0.1, 0.8 if (cbits & (1 << 15)) else 0.0]
+                    rec["volatility"] = 0.85
+                    rec["mlh"] = 0.35
+                    rec["threat_mask_stm"] = orient_bb(atk_w if stm == 0 else atk_b, stm)
+                    rec["threat_mask_opp"] = orient_bb(atk_b if stm == 0 else atk_w, stm)
+
+                    records.append(rec)
+                    concept_bits_list.append(cbits)
+                    if len(records) % 5000 == 0:
+                        print(f"  Streamed {seen:,} puzzles -> kept {len(records):,} Elite Causal puzzles")
+                    if len(records) >= max_puzzles:
+                        break
+    except Exception as exc:
+        print(f"[Warn] Causal puzzle stream stopped early ({exc}); kept {len(records):,} puzzles.")
+
+    if not records:
+        return {"puzzles_train": 0, "puzzles_val": 0}
+
+    val_n = max(1, min(len(records) // 2, (len(records) * val_pct) // 100))
+    tr_recs, val_recs = records[:-val_n], records[-val_n:]
+    tr_cb, val_cb = concept_bits_list[:-val_n], concept_bits_list[-val_n:]
+
+    def _write_with_concepts(path: Path, rlist: List[np.ndarray], clist: List[int]) -> None:
+        arr = np.asarray(rlist, dtype=SACC_RECORD_DTYPE)
+        with open(path, "wb") as f:
+            f.write(struct.pack("<8sII", SACC_SHARD_MAGIC, 0, len(arr)))
+            f.write(arr.tobytes())
+        np.asarray(clist, dtype="<u2").tofile(path.with_name(path.name + ".concepts.u16"))
+
+    _write_with_concepts(shard_dir / "train_random_puzzles.sacc", tr_recs, tr_cb)
+    _write_with_concepts(shard_dir / "val_puzzles.sacc", val_recs, val_cb)
+    print(
+        f"Saved Elite Causal Puzzles: train={len(tr_recs):,} | val={len(val_recs):,} "
+        f"(16-concept ground truth) -> {shard_dir}"
+    )
+    return {"puzzles_train": len(tr_recs), "puzzles_val": len(val_recs)}
+
+
 def fetch_and_prepare(
     out_dir: Path,
     source: str = "auto",
@@ -496,6 +672,8 @@ def fetch_and_prepare(
     val_pct: int = 5,
     local_pgn: Optional[Path] = None,
     build_rust_if_available: bool = True,
+    include_causal_puzzles: bool = True,
+    max_puzzles: int = 35000,
 ) -> Path:
     """End-to-end downloader + strategic organizer returning the shard directory path."""
     raw_dir = out_dir / "raw"
@@ -545,7 +723,7 @@ def fetch_and_prepare(
         rust_bin = _find_rust_packer(repo_root)
 
     # Clear old shards before writing fresh split
-    for old in shard_dir.glob("*.sacc"):
+    for old in list(shard_dir.glob("*.sacc")) + list(shard_dir.glob("*.concepts.u16")):
         old.unlink()
 
     if rust_bin is not None:
@@ -572,12 +750,18 @@ def fetch_and_prepare(
         stats = _pack_pgn_with_python_chess([merged_pgn], shard_dir, val_pct=val_pct, max_games=max_games)
         stats["packer"] = "python_chess_fallback"
 
+    if include_causal_puzzles and max_puzzles > 0:
+        puz_stats = download_and_pack_elite_causal_puzzles(
+            shard_dir, max_puzzles=max_puzzles, val_pct=val_pct
+        )
+        stats.update(puz_stats)
+
     manifest = {
         "source": source,
         "pgn_files": [str(p) for p in pgn_files],
         "train_random_shards": sorted(str(p) for p in shard_dir.glob("train_random_*.sacc")),
         "train_traj_shards": sorted(str(p) for p in shard_dir.glob("train_traj_*.sacc")),
-        "val_shard": str(shard_dir / "val_random.sacc"),
+        "val_shards": sorted(str(p) for p in shard_dir.glob("val_*.sacc")),
         "stats": stats,
     }
     manifest_path = out_dir / "manifest.json"

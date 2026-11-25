@@ -58,6 +58,58 @@ def jepa_vicreg_loss(pred_latent: jnp.ndarray, target_latent: jnp.ndarray) -> jn
     return inv_loss + 0.1 * var_loss
 
 
+def counterfactual_noduli_loss(
+    noduli_delta_map: jnp.ndarray,  # [B, 4096] in [-1, 1]
+    policy_logits: jnp.ndarray,     # [B, 4096]
+    best_move: jnp.ndarray,         # [B] int32
+    wdl_target: jnp.ndarray,        # [B, 3]
+    margin: float = 0.25,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Counterfactual Effectome Loss training Noduli `b_noduli_w` on `do(m*)` vs hard negatives.
+
+    Forces the Noduli forward model to predict strictly higher causal advantage for the true
+    winning move `do(m*)` than for the highest-scoring non-best counterfactual candidate moves.
+    """
+    bsz = noduli_delta_map.shape[0]
+    row_idx = jnp.arange(bsz)
+    pos_delta = noduli_delta_map[row_idx, best_move]  # [B]
+
+    # Select top-3 hard-negative counterfactual moves (masking out true best_move)
+    masked_pol = jax.lax.stop_gradient(policy_logits).at[row_idx, best_move].set(-1e9)
+    neg_idx = jax.lax.top_k(masked_pol, 3)[1]  # [B, 3]
+    neg_deltas = jnp.take_along_axis(noduli_delta_map, neg_idx, axis=-1)  # [B, 3]
+
+    # Pairwise counterfactual margin loss: pos_delta >= neg_delta + margin
+    margin_gap = pos_delta[:, None] - neg_deltas
+    loss_margin = jnp.mean(jax.nn.relu(margin - margin_gap))
+    # Calibrate positive move delta gently with true position expected value
+    true_exp = wdl_target[:, 0] - wdl_target[:, 2]
+    loss_cal = 0.25 * huber_loss(pos_delta, true_exp, delta=0.35)
+    return loss_margin + loss_cal, jnp.mean(margin_gap)
+
+
+def causal_concept_loss(
+    causal_logits: jnp.ndarray,   # [B, 16]
+    causal_targets: jnp.ndarray,  # [B, 16] in {0, 1}
+    causal_mask: jnp.ndarray,     # [B] in {0, 1} (1 only on elite causal-tagged records)
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Masked multi-label binary cross-entropy over the 16 Elite Causal Chess Concepts."""
+    # Numerically stable sigmoid BCE
+    bce = jnp.maximum(causal_logits, 0.0) - causal_logits * causal_targets + jnp.log1p(jnp.exp(-jnp.abs(causal_logits)))
+    per_sample = jnp.mean(bce, axis=-1)  # [B]
+    denom = jnp.maximum(jnp.sum(causal_mask), 1.0)
+    loss = jnp.sum(per_sample * causal_mask) / denom
+
+    # Soft F1 telemetry on tagged samples
+    preds = (jax.nn.sigmoid(causal_logits) >= 0.5).astype(jnp.float32) * causal_mask[:, None]
+    targs = causal_targets * causal_mask[:, None]
+    tp = jnp.sum(preds * targs)
+    fp = jnp.sum(preds * (1.0 - targs))
+    fn = jnp.sum((1.0 - preds) * targs)
+    f1 = (2.0 * tp) / jnp.maximum(2.0 * tp + fp + fn, 1e-5)
+    return loss, f1
+
+
 def compute_multitask_loss(
     out_a: Dict[str, jnp.ndarray],
     out_b: Dict[str, jnp.ndarray],
@@ -66,7 +118,7 @@ def compute_multitask_loss(
     apl_weight: float = 0.05,
     jepa_target_latent: jnp.ndarray | None = None,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
-    """Computes full weighted 8-sensor loss and diagnostic scalar metrics."""
+    """Computes full weighted 11-sensor causal multi-task loss and diagnostic scalar metrics."""
     wdl_t = batch["wdl_target"]
 
     # 1. Deep Supervision across all Central Complex deliberation ticks + Stream A + B->A Distill
@@ -108,9 +160,33 @@ def compute_multitask_loss(
 
     # 8. K=4 Creative Plan Orthogonality + APL Exact-Sparsity Annealing
     loss_orth = creative_orthogonality_loss(out_b["creative_plans"])
-    # Differentiable L1 proxy pushing active KC fraction cleanly toward 8% (92% exact zeros!)
     kc_density = 0.5 * (jnp.mean(out_a["kc_stm"]) + jnp.mean(out_a["kc_opp"]))
     loss_apl = jax.nn.relu(kc_density - apl_target_active)
+
+    # 9. Counterfactual Noduli Efference-Copy Advantage Loss (trains b_noduli_w!)
+    best_mv = batch["top4_moves"][:, 0]
+    loss_noduli, noduli_margin = counterfactual_noduli_loss(
+        out_b["noduli_delta_map"], out_b["policy_logits"], best_mv, wdl_t
+    )
+
+    # 10. AOTU -> LAL -> SMP 16-Elite-Causal-Concept Supervision (masked to tagged puzzles)
+    if "causal_concepts" in batch and "causal_mask" in batch:
+        loss_causal, causal_f1 = causal_concept_loss(
+            out_b["causal_logits"], batch["causal_concepts"], batch["causal_mask"]
+        )
+    else:
+        loss_causal = jnp.array(0.0, dtype=jnp.float32)
+        causal_f1 = jnp.array(0.0, dtype=jnp.float32)
+
+    # 11. 2-Ply VNC Causal Consequence Loss (predicts m_{t+2} enabled by m_t!)
+    if "next_move" in batch:
+        log_p2 = jax.nn.log_softmax(out_b["vnc2_logits"], axis=-1)
+        next_mv = batch["next_move"]
+        has_next = (next_mv != best_mv).astype(jnp.float32)
+        nll2 = -log_p2[jnp.arange(log_p2.shape[0]), next_mv]
+        loss_vnc2 = jnp.sum(nll2 * has_next) / jnp.maximum(jnp.sum(has_next), 1.0)
+    else:
+        loss_vnc2 = jnp.array(0.0, dtype=jnp.float32)
 
     total = (
         loss_wdl
@@ -122,6 +198,9 @@ def compute_multitask_loss(
         + 0.25 * loss_jepa
         + 0.10 * loss_orth
         + apl_weight * loss_apl
+        + 0.22 * loss_noduli
+        + 0.25 * loss_causal
+        + 0.12 * loss_vnc2
     )
     metrics = {
         "total": total,
@@ -131,6 +210,11 @@ def compute_multitask_loss(
         "pressure": loss_pressure,
         "lh": loss_lh,
         "orth": loss_orth,
+        "noduli": loss_noduli,
+        "noduli_margin": noduli_margin,
+        "causal": loss_causal,
+        "causal_f1": causal_f1,
+        "vnc2": loss_vnc2,
         "active_kc_ratio": out_a["active_kc_ratio"],
     }
     return total, metrics

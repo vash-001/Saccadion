@@ -386,7 +386,9 @@ impl SearchEngine {
         let static_eval = out_a.total_cp.round() as i32;
 
         // Accumulate decaying eligibility trace on search stack for retroactive Dopamine credit
+        // and trigger MBON -> DAN Second-Order Conditioning on stable alpha/beta valuation shifts
         if self.cfg.use_dopamine {
+            self.plasticity.apply_mbon_soc_feedback(out_a.slow_cp);
             self.plasticity
                 .accumulate_eligibility(&out_a.active_gamma_stm, &out_a.active_gamma_opp);
         }

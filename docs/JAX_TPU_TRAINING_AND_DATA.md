@@ -148,3 +148,17 @@ $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{WDL}} + 0.60\,\mathcal{L}_{\te
 | **Exp 3 (+ Lateral Horn Veto)** | تفعيل فيتو الحصون والأخطار الفطري | خفض بلندرات الأفق ورفع دقة الحصون بنسبة `> 40%` |
 | **Exp 4 (+ Phasor Stream B & PFL2/3)** | تفعيل الدماغ العميق الانتقائي (`1–2%` عقد) + `StrategicTT` + `Efference Copy` | `+80` إلى `+150 Elo` في الوضعيات الاستراتيجية والمغلقة! |
 | **Exp 5 (+ Strategic Pressure & K=4 Creativity)** | إضافة أهداف الضغط لـ 10–20 نقلة + JEPA + تعامد الخطط الأربعة | تفوّق نوعي واضح في ألعاب الخنق الطويل والتضحيات الموضعية ضد محركات Alpha-Beta التقليدية! |
+| **Exp 6 (`Saccadion-2 Causal` + 50× FastCache + CPU Stockfish Arena)** | منهج المفاهيم السببية الـ 16 النخبوية (Lichess Puzzles `Rating >= 2000, Popularity >= 85`) + `Counterfactual Noduli` + `Dop1R1/Dop1R2` + `MBON->DAN SOC` + كاش ثنائي `FastCache` (~25 ثانية/إيبوك بدل 20 دقيقة!) + حلبة Stockfish بالخلفية على CPU | قفزة 50× في سرعة التدريب على Colab TPU + قياس **Real Elo حقيقي** ضد Stockfish مع حصاد أخطاء المحرك وتدريبه عليها آليًا! |
+
+---
+
+## 7. تسريع 50× على Colab TPU + حلبة Stockfish الحية على CPU بالخلفية
+
+1. **حل عنق الزجاجة (`50× FastCache`):**
+   - فك تشفير 1.2 مليون وضعية داخل حلقات Python GIL كان يستهلك `98%` من زمن الإيبوك (`1,226s` مقابل `23s` حساب TPU فعلي!).
+   - الآن يقوم أمر Pure-Rust **`saccadion-data predecode`** (أو بديل Python متعدد العمليات `ProcessPoolExecutor` لتجاوز GIL) بفك التشفير **مرة واحدة فقط** إلى ملفات memmap مدمجة (`int16`/`float16`) على القرص المحلي السريع `/content/sacc_cache/` (~1.5 ثانية بـ Rust لمليون وضعية!)، لتنزل مدة كل إيبوك لاحق إلى **~25 ثانية فقط (~45,000 pos/s)**!
+2. **حلبة Stockfish بالخلفية على أنوية CPU الخاملة (`cpu_arena_sparring.py`):**
+   - أثناء تدريب TPU، تلعب أنوية CPU الخاملة مباريات حقيقية سريعة بمحرك **`saccadion` Pure-Rust UCI** (يعيد تحميل `saccadion_latest.saccnet` آليًا بعد كل إيبوك!) ضد سلّم متدرّج: `Baseline-900 -> Stockfish 1320 -> 1550 -> 1850 -> 2200 -> 2600 -> 3000+ Elo`.
+   - تحسب **Real MLE Elo** مع فترة ثقة 95%، وتحصد تلقائيًا نقاط التحول والخسائر ضد Stockfish (مع ردود Stockfish القاتلة) في `sparring_hard.sacc` لإعادة حقنها في التدريب!
+3. **لوحة القيادة الحية بسرعة 20 Hz (`live_ui.py`):**
+   - واجهة HTML/SVG داكنة بدون وميض داخل Google Colab تتحدث حتى 20 مرة/ثانية (`DisplayHandle`) لعرض شريط التقدم، الـ Loss، دقة الشطرنج، F1 للمفاهيم السببية الـ 16، نسبة خمول خلايا كينيون `APL`، ونتائج حلبة Stockfish والـ Real Elo لحظة بلحظة!

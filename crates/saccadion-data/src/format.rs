@@ -1,7 +1,8 @@
 //! Exact 128-byte `.sacc` binary training shard format shared byte-for-byte with JAX TPU dataset.py.
 
+use saccadion_chess::bitboard::Bitboard;
 use saccadion_chess::position::Position;
-use saccadion_chess::types::{Color, Piece, Square};
+use saccadion_chess::types::{CastlingRights, Color, Piece, Square};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -138,6 +139,58 @@ impl SaccRecord {
             _ => None,
         }
     }
+
+    /// Reconstructs a full `Position` from this 128-byte record for ultra-fast Rust pre-decoding.
+    pub fn to_position(&self) -> Position {
+        let mut pos = Position::empty();
+        for sq in 0..64usize {
+            if let Some((c, p)) = self.piece_at(sq) {
+                let s = Square::new(sq as u8);
+                let bb = Bitboard::from_sq(s);
+                pos.pieces[c.index()][p.index()] |= bb;
+                pos.color_occ[c.index()] |= bb;
+                pos.all_occ |= bb;
+                pos.mailbox[sq] = Some((c, p));
+            }
+        }
+        let meta = self.meta_flags;
+        pos.side_to_move = if (meta & 1) == 0 { Color::White } else { Color::Black };
+        pos.castling = CastlingRights(((meta >> 1) & 0x0F) as u8);
+        let ep_f = ((meta >> 5) & 0x0F) as u8;
+        if (1..=8).contains(&ep_f) {
+            let ep_rank = if pos.side_to_move == Color::White { 5 } else { 2 };
+            pos.ep_square = Some(Square::from_file_rank(ep_f - 1, ep_rank));
+        }
+        pos.halfmove_clock = ((meta >> 9) & 0xFF) as u16;
+        pos
+    }
+}
+
+/// Converts finite f32 (in typical feature range [-8, 8]) to IEEE-754 binary16 (u16).
+#[inline(always)]
+pub fn f32_to_f16(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x007F_FFFF;
+    if exp == 0 {
+        return sign;
+    }
+    if exp == 255 {
+        return sign | 0x7C00 | if mant != 0 { 1 } else { 0 };
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        return sign | 0x7C00;
+    }
+    if new_exp <= 0 {
+        if new_exp < -10 {
+            return sign;
+        }
+        let m = (mant | 0x0080_0000) >> (1 - new_exp + 13);
+        return sign | (m as u16);
+    }
+    sign | ((new_exp as u16) << 10) | ((mant >> 13) as u16)
 }
 
 /// Writes a slice of SaccRecords into a `.sacc` binary shard with 16-byte header.

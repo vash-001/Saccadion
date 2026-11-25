@@ -231,6 +231,17 @@ $$\Delta W_{\gamma}^{\text{stm}} \leftarrow (1 - \lambda_\gamma)\Delta W_{\gamma
 $$\Delta W_{\gamma}^{\text{opp}} \leftarrow (1 - \lambda_\gamma)\Delta W_{\gamma}^{\text{opp}} + 0.332\,\eta_{\text{PPL1}}\max(-\delta, 0)\,\frac{e_{\gamma}^{\text{opp}}}{\|e_{\gamma}^{\text{opp}}\|_2^2 + \varepsilon}$$
 - **دمج `DPM` بين النقلات:** عقب تنفيذ كل نقلة في المباراة، يُدمج الدرس النهائي من الجذر ببطء في $\Delta W_{\alpha'/\beta'}$ (بعامل بقاء `0.92`)، وتُصفَّر كلتا المصفوفتين كليًا إلى `0` عند `ucinewgame`!
 
+### 6.3 الترقية السببية (`Saccadion-2 Causal`) — دوائر السببية الحقيقية في دماغ الذبابة
+لأن الفوز على محركات القوة الغاشمة يتطلب فهم **"لماذا تسبّب النقلة $A$ انهيار الخصم $C$؟"** بدل الحفظ الإحصائي السطحي، أضفنا **3 دوائر سببية موثّقة علميًا في *Drosophila*** بدون أي إبطاء لوقت الاستدلال في Rust:
+1. **منطق الترتيب السببي ثنائي الاتجاه (`Dop1R1` ضد `Dop1R2` — *Handler et al., Cell 2019*):**
+   - مستقبل **`Dop1R1`** ($G_{\alpha s}$ / cAMP) يكتب الرصيد السببي الأمامي على طول أثر الأهلية (`CS -> US`: النقلة سبّبت النتيجة).
+   - مستقبل **`Dop1R2`** ($G_{\alpha q}$ / IP3) يعمل كـ **كاشف انقلاب سببي ونسيان نشط**: عندما تنقلب إشارة المفاجأة $\delta_{t-1}\cdot\delta_t < 0$ (فخ تكتيكي أو وهم أفق)، يمحو `Dop1R2` الأوزان السريعة الزائفة عن الخلايا النشطة فورًا لمنع تلوث البحث!
+2. **التكييف السببي من الدرجة الثانية (`MBON -> DAN` Feedback — *Felsenberg 2018; Yamada 2023*):**
+   - الفصوص المستقرة المجمدة ($\alpha/\beta$ MBONs) ترسل تغذية راجعة استثارية مباشرة إلى خلايا الدوبامين (`DANs`)؛ فعندما تنقلنا نقلة هادئة $A$ إلى وضعية استراتيجية متفوقة $B$ يلتقطها $\alpha/\beta$ ($\Delta V_{\text{MBON}}$)، يُطلق الدماغ **دوبامينًا داخليًا من الدرجة الثانية** يعلّم الفص السريع $\gamma$ قيمة السبب $A$ قبل وصول المكسب المادي النهائي $C$ بـ 10 نقلات!
+3. **نموذج الأثر السببي التنبؤي (`AOTU -> LAL -> SMP` Effectome + `Counterfactual Noduli`):**
+   - رأس **مفاهيم السببية الـ 16 النخبوية** (تدريبي فقط `aux_causal_*` — **صفر عبء على Rust CPU!**): يدرّب الـ Rich-Club والـ Central Complex على استيعاب المفاهيم السببية الحقيقية (`quietMove`, `zugzwang`, `sacrifice`, `clearance`, `interference`, `deflection`, `overloading`, `attraction`, `discoveredAttack`, `pin`, `trappedPiece`, `defensiveMove`, `exposedKing`, `kingsideAttack`, `queensideAttack`, `advancedPawn`).
+   - **خسارة `Noduli` السببية المضادة للواقع (`Counterfactual do(m*)`):** تدرّب `b_noduli_w` مباشرةً لتتنبأ بفارق الأثر السببي لنقلة `do(m*)` مقابل أصعب 3 نقلات بديلة خادعة `do(m_neg)`، مصحوبةً برأس **`VNC 2-Ply`** للتنبؤ بالتتمة السببية `m_{t+2}` التي تمكّنها نقلة `m_t`!
+
 ---
 
 ## 7. هندسة الإبداع الاستراتيجي

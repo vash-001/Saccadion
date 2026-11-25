@@ -37,8 +37,10 @@ import numpy as np
 import optax
 
 from .config import SaccadionConfig, build_flyhash_claws
+from .cpu_arena_sparring import StockfishSparringArena
 from .dataset import SaccShardDataset
 from .export_rust import export_params_to_saccnet
+from .live_ui import LiveTrainingHUD
 from .losses import compute_multitask_loss, soft_kl_loss
 from .model import (
     forward_stream_a,
@@ -243,11 +245,14 @@ def _save_metrics_and_dashboard(history: List[Dict[str, Any]], ckpt_dir: Path) -
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
 
-        # Panel 6: Estimated Elo Curve & Meta-Dopamine Gain
+        # Panel 6: Real Stockfish Arena Elo & Proxy Elo Curve
         ax = axes[1, 2]
-        ax.plot(epochs, [r["est_raw_elo"] for r in history], label="Est. Raw Net Elo", color="tab:green", marker="o", linewidth=2)
+        ax.plot(epochs, [r["est_raw_elo"] for r in history], label="Est. Raw Net Elo", color="tab:green", marker="o", linewidth=1.8)
         ax.plot(epochs, [r["est_search_elo"] for r in history], label="Est. +Rust PVS Elo", color="tab:cyan", linestyle="--", marker="^")
-        ax.set_title("Estimated Elo Progression (Proxy)")
+        real_pts = [(r["epoch"], r["real_arena_elo"]) for r in history if r.get("real_arena_elo", 0.0) > 0]
+        if real_pts:
+            ax.plot([p[0] for p in real_pts], [p[1] for p in real_pts], label="REAL Stockfish Arena Elo", color="tab:red", marker="D", linewidth=2.4)
+        ax.set_title("Real Stockfish Arena vs Proxy Elo")
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Elo")
         ax.grid(True, alpha=0.3)
@@ -257,14 +262,6 @@ def _save_metrics_and_dashboard(history: List[Dict[str, Any]], ckpt_dir: Path) -
         dash_path = ckpt_dir / "training_dashboard.png"
         plt.savefig(dash_path, dpi=140)
         plt.close(fig)
-
-        # Live inline chart refresh when running inside Google Colab / Jupyter!
-        try:
-            from IPython.display import Image, clear_output, display
-            clear_output(wait=True)
-            display(Image(filename=str(dash_path)))
-        except Exception:
-            pass
     except Exception:
         pass
 
@@ -280,12 +277,17 @@ def _shard_batch_for_pmap(batch: Dict[str, np.ndarray], n_dev: int) -> Dict[str,
 
 def _print_epoch_banner(row: Dict[str, Any], is_best: bool) -> None:
     best_tag = "  *** NEW BEST -> EXPORTED .saccnet ***" if is_best else ""
-    print("\n" + "=" * 92)
+    real_elo_s = (
+        f"REAL SF-ARENA={row['real_arena_elo']:.0f} Elo ({row['arena_games']}g)"
+        if row.get("real_arena_elo", 0.0) > 0
+        else "REAL SF-ARENA=calibrating..."
+    )
+    print("\n" + "=" * 96)
     print(
         f"EPOCH {row['epoch']:02d}/{row['total_epochs']:02d} | STAGE {row['stage']} ({row['stage_name']}) "
         f"| Ticks={row['ticks']} | QAT={row['qat']} | Time={row['epoch_sec']:.1f}s ({row['pos_per_sec']:,.0f} pos/s){best_tag}"
     )
-    print("-" * 92)
+    print("-" * 96)
     print(
         f"  LOSS    : train={row['train_loss']:.4f} | val={row['val_loss']:.4f} "
         f"(delta={row['val_delta']:+.4f}) | LR_Muon={row['lr_muon']:.2e} LR_AdamW={row['lr_adamw']:.2e}"
@@ -295,21 +297,25 @@ def _print_epoch_banner(row: Dict[str, Any], is_best: bool) -> None:
         f"Policy={row['val_policy']:.4f} | Press(10-20ply)={row['val_pressure']:.4f} | LH={row['val_lh']:.4f}"
     )
     print(
+        f"  CAUSAL  : 16-Concept F1={row['val_causal_f1']*100:5.1f}% | NoduliGap={row['val_noduli_margin']:+.3f} | "
+        f"VNC-2Ply={row['val_vnc2']:.4f} | CausalLoss={row['val_causal']:.4f}"
+    )
+    print(
         f"  CHESS   : Move Top-1={row['val_top1_acc']:5.2f}% | Move Top-3={row['val_top3_acc']:5.2f}% | "
         f"WDL Acc={row['val_wdl_acc']:5.2f}% | Eval MAE={row['val_cp_mae']:6.1f} cp"
     )
     print(
-        f"  ELO EST : Raw Net ~{row['est_raw_elo']:.0f} Elo | With Rust PVS Search ~{row['est_search_elo']:.0f} Elo"
+        f"  ELO     : {real_elo_s} | Proxy Net ~{row['est_raw_elo']:.0f} | +Rust PVS ~{row['est_search_elo']:.0f}"
     )
     print(
         f"  BIOLOGY : APL Active KCs={row['val_active_kc_pct']:5.2f}% (target={row['apl_target_pct']:.1f}%) | "
         f"K=4 OrthErr={row['val_orth']:.4f} | DopamineGain={row['meta_dopamine_gain']:+.4f}"
     )
     print(
-        f"  META-DA : eta_PAM={row['eta_pam']:.4f} | eta_PPL1={row['eta_ppl1']:.4f} | "
-        f"trace_rho={row['trace_rho']:.4f} | HardReplay={row['replay_batches']} batches"
+        f"  META-DA : PAM={row['eta_pam']:.4f} | PPL1={row['eta_ppl1']:.4f} | Dop1R2={row['eta_dop1r2']:.4f} | "
+        f"SOC={row['eta_soc']:.4f} | rho={row['trace_rho']:.4f} | HardReplay={row['replay_batches']}"
     )
-    print("=" * 92)
+    print("=" * 96)
 
 
 def train_saccadion_smart(
@@ -323,51 +329,75 @@ def train_saccadion_smart(
     lr_adamw: float = 6.0e-4,
     ckpt_every_minutes: float = 15.0,
     log_every_steps: int = 25,
+    fast_cache_dir: Optional[Path] = None,
+    enable_cpu_arena: bool = True,
+    live_hud_hz: float = 20.0,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """Runs complete smart epoch-by-epoch training with full validation & live telemetry."""
+    """Runs complete smart epoch-by-epoch causal TPU training with 50x FastCache,
+    20 Hz live HTML/SVG HUD, and Background CPU Stockfish Sparring Arena."""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     export_dir.mkdir(parents=True, exist_ok=True)
 
     train_shards = sorted(shard_dir.glob("train_random_*.sacc"))
     if not train_shards:
         train_shards = sorted(p for p in shard_dir.glob("*.sacc") if "val" not in p.name and "traj" not in p.name)
+    # Automatically include previously harvested anti-Stockfish hard sparring positions!
+    sparring_shard = shard_dir / "sparring_hard.sacc"
+    if sparring_shard.exists() and sparring_shard not in train_shards:
+        train_shards.append(sparring_shard)
+
     val_shards = sorted(shard_dir.glob("val_*.sacc"))
     traj_shards = sorted(shard_dir.glob("train_traj_*.sacc"))
 
     if not train_shards:
         raise FileNotFoundError(f"No training `.sacc` shards found in {shard_dir}")
 
-    train_ds = SaccShardDataset(train_shards)
-    val_ds = SaccShardDataset(val_shards) if val_shards else train_ds
-    traj_ds = SaccShardDataset(traj_shards) if traj_shards else train_ds
+    # Default local SSD fast cache eliminates Python GIL decoding bottleneck (~50x faster epochs!)
+    if fast_cache_dir is None:
+        fast_cache_dir = Path("/content/sacc_cache") if Path("/content").exists() else (shard_dir.parent / "cache")
+
+    train_ds = SaccShardDataset(train_shards, cache_dir=fast_cache_dir, split_name="train")
+    val_ds = SaccShardDataset(val_shards, cache_dir=fast_cache_dir, split_name="val") if val_shards else train_ds
+    traj_ds = SaccShardDataset(traj_shards, cache_dir=fast_cache_dir, split_name="traj") if traj_shards else train_ds
 
     n_dev = jax.local_device_count()
     use_pmap = n_dev > 1
-    # Ensure batch_size is divisible by device count
     eff_bsz = max(n_dev, (batch_size // n_dev) * n_dev)
     steps_per_epoch = max(1, len(train_ds) // eff_bsz)
     total_steps = steps_per_epoch * epochs
+    dev_label = f"{n_dev}x {jax.devices()[0].platform.upper()}"
 
-    print(f"=== SACCADION-1 SMART TPU TRAINER ===")
-    print(f"Devices      : {n_dev} x {jax.devices()[0].platform.upper()} (pmap={use_pmap})")
+    print(f"=== SACCADION-2 CAUSAL SMART TPU TRAINER ===")
+    print(f"Devices      : {dev_label} (pmap={use_pmap})")
     print(f"Model Tier   : tier_id={cfg.tier_id} (acc_dim={cfg.acc_dim}, D={cfg.stream_b_dim}, CX={cfg.cx_dim}, T_max={cfg.cx_max_ticks})")
     print(f"Dataset      : train={len(train_ds):,} pos | val={len(val_ds):,} pos | traj={len(traj_ds)//12:,} windows")
+    print(f"FastCache    : {'ACTIVE (' + str(fast_cache_dir) + ')' if train_ds._cached else 'direct'}")
     print(f"Schedule     : {epochs} epochs x {steps_per_epoch} steps/epoch (batch={eff_bsz}, total_steps={total_steps:,})")
 
     claws_idx = jnp.asarray(build_flyhash_claws(cfg), dtype=jnp.int32)
+    fresh_params = init_saccadion_params(cfg, seed=42)
     ckpt_file = checkpoint_dir / "latest.pkl"
     if ckpt_file.exists():
         ck = load_checkpoint(ckpt_file)
-        params = ck["params"]
-        tx, sched_muon, sched_adamw = build_muon_adamw_optimizer(params, total_steps, lr_muon, lr_adamw)
-        opt_state = ck["opt_state"]
+        loaded_p = ck["params"]
+        # Seamless forward migration when resuming an earlier Saccadion-1 checkpoint into Saccadion-2 Causal!
+        added_keys = [k for k in fresh_params if k not in loaded_p]
+        if added_keys:
+            params = {**fresh_params, **loaded_p}
+            tx, sched_muon, sched_adamw = build_muon_adamw_optimizer(params, total_steps, lr_muon, lr_adamw)
+            opt_state = tx.init(params)
+            print(f"Migrated Saccadion-1 checkpoint cleanly (initialized new causal params: {added_keys})")
+        else:
+            params = loaded_p
+            tx, sched_muon, sched_adamw = build_muon_adamw_optimizer(params, total_steps, lr_muon, lr_adamw)
+            opt_state = ck["opt_state"]
         start_epoch = int(ck["epoch"]) + 1
         global_step = int(ck["global_step"])
         best_val_loss = float(ck["best_val_loss"])
         history = list(ck["history"])
         print(f"Resumed checkpoint cleanly at Epoch {start_epoch} (best_val={best_val_loss:.4f})")
     else:
-        params = init_saccadion_params(cfg, seed=42)
+        params = fresh_params
         tx, sched_muon, sched_adamw = build_muon_adamw_optimizer(params, total_steps, lr_muon, lr_adamw)
         opt_state = tx.init(params)
         start_epoch = 1
@@ -381,6 +411,18 @@ def train_saccadion_smart(
     else:
         params_dev = params
         opt_dev = opt_state
+
+    # Start Background CPU Stockfish Sparring & Real-Elo Arena (uses idle CPU cores!)
+    arena: Optional[StockfishSparringArena] = None
+    if enable_cpu_arena:
+        arena = StockfishSparringArena(
+            weights_path=export_dir / "saccadion_latest.saccnet",
+            harvest_shard_path=sparring_shard,
+            status_json_path=checkpoint_dir / "arena_status.json",
+        )
+        arena.start()
+
+    hud = LiveTrainingHUD(max_hz=live_hud_hz, device_label=dev_label)
 
     # Cached compiled functions per (num_ticks, qat)
     compiled_train: Dict[Tuple[int, bool], Any] = {}
@@ -510,171 +552,229 @@ def train_saccadion_smart(
     last_ckpt_time = time.time()
     prev_val_loss = history[-1]["val_loss"] if history else float("nan")
 
-    for epoch in range(start_epoch, epochs + 1):
-        t_ep0 = time.time()
-        if epoch <= stage1_end:
-            stage, stage_name, num_ticks, apl_target, qat = 1, "Embryo-Vision", 2, 0.25, False
-        elif epoch <= stage2_end:
-            stage, stage_name, num_ticks, apl_target, qat = 2, "Phasor-Strategy", cfg.cx_max_ticks, 0.12, False
-        else:
-            stage, stage_name, num_ticks, apl_target, qat = 3, "Meta-Dopamine+QAT", cfg.cx_max_ticks, 0.08, True
-
-        train_fn = get_train_step(num_ticks, qat)
-        val_fn = get_val_step(num_ticks, qat)
-
-        ep_losses: List[float] = []
-        hard_buffer: List[Tuple[float, Dict[str, np.ndarray]]] = []
-        max_hard_keep = max(2, steps_per_epoch // 8)
-        pos_seen = 0
-
-        for step_idx, batch_np in enumerate(train_ds.iter_batches(eff_bsz, seed=epoch * 997), start=1):
-            t_s0 = time.time()
-            if use_pmap:
-                b_in = _shard_batch_for_pmap(batch_np, n_dev)
-                params_dev, opt_dev, m = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight)
-                loss_val = float(m["total"][0])
-                kc_val = float(m["active_kc_ratio"][0])
+    t_train_start = time.time()
+    try:
+        for epoch in range(start_epoch, epochs + 1):
+            t_ep0 = time.time()
+            if epoch <= stage1_end:
+                stage, stage_name, num_ticks, apl_target, qat = 1, "Embryo-Vision", 2, 0.25, False
+            elif epoch <= stage2_end:
+                stage, stage_name, num_ticks, apl_target, qat = 2, "Phasor-Causal", cfg.cx_max_ticks, 0.12, False
             else:
-                b_in = {k: jnp.asarray(v) for k, v in batch_np.items()}
-                params_dev, opt_dev, m = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight)
-                loss_val = float(m["total"])
-                kc_val = float(m["active_kc_ratio"])
+                stage, stage_name, num_ticks, apl_target, qat = 3, "Meta-Dopamine+QAT", cfg.cx_max_ticks, 0.08, True
 
-            ep_losses.append(loss_val)
-            global_step += 1
-            pos_seen += eff_bsz
+            train_fn = get_train_step(num_ticks, qat)
+            val_fn = get_val_step(num_ticks, qat)
 
-            # Smart Hard-Example Surprise Replay Buffer (keeps top hardest batches)
-            if len(hard_buffer) < max_hard_keep:
-                hard_buffer.append((loss_val, batch_np))
-            elif loss_val > hard_buffer[0][0]:
-                hard_buffer[0] = (loss_val, batch_np)
-                hard_buffer.sort(key=lambda x: x[0])
+            ep_losses: List[float] = []
+            hard_buffer: List[Tuple[float, Dict[str, np.ndarray]]] = []
+            max_hard_keep = max(2, steps_per_epoch // 8)
+            pos_seen = 0
+            ema_step_ms = 25.0
 
-            if step_idx % log_every_steps == 0 or step_idx == steps_per_epoch:
-                step_ms = (time.time() - t_s0) * 1000.0
-                print(
-                    f"  [Ep {epoch:02d} | {step_idx:4d}/{steps_per_epoch}] "
-                    f"loss={loss_val:.4f} | active_kc={kc_val*100:4.1f}% | {step_ms:5.1f} ms/step",
-                    flush=True,
-                )
-
-            if (time.time() - last_ckpt_time) > ckpt_every_minutes * 60.0:
-                host_p = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
-                host_o = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
-                save_checkpoint(ckpt_file, host_p, host_o, epoch - 1, global_step, best_val_loss, history)
-                last_ckpt_time = time.time()
-
-        # Hard-Example Surprise Replay pass (enabled in Stages 2-3 to prevent Stage-1 overfitting)
-        if stage >= 2:
-            for _, hard_b in hard_buffer:
+            for step_idx, batch_np in enumerate(train_ds.iter_batches(eff_bsz, seed=epoch * 997), start=1):
+                t_s0 = time.time()
                 if use_pmap:
-                    b_in = _shard_batch_for_pmap(hard_b, n_dev)
-                    params_dev, opt_dev, _ = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight)
+                    b_in = _shard_batch_for_pmap(batch_np, n_dev)
+                    params_dev, opt_dev, m = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight)
+                    loss_val = float(m["total"][0])
+                    kc_val = float(m["active_kc_ratio"][0])
                 else:
-                    b_in = {k: jnp.asarray(v) for k, v in hard_b.items()}
-                    params_dev, opt_dev, _ = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight)
+                    b_in = {k: jnp.asarray(v) for k, v in batch_np.items()}
+                    params_dev, opt_dev, m = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight)
+                    loss_val = float(m["total"])
+                    kc_val = float(m["active_kc_ratio"])
+
+                step_ms = (time.time() - t_s0) * 1000.0
+                ema_step_ms = 0.85 * ema_step_ms + 0.15 * step_ms
+                ep_losses.append(loss_val)
+                global_step += 1
                 pos_seen += eff_bsz
 
-        # Unwrap single-host copy for Stage-3 Meta-Dopamine scan & Validation
-        host_params = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
-        host_opt = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
+                # Smart Hard-Example Surprise Replay Buffer (keeps top hardest batches)
+                if len(hard_buffer) < max_hard_keep:
+                    hard_buffer.append((loss_val, batch_np))
+                elif loss_val > hard_buffer[0][0]:
+                    hard_buffer[0] = (loss_val, batch_np)
+                    hard_buffer.sort(key=lambda x: x[0])
 
-        # Stage 3: Differentiable Meta-Dopamine Trajectory Scan
-        meta_gain_vals: List[float] = []
-        if stage == 3 and len(traj_ds) >= 12:
-            traj_bsz = max(4, min(64, (len(traj_ds) // 12) // 2 or 1))
-            for t_i, tbatch_np in enumerate(traj_ds.iter_trajectory_batches(traj_bsz, window_k=12, seed=epoch * 31)):
-                tbatch = {k: jnp.asarray(v) for k, v in tbatch_np.items()}
-                host_params, host_opt, mm = stage3_meta_step(host_params, host_opt, tbatch)
-                meta_gain_vals.append(float(mm["adapt_gain"]))
-                if t_i >= 40:
+                # Smooth 20 Hz Live Cockpit update (zero flicker, throttled to <= 20 fps!)
+                elapsed_ep = max(1e-3, time.time() - t_ep0)
+                cur_pos_s = pos_seen / elapsed_ep
+                rem_steps = (epochs - epoch) * steps_per_epoch + (steps_per_epoch - step_idx)
+                eta_sec = rem_steps * (elapsed_ep / step_idx)
+                hud.update(
+                    epoch=epoch,
+                    total_epochs=epochs,
+                    step=step_idx,
+                    steps_per_epoch=steps_per_epoch,
+                    stage_name=stage_name,
+                    ticks=num_ticks,
+                    qat=qat,
+                    step_loss=loss_val,
+                    step_kc_pct=kc_val * 100.0,
+                    step_ms=ema_step_ms,
+                    pos_per_sec=cur_pos_s,
+                    eta_sec=eta_sec,
+                    history=history,
+                    arena_status=arena.get_status() if arena else None,
+                    force=(step_idx == steps_per_epoch),
+                )
+
+                if (time.time() - last_ckpt_time) > ckpt_every_minutes * 60.0:
+                    host_p = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
+                    host_o = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
+                    save_checkpoint(ckpt_file, host_p, host_o, epoch - 1, global_step, best_val_loss, history)
+                    last_ckpt_time = time.time()
+
+            # Hard-Example Surprise Replay pass (enabled in Stages 2-3 to prevent Stage-1 overfitting)
+            if stage >= 2:
+                for _, hard_b in hard_buffer:
+                    if use_pmap:
+                        b_in = _shard_batch_for_pmap(hard_b, n_dev)
+                        params_dev, opt_dev, _ = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight)
+                    else:
+                        b_in = {k: jnp.asarray(v) for k, v in hard_b.items()}
+                        params_dev, opt_dev, _ = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight)
+                    pos_seen += eff_bsz
+
+            # Unwrap single-host copy for Stage-3 Meta-Dopamine scan & Validation
+            host_params = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
+            host_opt = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
+
+            # Stage 3: Differentiable Meta-Dopamine Trajectory Scan (Dop1R1 + Dop1R2 + MBON->DAN SOC)
+            meta_gain_vals: List[float] = []
+            if stage == 3 and len(traj_ds) >= 12:
+                traj_bsz = max(4, min(64, (len(traj_ds) // 12) // 2 or 1))
+                for t_i, tbatch_np in enumerate(traj_ds.iter_trajectory_batches(traj_bsz, window_k=12, seed=epoch * 31)):
+                    tbatch = {k: jnp.asarray(v) for k, v in tbatch_np.items()}
+                    host_params, host_opt, mm = stage3_meta_step(host_params, host_opt, tbatch)
+                    meta_gain_vals.append(float(mm["adapt_gain"]))
+                    if t_i >= 40:
+                        break
+                if use_pmap:
+                    params_dev = jax.device_put_replicated(host_params, jax.local_devices())
+                    opt_dev = jax.device_put_replicated(host_opt, jax.local_devices())
+                else:
+                    params_dev, opt_dev = host_params, host_opt
+
+            # Full Held-Out Validation Evaluation (including 16-Causal-Concept F1 & Noduli Gap!)
+            val_acc: Dict[str, List[float]] = {
+                k: []
+                for k in [
+                    "total", "wdl_b", "wdl_a", "policy", "pressure", "lh", "orth",
+                    "noduli", "noduli_margin", "causal", "causal_f1", "vnc2",
+                    "active_kc_ratio", "top1_acc", "top3_acc", "wdl_acc", "cp_mae",
+                ]
+            }
+            val_bsz = min(eff_bsz, max(1, len(val_ds)))
+            for v_i, vbatch_np in enumerate(val_ds.iter_batches(val_bsz, seed=12345)):
+                vb = {k: jnp.asarray(v) for k, v in vbatch_np.items()}
+                vm = val_fn(host_params, vb, apl_target, apl_weight)
+                for k in val_acc:
+                    val_acc[k].append(float(vm[k]))
+                if v_i >= 30:
                     break
-            if use_pmap:
-                params_dev = jax.device_put_replicated(host_params, jax.local_devices())
-                opt_dev = jax.device_put_replicated(host_opt, jax.local_devices())
-            else:
-                params_dev, opt_dev = host_params, host_opt
 
-        # Full Held-Out Validation Evaluation
-        val_acc: Dict[str, List[float]] = {
-            k: []
-            for k in ["total", "wdl_b", "wdl_a", "policy", "pressure", "lh", "orth", "active_kc_ratio", "top1_acc", "top3_acc", "wdl_acc", "cp_mae"]
-        }
-        val_bsz = min(eff_bsz, max(1, len(val_ds)))
-        for v_i, vbatch_np in enumerate(val_ds.iter_batches(val_bsz, seed=12345)):
-            vb = {k: jnp.asarray(v) for k, v in vbatch_np.items()}
-            vm = val_fn(host_params, vb, apl_target, apl_weight)
-            for k in val_acc:
-                val_acc[k].append(float(vm[k]))
-            if v_i >= 30:
-                break
+            v_mean = {k: float(np.mean(v)) if v else 0.0 for k, v in val_acc.items()}
+            ep_sec = max(1e-3, time.time() - t_ep0)
 
-        v_mean = {k: float(np.mean(v)) if v else 0.0 for k, v in val_acc.items()}
-        ep_sec = max(1e-3, time.time() - t_ep0)
+            # Adaptive APL Sparsity Controller
+            if v_mean["active_kc_ratio"] > apl_target + 0.03:
+                apl_weight = min(0.50, apl_weight * 1.25)
+            elif v_mean["active_kc_ratio"] < apl_target * 0.65:
+                apl_weight = max(0.01, apl_weight * 0.85)
 
-        # Adaptive APL Sparsity Controller
-        if v_mean["active_kc_ratio"] > apl_target + 0.03:
-            apl_weight = min(0.50, apl_weight * 1.25)
-        elif v_mean["active_kc_ratio"] < apl_target * 0.65:
-            apl_weight = max(0.01, apl_weight * 0.85)
+            val_loss = v_mean["total"]
+            val_delta = (val_loss - prev_val_loss) if not math.isnan(prev_val_loss) else 0.0
+            prev_val_loss = val_loss
+            is_best = val_loss < best_val_loss
+            if is_best:
+                best_val_loss = val_loss
+                export_params_to_saccnet(cfg, jax.device_get(host_params), export_dir / "saccadion_best.saccnet")
+            export_params_to_saccnet(cfg, jax.device_get(host_params), export_dir / "saccadion_latest.saccnet")
 
-        val_loss = v_mean["total"]
-        val_delta = (val_loss - prev_val_loss) if not math.isnan(prev_val_loss) else 0.0
-        prev_val_loss = val_loss
-        is_best = val_loss < best_val_loss
-        if is_best:
-            best_val_loss = val_loss
-            export_params_to_saccnet(cfg, jax.device_get(host_params), export_dir / "saccadion_best.saccnet")
-        export_params_to_saccnet(cfg, jax.device_get(host_params), export_dir / "saccadion_latest.saccnet")
+            eta_pam_v = float(jax.nn.softplus(host_params["meta_eta_pam"]))
+            eta_ppl1_v = float(jax.nn.softplus(host_params["meta_eta_ppl1"]))
+            eta_dop1r2_v = float(jax.nn.softplus(host_params.get("meta_eta_dop1r2", jnp.array(-1.9))))
+            eta_soc_v = float(jax.nn.softplus(host_params.get("meta_eta_soc", jnp.array(-1.4))))
+            rho_v = float(jax.nn.sigmoid(host_params["meta_trace_decay"]))
+            est_raw_elo = estimate_elo_proxy(v_mean["top1_acc"], v_mean["wdl_acc"], v_mean["cp_mae"])
+            est_search_elo = min(3700.0, est_raw_elo + 520.0)
+            a_st = arena.get_status() if arena else {}
 
-        eta_pam_v = float(jax.nn.softplus(host_params["meta_eta_pam"]))
-        eta_ppl1_v = float(jax.nn.softplus(host_params["meta_eta_ppl1"]))
-        rho_v = float(jax.nn.sigmoid(host_params["meta_trace_decay"]))
-        est_raw_elo = estimate_elo_proxy(v_mean["top1_acc"], v_mean["wdl_acc"], v_mean["cp_mae"])
-        est_search_elo = min(3700.0, est_raw_elo + 520.0)
+            row = {
+                "epoch": epoch,
+                "total_epochs": epochs,
+                "stage": stage,
+                "stage_name": stage_name,
+                "ticks": num_ticks,
+                "qat": qat,
+                "train_loss": float(np.mean(ep_losses)) if ep_losses else 0.0,
+                "val_loss": val_loss,
+                "val_delta": val_delta,
+                "val_wdl_b": v_mean["wdl_b"],
+                "val_wdl_a": v_mean["wdl_a"],
+                "val_policy": v_mean["policy"],
+                "val_pressure": v_mean["pressure"],
+                "val_lh": v_mean["lh"],
+                "val_orth": v_mean["orth"],
+                "val_noduli": v_mean["noduli"],
+                "val_noduli_margin": v_mean["noduli_margin"],
+                "val_causal": v_mean["causal"],
+                "val_causal_f1": v_mean["causal_f1"],
+                "val_vnc2": v_mean["vnc2"],
+                "val_top1_acc": v_mean["top1_acc"],
+                "val_top3_acc": v_mean["top3_acc"],
+                "val_wdl_acc": v_mean["wdl_acc"],
+                "val_cp_mae": v_mean["cp_mae"],
+                "est_raw_elo": est_raw_elo,
+                "est_search_elo": est_search_elo,
+                "real_arena_elo": float(a_st.get("real_elo", 0.0)),
+                "arena_games": int(a_st.get("games_played", 0)),
+                "arena_harvested": int(a_st.get("harvested_positions", 0)),
+                "val_active_kc_pct": v_mean["active_kc_ratio"] * 100.0,
+                "apl_target_pct": apl_target * 100.0,
+                "meta_dopamine_gain": float(np.mean(meta_gain_vals)) if meta_gain_vals else 0.0,
+                "eta_pam": eta_pam_v,
+                "eta_ppl1": eta_ppl1_v,
+                "eta_dop1r2": eta_dop1r2_v,
+                "eta_soc": eta_soc_v,
+                "trace_rho": rho_v,
+                "lr_muon": float(sched_muon(global_step)),
+                "lr_adamw": float(sched_adamw(global_step)),
+                "replay_batches": len(hard_buffer) if stage >= 2 else 0,
+                "epoch_sec": ep_sec,
+                "pos_per_sec": pos_seen / ep_sec,
+            }
+            history.append(row)
+            _save_metrics_and_dashboard(history, checkpoint_dir)
+            hud.update(
+                epoch=epoch,
+                total_epochs=epochs,
+                step=steps_per_epoch,
+                steps_per_epoch=steps_per_epoch,
+                stage_name=stage_name,
+                ticks=num_ticks,
+                qat=qat,
+                step_loss=row["train_loss"],
+                step_kc_pct=row["val_active_kc_pct"],
+                step_ms=ema_step_ms,
+                pos_per_sec=row["pos_per_sec"],
+                eta_sec=max(0.0, (epochs - epoch) * ep_sec),
+                history=history,
+                arena_status=a_st,
+                force=True,
+            )
+            _print_epoch_banner(row, is_best)
+            save_checkpoint(ckpt_file, host_params, host_opt, epoch, global_step, best_val_loss, history)
+            last_ckpt_time = time.time()
+    finally:
+        if arena is not None:
+            arena.stop()
 
-        row = {
-            "epoch": epoch,
-            "total_epochs": epochs,
-            "stage": stage,
-            "stage_name": stage_name,
-            "ticks": num_ticks,
-            "qat": qat,
-            "train_loss": float(np.mean(ep_losses)) if ep_losses else 0.0,
-            "val_loss": val_loss,
-            "val_delta": val_delta,
-            "val_wdl_b": v_mean["wdl_b"],
-            "val_wdl_a": v_mean["wdl_a"],
-            "val_policy": v_mean["policy"],
-            "val_pressure": v_mean["pressure"],
-            "val_lh": v_mean["lh"],
-            "val_orth": v_mean["orth"],
-            "val_top1_acc": v_mean["top1_acc"],
-            "val_top3_acc": v_mean["top3_acc"],
-            "val_wdl_acc": v_mean["wdl_acc"],
-            "val_cp_mae": v_mean["cp_mae"],
-            "est_raw_elo": est_raw_elo,
-            "est_search_elo": est_search_elo,
-            "val_active_kc_pct": v_mean["active_kc_ratio"] * 100.0,
-            "apl_target_pct": apl_target * 100.0,
-            "meta_dopamine_gain": float(np.mean(meta_gain_vals)) if meta_gain_vals else 0.0,
-            "eta_pam": eta_pam_v,
-            "eta_ppl1": eta_ppl1_v,
-            "trace_rho": rho_v,
-            "lr_muon": float(sched_muon(global_step)),
-            "lr_adamw": float(sched_adamw(global_step)),
-            "replay_batches": len(hard_buffer) if stage >= 2 else 0,
-            "epoch_sec": ep_sec,
-            "pos_per_sec": pos_seen / ep_sec,
-        }
-        history.append(row)
-        _save_metrics_and_dashboard(history, checkpoint_dir)
-        _print_epoch_banner(row, is_best)
-        save_checkpoint(ckpt_file, host_params, host_opt, epoch, global_step, best_val_loss, history)
-        last_ckpt_time = time.time()
-
-    return jax.device_get(host_params), history
+    host_final = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
+    return jax.device_get(host_final), history
 
 
 if __name__ == "__main__":

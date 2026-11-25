@@ -7,11 +7,19 @@
 
 use crate::config::ModelConfig;
 
-/// Hyperparameters controlling three-factor eligibility-trace plasticity and bounds.
+/// Hyperparameters controlling three-factor causal eligibility-trace plasticity and bounds.
+///
+/// Implements peer-reviewed Drosophila causal learning circuits:
+/// - Dop1R1 (G_alpha_s / cAMP): forward causal credit along eligibility trace (`CS -> US`)
+/// - Dop1R2 (G_alpha_q / IP3): temporal causal order erosion of non-causal correlations / reversals
+/// - MBON -> DAN Second-Order Conditioning (SOC): stable alpha/beta MBON shifts generate
+///   internal pseudo-dopamine to train fast gamma weights before delayed primary reward arrives.
 #[derive(Clone, Debug)]
 pub struct PlasticityParams {
-    pub eta_pam: f32,          // Positive strategic opportunity learning rate
+    pub eta_pam: f32,          // Positive strategic opportunity learning rate (Dop1R1)
     pub eta_ppl1: f32,         // Sharp negative blunder-alarm learning rate (~3.5x PAM)
+    pub eta_dop1r2: f32,       // Dop1R2 causal order reversal / active forgetting rate
+    pub eta_soc: f32,          // MBON -> DAN Second-Order Conditioning coupling strength
     pub ppl1_contra_ratio: f32,// FlyWire v783 measured contralateral PPL1 ratio (0.332)
     pub lambda_gamma: f32,     // Per-update exponential decay on intra-search fast weights
     pub lambda_game: f32,      // Per-move exponential decay on intra-game fast weights (DPM)
@@ -27,6 +35,8 @@ impl Default for PlasticityParams {
         Self {
             eta_pam: 0.08,
             eta_ppl1: 0.28,
+            eta_dop1r2: 0.14,
+            eta_soc: 0.22,
             ppl1_contra_ratio: 0.332,
             lambda_gamma: 0.02,
             lambda_game: 0.08,
@@ -85,9 +95,15 @@ pub struct DopaminePlasticityState {
     pub familiarity_table: Vec<f32>,
     /// LAL bistable previous-move strategic goal vector (prevents move-to-move plan oscillation).
     pub lal_committed_goal: Vec<f32>,
+    /// Previous surprise delta for Dop1R2 causal-reversal detection.
+    pub prev_delta: f32,
+    /// Previous frozen alpha/beta MBON valuation (cp) for MBON -> DAN second-order conditioning.
+    pub prev_mbon_cp: f32,
     /// Total dopamine events fired during the current search (diagnostics).
     pub pam_updates: u64,
     pub ppl1_updates: u64,
+    pub dop1r2_erosions: u64,
+    pub soc_updates: u64,
 }
 
 impl DopaminePlasticityState {
@@ -105,8 +121,12 @@ impl DopaminePlasticityState {
             elig_gamma_opp: vec![0.0; gamma_dim],
             familiarity_table: vec![0.0; 256],
             lal_committed_goal: vec![0.0; cfg.cx_dim],
+            prev_delta: 0.0,
+            prev_mbon_cp: 0.0,
             pam_updates: 0,
             ppl1_updates: 0,
+            dop1r2_erosions: 0,
+            soc_updates: 0,
         }
     }
 
@@ -120,8 +140,12 @@ impl DopaminePlasticityState {
         self.elig_gamma_opp.fill(0.0);
         self.familiarity_table.fill(0.0);
         self.lal_committed_goal.fill(0.0);
+        self.prev_delta = 0.0;
+        self.prev_mbon_cp = 0.0;
         self.pam_updates = 0;
         self.ppl1_updates = 0;
+        self.dop1r2_erosions = 0;
+        self.soc_updates = 0;
     }
 
     /// Softly decays intra-search gamma weights and clears eligibility traces before a new root search.
@@ -134,8 +158,11 @@ impl DopaminePlasticityState {
         }
         self.elig_gamma_stm.fill(0.0);
         self.elig_gamma_opp.fill(0.0);
+        self.prev_delta = 0.0;
         self.pam_updates = 0;
         self.ppl1_updates = 0;
+        self.dop1r2_erosions = 0;
+        self.soc_updates = 0;
     }
 
     /// Injects a top-down strategic fast-weight seed from Stream B into intra-search gamma weights.
@@ -235,15 +262,30 @@ impl DopaminePlasticityState {
             opp_norm_sq += 0.25 * e * e;
         }
 
+        // Dop1R2 (G_alpha_q / IP3) bidirectional temporal causal order gate:
+        // When surprise reverses sign (prev_delta * delta < 0), actively erode stale non-causal
+        // fast weights on currently active KCs to eliminate horizon/trap illusions.
+        if self.prev_delta * delta < -0.02 {
+            self.dop1r2_erosions += 1;
+            let erode = (1.0 - self.params.eta_dop1r2 * delta.abs().min(1.0)).clamp(0.4, 1.0);
+            for &(idx, _) in &gamma_stm.items {
+                self.dw_gamma_stm[idx as usize] *= erode;
+            }
+            for &(idx, _) in &gamma_opp.items {
+                self.dw_gamma_opp[idx as usize] *= erode;
+            }
+        }
+        self.prev_delta = delta;
+
         if delta > 0.0 {
-            // PAM positive opportunity Dopamine
+            // Dop1R1 + PAM positive causal opportunity Dopamine
             self.pam_updates += 1;
             let step = (self.params.eta_pam * delta) / stm_norm_sq;
             for &(idx, val) in &gamma_stm.items {
                 let i = idx as usize;
                 self.dw_gamma_stm[i] = (self.dw_gamma_stm[i] + step * val).clamp(-2.0, 2.0);
             }
-            // Retroactive credit along eligibility trace
+            // Retroactive forward-causal credit along eligibility trace
             let trace_step = 0.5 * step;
             for i in 0..self.gamma_dim {
                 let e = self.elig_gamma_stm[i];
@@ -252,7 +294,7 @@ impl DopaminePlasticityState {
                 }
             }
         } else {
-            // PPL1 sharp negative blunder alarm (12x denser per neuron, 33.2% contralateral!)
+            // Dop1R1 + PPL1 sharp negative blunder alarm (12x denser per neuron, 33.2% contralateral!)
             self.ppl1_updates += 1;
             let mag = -delta;
             let step_stm = (self.params.eta_ppl1 * mag) / stm_norm_sq;
@@ -271,6 +313,34 @@ impl DopaminePlasticityState {
                 if e.abs() > 1e-4 {
                     self.dw_gamma_stm[i] = (self.dw_gamma_stm[i] - trace_stm * e).clamp(-2.0, 2.0);
                 }
+            }
+        }
+    }
+
+    /// MBON -> DAN Second-Order Conditioning (SOC) feedback loop (Felsenberg 2018; Yamada 2023):
+    /// When the stable frozen alpha/beta MBON valuation shifts cleanly across a strategic sequence
+    /// `A -> B` before primary tactical reward arrives at `C`, it drives internal pseudo-dopamine
+    /// onto the eligibility trace of the preceding cause `A`.
+    pub fn apply_mbon_soc_feedback(&mut self, mbon_slow_cp: f32) {
+        let diff_cp = mbon_slow_cp - self.prev_mbon_cp;
+        self.prev_mbon_cp = mbon_slow_cp;
+        if diff_cp.abs() < 25.0 {
+            return;
+        }
+        let soc_delta = (diff_cp / 250.0).clamp(-1.0, 1.0) * self.params.eta_soc;
+        let mut trace_norm_sq = 0.0f32;
+        for &e in &self.elig_gamma_stm {
+            trace_norm_sq += e * e;
+        }
+        if trace_norm_sq < 1e-8 {
+            return;
+        }
+        self.soc_updates += 1;
+        let step = soc_delta / (trace_norm_sq + 1e-4);
+        for i in 0..self.gamma_dim {
+            let e = self.elig_gamma_stm[i];
+            if e.abs() > 1e-4 {
+                self.dw_gamma_stm[i] = (self.dw_gamma_stm[i] + step * e).clamp(-2.0, 2.0);
             }
         }
     }

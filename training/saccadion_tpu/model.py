@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .config import SaccadionConfig, build_flyhash_claws
+from .config import NUM_CAUSAL_CONCEPTS, SaccadionConfig, build_flyhash_claws
 
 
 def ste_quantize(w: jnp.ndarray, bits: int = 8, enabled: bool = False) -> jnp.ndarray:
@@ -118,10 +118,18 @@ def init_saccadion_params(cfg: SaccadionConfig, seed: int = 42) -> Dict[str, jnp
         "b_seed_down": u((cfg.seed_rank, d + cx), s_d),
         "b_seed_to_gamma": u((gamma_dim, cfg.seed_rank), 0.1),
         "b_seed_to_cent": u((cfg.acc_dim, cfg.seed_rank), 0.1),
-        # Learnable meta-plasticity scalars (initialized via inverse-softplus -> 0.08, 0.28, 0.65)
+        # Training-only AOTU -> LAL -> SMP 16-Causal-Concept Effectome Head (zero Rust latency!)
+        "aux_causal_w": u((NUM_CAUSAL_CONCEPTS, d + cx), s_d),
+        "aux_causal_b": jnp.full((NUM_CAUSAL_CONCEPTS,), -1.5, dtype=jnp.float32),
+        # Training-only 2-Ply VNC Causal Consequence Head (predicts m_{t+2} enabled by m_t)
+        "aux_vnc2_q": u((cx, d), s_d),
+        "aux_vnc2_k": u((cx, d), s_d),
+        # Learnable meta-plasticity scalars (Dop1R1 PAM/PPL1, trace rho, Dop1R2 erosion, MBON->DAN SOC)
         "meta_eta_pam": jnp.array(-2.484, dtype=jnp.float32),
         "meta_eta_ppl1": jnp.array(-1.130, dtype=jnp.float32),
         "meta_trace_decay": jnp.array(0.619, dtype=jnp.float32),
+        "meta_eta_dop1r2": jnp.array(-1.900, dtype=jnp.float32),
+        "meta_eta_soc": jnp.array(-1.400, dtype=jnp.float32),
     }
 
 
@@ -347,8 +355,30 @@ def forward_stream_b(
     o_sq = jnp.einsum("bsd,cd->bsc", sq_state, params["b_pfl3_opp"])
     aligned_q = q_sq * (1.0 + committed_goal[:, None, :])
     contra_k = k_sq - 0.99 * o_sq
-    policy_logits = jnp.einsum("buc,bvc->buv", aligned_q, contra_k) * float(1.0 / (cx_d ** 0.5))
+    inv_sqrt_cx = float(1.0 / (cx_d ** 0.5))
+    policy_logits = jnp.einsum("buc,bvc->buv", aligned_q, contra_k) * inv_sqrt_cx
     policy_flat = policy_logits.reshape((bsz, 4096))
+
+    # Noduli Efference-Copy Counterfactual Causal Advantage Matrix [B, 64, 64] -> [B, 4096]
+    # Exact algebraic match with Rust `stream_b.rs`:
+    #   noduli_dot(u, v) = w_noduli . (aligned_q[u] - contra_k[v]) = (w.aligned_q[u]) - (w.contra_k[v])
+    nod_from = jnp.einsum("buc,c->bu", aligned_q, params["b_noduli_w"]) * inv_sqrt_cx  # [B, 64]
+    nod_to = jnp.einsum("bvc,c->bv", contra_k, params["b_noduli_w"]) * inv_sqrt_cx     # [B, 64]
+    noduli_delta_map = jnp.tanh(nod_from[:, :, None] - nod_to[:, None, :] + params["b_noduli_b"]).reshape((bsz, 4096))
+
+    # Training-only AOTU -> LAL -> SMP 16-Causal-Concept Logits [B, 16]
+    if "aux_causal_w" in params:
+        causal_logits = jnp.einsum("bg,kg->bk", global_vec, params["aux_causal_w"]) + params["aux_causal_b"]
+    else:
+        causal_logits = jnp.zeros((bsz, NUM_CAUSAL_CONCEPTS), dtype=jnp.float32)
+
+    # Training-only 2-Ply VNC Causal Consequence Policy [B, 4096] (predicts follow-up move m_{t+2})
+    if "aux_vnc2_q" in params:
+        vq = jnp.einsum("bsd,cd->bsc", sq_state, params["aux_vnc2_q"]) * (1.0 + committed_goal[:, None, :])
+        vk = jnp.einsum("bsd,cd->bsc", sq_state, params["aux_vnc2_k"])
+        vnc2_logits = (jnp.einsum("buc,bvc->buv", vq, vk) * inv_sqrt_cx).reshape((bsz, 4096))
+    else:
+        vnc2_logits = policy_flat
 
     # Top-Down Stream B -> Stream A Seed & Centrifugal KC Mask
     seed_latent = jnp.tanh(jnp.einsum("bg,rg->br", global_vec, params["b_seed_down"]))
@@ -359,6 +389,9 @@ def forward_stream_b(
         "wdl_logits": wdl_logits,
         "per_tick_wdl": per_tick_wdl,
         "policy_logits": policy_flat,
+        "noduli_delta_map": noduli_delta_map,
+        "causal_logits": causal_logits,
+        "vnc2_logits": vnc2_logits,
         "pfl2_sharpness": pfl2_sharpness,
         "strategic_pressure": strategic_pressure,
         "creative_plans": plans,
@@ -390,14 +423,18 @@ def meta_dopamine_trajectory_scan(
         jnp.zeros((bsz, gamma_dim), dtype=jnp.float32),  # dw_gamma_opp
         jnp.zeros((bsz, gamma_dim), dtype=jnp.float32),  # elig_stm
         jnp.zeros((bsz, gamma_dim), dtype=jnp.float32),  # elig_opp
+        jnp.zeros((bsz,), dtype=jnp.float32),            # prev_delta (Dop1R2 reversal detector)
+        jnp.zeros((bsz,), dtype=jnp.float32),            # prev_mbon_val (MBON->DAN SOC)
     )
 
     eta_pam = jnp.clip(jax.nn.softplus(params["meta_eta_pam"]), 0.01, 0.5)
     eta_ppl1 = jnp.clip(jax.nn.softplus(params["meta_eta_ppl1"]), 0.02, 1.0)
     rho = jax.nn.sigmoid(params["meta_trace_decay"])
+    eta_dop1r2 = jnp.clip(jax.nn.softplus(params.get("meta_eta_dop1r2", jnp.array(-1.9))), 0.01, 0.5)
+    eta_soc = jnp.clip(jax.nn.softplus(params.get("meta_eta_soc", jnp.array(-1.4))), 0.01, 0.5)
 
     def scan_step(carry, step_inputs):
-        dw_s, dw_o, elig_s, elig_o = carry
+        dw_s, dw_o, elig_s, elig_o, prev_delta, prev_mbon_val = carry
         sp_s, sp_o, lh, ph, target_wdl = step_inputs
 
         out_a = forward_stream_a(
@@ -407,28 +444,43 @@ def meta_dopamine_trajectory_scan(
         probs = jax.nn.softmax(out_a["wdl_logits"], axis=-1)
         pred_val = probs[:, 0] - probs[:, 2]
         true_val = target_wdl[:, 0] - target_wdl[:, 2]
-        delta = jnp.clip(true_val - pred_val, -1.5, 1.5)  # Dopamine TD-surprise!
+        td_delta = jnp.clip(true_val - pred_val, -1.5, 1.5)
+
+        # MBON -> DAN Second-Order Conditioning (SOC):
+        # Stable MBON valuation shift generates internal pseudo-dopamine chaining A -> B -> C!
+        mbon_val = jax.lax.stop_gradient(pred_val)
+        soc_delta = jnp.clip(mbon_val - prev_mbon_val, -1.0, 1.0)
+        delta = jnp.clip(td_delta + eta_soc * soc_delta, -1.5, 1.5)
 
         k_s = out_a["kc_gamma_stm"]
         k_o = out_a["kc_gamma_opp"]
         elig_s = rho * elig_s + k_s
         elig_o = rho * elig_o + k_o
 
+        # Dop1R2 (G_alpha_q) bidirectional causal order erosion on sign reversals (trap / illusion)
+        reversal = jax.nn.sigmoid(-8.0 * (prev_delta * td_delta))
+        erode_gate = 1.0 - eta_dop1r2 * reversal[:, None] * jnp.minimum(k_s * 2.0, 1.0)
+        dw_s_eroded = dw_s * erode_gate
+        dw_o_eroded = dw_o * (1.0 - eta_dop1r2 * reversal[:, None] * jnp.minimum(k_o * 2.0, 1.0))
+
         norm_s = jnp.sum(k_s ** 2, axis=-1, keepdims=True) + 0.25 * jnp.sum(elig_s ** 2, axis=-1, keepdims=True) + 1e-4
         norm_o = jnp.sum(k_o ** 2, axis=-1, keepdims=True) + 0.25 * jnp.sum(elig_o ** 2, axis=-1, keepdims=True) + 1e-4
 
         pos_d = jnp.maximum(delta, 0.0)[:, None]
         neg_d = jnp.maximum(-delta, 0.0)[:, None]
-        # Asymmetric PAM (+) vs bilateral 33.2% contralateral PPL1 (-)
+        # Asymmetric Dop1R1 PAM (+) vs bilateral 33.2% contralateral PPL1 (-)
         dw_s_next = jnp.clip(
-            0.98 * dw_s + (eta_pam * pos_d - eta_ppl1 * neg_d) * (k_s + 0.5 * elig_s) / norm_s,
+            0.98 * dw_s_eroded + (eta_pam * pos_d - eta_ppl1 * neg_d) * (k_s + 0.5 * elig_s) / norm_s,
             -2.0, 2.0,
         )
         dw_o_next = jnp.clip(
-            0.98 * dw_o + (0.332 * eta_ppl1 * neg_d) * (k_o + 0.5 * elig_o) / norm_o,
+            0.98 * dw_o_eroded + (0.332 * eta_ppl1 * neg_d) * (k_o + 0.5 * elig_o) / norm_o,
             -2.0, 2.0,
         )
-        return (dw_s_next, dw_o_next, elig_s, elig_o), (out_a["wdl_logits"], out_a["active_kc_ratio"])
+        return (dw_s_next, dw_o_next, elig_s, elig_o, td_delta, mbon_val), (
+            out_a["wdl_logits"],
+            out_a["active_kc_ratio"],
+        )
 
     # Transpose [B, K, ...] -> [K, B, ...] for jax.lax.scan
     seq_in = (

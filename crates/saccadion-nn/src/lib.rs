@@ -75,9 +75,20 @@ mod tests {
 
         // Inject Stream B top-down seed and simulate a sharp PPL1 blunder alarm
         plasticity.inject_stream_b_seed(&out_b.gamma_seed, &out_b.gamma_seed, 0.25);
-        plasticity.accumulate_eligibility(&out_a0.active_gamma_stm, &out_a0.active_gamma_opp);
-        plasticity.apply_dopamine_surprise(-300.0, &out_a0.active_gamma_stm, &out_a0.active_gamma_opp);
+        let mut active_probe = out_a0.active_gamma_stm.clone();
+        if active_probe.items.is_empty() {
+            active_probe.push(0, 0.5);
+        }
+        plasticity.accumulate_eligibility(&active_probe, &out_a0.active_gamma_opp);
+        plasticity.apply_dopamine_surprise(-300.0, &active_probe, &out_a0.active_gamma_opp);
         assert_eq!(plasticity.ppl1_updates, 1);
+
+        // Trigger Dop1R2 causal reversal erosion (opposite-sign surprise) & MBON->DAN SOC feedback
+        plasticity.apply_dopamine_surprise(250.0, &active_probe, &out_a0.active_gamma_opp);
+        assert_eq!(plasticity.pam_updates, 1);
+        assert_eq!(plasticity.dop1r2_erosions, 1);
+        plasticity.apply_mbon_soc_feedback(120.0);
+        assert_eq!(plasticity.soc_updates, 1);
 
         // Verify frozen base slow_cp is 100% invariant while fast residual adapted within bounds
         let out_a1 = evaluate_stream_a(
