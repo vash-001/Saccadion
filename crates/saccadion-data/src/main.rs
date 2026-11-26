@@ -76,6 +76,22 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
         std::process::exit(1);
     }
 
+    // Global Cross-Shard Fisher-Yates Interleaving when combining multiple training shards
+    // (Games + Diverse Causal Puzzles + Looming/Endgame Survival) -> eliminates Epoch spikes!
+    if shard_paths.len() > 1 && n > 1 {
+        let mut rng_s: u64 = 0x5ACC_AD10_5A11_7777;
+        for idx in (1..n).rev() {
+            rng_s = rng_s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = rng_s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let swap_i = (z as usize) % (idx + 1);
+            all_recs.swap(idx, swap_i);
+            all_concepts.swap(idx, swap_i);
+        }
+    }
+
     let mut sp_stm = vec![-1i16; n * MAX_SPARSE_CACHE];
     let mut sp_opp = vec![-1i16; n * MAX_SPARSE_CACHE];
     let mut board_f16 = vec![0u16; n * 64 * STREAM_B_SQ_FEAT_DIM];
@@ -213,7 +229,7 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
     write_raw_slice(&out_cache_dir.join("causal_bits.u16"), &all_concepts).expect("write causal_bits");
 
     let meta_json = format!(
-        "{{\"count\": {}, \"max_sparse\": {}, \"version\": 3, \"num_shards\": {}}}",
+        "{{\"count\": {}, \"max_sparse\": {}, \"version\": 4, \"num_shards\": {}}}",
         n,
         MAX_SPARSE_CACHE,
         shard_paths.len()

@@ -397,7 +397,7 @@ def _pack_pgn_with_python_chess(
                     out_stm = w_res if stm == 0 else (1.0 - w_res)
                     out_wdl = (0.94, 0.04, 0.02) if out_stm > 0.75 else ((0.02, 0.04, 0.94) if out_stm < 0.25 else (0.08, 0.84, 0.08))
                     ev_wdl = cp_to_wdl(evals_stm[ply])
-                    rec["wdl_target"] = [0.6 * ev_wdl[i] + 0.4 * out_wdl[i] for i in range(3)]
+                    rec["wdl_target"] = [0.92 * ev_wdl[i] + 0.08 * out_wdl[i] for i in range(3)]
 
                     bm = (mv.from_square << 6) | mv.to_square
                     nm = (
@@ -535,6 +535,8 @@ def download_and_pack_elite_causal_puzzles(
 
     records: List[np.ndarray] = []
     concept_bits_list: List[int] = []
+    concept_counts = [0] * 16
+    per_theme_cap = max(3500, int(max_puzzles * 0.22))
     seen = 0
 
     try:
@@ -558,11 +560,16 @@ def download_and_pack_elite_causal_puzzles(
 
                     themes = row[7].split()
                     cbits = 0
+                    matched_idxs = []
                     for th in themes:
                         idx = CAUSAL_CONCEPT_TO_IDX.get(th)
                         if idx is not None:
                             cbits |= 1 << idx
+                            matched_idxs.append(idx)
                     if cbits == 0:
+                        continue
+                    # Enforce rich diversity across all 16 causal concepts (no single theme dominates!)
+                    if all(concept_counts[i] >= per_theme_cap for i in matched_idxs) and seen < 1_800_000:
                         continue
 
                     moves_uci = row[2].split()
@@ -637,6 +644,8 @@ def download_and_pack_elite_causal_puzzles(
 
                     records.append(rec)
                     concept_bits_list.append(cbits)
+                    for ci in matched_idxs:
+                        concept_counts[ci] += 1
                     if len(records) % 5000 == 0:
                         print(f"  Streamed {seen:,} puzzles -> kept {len(records):,} Elite Causal puzzles")
                     if len(records) >= max_puzzles:
@@ -890,15 +899,15 @@ def fetch_and_prepare(
         pgn_files.append(local_pgn)
     else:
         if source == "auto":
-            # 100% ENGINE-EVALUATED SURVIVAL + ELITE BLEND (Saccadion-4):
-            # 70% Stockfish Fishtest 3600+ per-ply evals + 30% Lichess 1900+ [%eval] tactical imbalances
-            ft_n = max(100, int(round(max_games * 0.70)))
+            # 100% ENGINE-EVALUATED COMPACT GENIUS BLEND (Saccadion-5):
+            # 75% Stockfish Fishtest 3600+ per-ply evals + 25% Lichess 2000+ [%eval] tactical/strategic variety
+            ft_n = max(100, int(round(max_games * 0.75)))
             le_n = max(0, max_games - ft_n)
             p_ft = download_fishtest_pgn(raw_dir, max_games=ft_n)
             if p_ft:
                 pgn_files.append(p_ft)
             if le_n > 0:
-                p_le = download_lichess_standard_eval_stream(raw_dir, max_games=le_n, min_elo=1900)
+                p_le = download_lichess_standard_eval_stream(raw_dir, max_games=le_n, min_elo=2000)
                 if p_le:
                     pgn_files.append(p_le)
             if not pgn_files:

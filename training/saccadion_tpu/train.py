@@ -49,7 +49,7 @@ import optax
 
 from .config import SaccadionConfig, build_flyhash_claws
 from .cpu_arena_sparring import StockfishSparringArena
-from .dataset import SaccShardDataset
+from .dataset import SaccShardDataset, augment_batch_file_mirror
 from .export_rust import export_params_to_saccnet
 from .live_ui import LiveTrainingHUD
 from .losses import compute_multitask_loss, jepa_vicreg_loss, soft_kl_loss
@@ -58,6 +58,7 @@ from .model import (
     forward_stream_b,
     init_saccadion_params,
     meta_dopamine_trajectory_scan,
+    predict_action_world_model,
 )
 
 
@@ -141,7 +142,9 @@ def build_muon_adamw_optimizer(
     for k, v in params.items():
         if k == "a_sez_weight":
             labels[k] = "sez"
-        elif k == "a_ft_weight" or v.ndim < 2 or "ln" in k or "bias" in k or "meta_" in k or "_rel" in k:
+        elif k == "a_ft_weight":
+            labels[k] = "sparse_ft"
+        elif v.ndim < 2 or "ln" in k or "bias" in k or "meta_" in k or "_rel" in k or "plastic_to_mbon" in k:
             labels[k] = "adamw"
         else:
             labels[k] = "muon"
@@ -149,7 +152,7 @@ def build_muon_adamw_optimizer(
     if hasattr(optax, "contrib") and hasattr(optax.contrib, "muon"):
         muon_tx = optax.chain(
             optax.contrib.muon(learning_rate=sched_muon, beta=0.95),
-            _signed_decoupled_weight_decay(sched_muon, weight_decay=0.005),
+            _signed_decoupled_weight_decay(sched_muon, weight_decay=0.008),
         )
     else:
         def init_fn(p):
@@ -167,16 +170,19 @@ def build_muon_adamw_optimizer(
 
         muon_tx = optax.chain(
             optax.GradientTransformation(init_fn, update_fn),
-            _signed_decoupled_weight_decay(sched_muon, weight_decay=0.005),
+            _signed_decoupled_weight_decay(sched_muon, weight_decay=0.008),
         )
 
-    # Calibrated decoupled weight decay (5e-3) prevents sparse table memorization without crushing T4/T5;
-    # SEZ innate survival table uses gentle LR + tiny decay so neural PSQTs refine smoothly around Queen=900!
+    # Stronger decoupled weight decay (1.5e-2) on `a_ft_weight` stops sparse-table memorization
+    # on compact datasets while SEZ refines neural PSQTs gently around Queen=900!
     adamw_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=5.0e-3)
+    sparse_ft_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=1.5e-2)
     sez_tx = optax.adamw(learning_rate=sched_sez, weight_decay=1.0e-4)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.multi_transform({"muon": muon_tx, "adamw": adamw_tx, "sez": sez_tx}, labels),
+        optax.multi_transform(
+            {"muon": muon_tx, "adamw": adamw_tx, "sparse_ft": sparse_ft_tx, "sez": sez_tx}, labels
+        ),
     )
     return tx, sched_muon, sched_adamw
 
@@ -251,7 +257,7 @@ def _save_metrics_and_dashboard(history: List[Dict[str, Any]], ckpt_dir: Path) -
 
         epochs = [r.get("epoch", i + 1) for i, r in enumerate(history)]
         fig, axes = plt.subplots(2, 3, figsize=(16, 9))
-        fig.suptitle("Saccadion-4 (SEZ+GF+DNp) Smart TPU Training Telemetry", fontsize=14, fontweight="bold")
+        fig.suptitle("Saccadion-5 (3-Lobe+Amacrine+WorldModel) Smart TPU Telemetry", fontsize=14, fontweight="bold")
 
         # Panel 1: Total Train vs Val Loss
         ax = axes[0, 0]
@@ -380,7 +386,7 @@ def _print_epoch_banner(row: Dict[str, Any], is_best: bool) -> None:
     )
     print(
         f"  META-DA : PAM={row['eta_pam']:.4f} | PPL1={row['eta_ppl1']:.4f} | Dop1R2={row['eta_dop1r2']:.4f} | "
-        f"SOC={row['eta_soc']:.4f} | rho={row['trace_rho']:.4f}"
+        f"SOC={row['eta_soc']:.4f} | DPM={row.get('eta_dpm', 0.0):.4f} | rho={row['trace_rho']:.4f}"
     )
     print("=" * 96)
 
@@ -442,7 +448,7 @@ def train_saccadion_smart(
     total_steps = steps_per_epoch * epochs
     dev_label = f"{n_dev}x {jax.devices()[0].platform.upper()}"
 
-    print(f"=== SACCADION-4 (SEZ+GF+DNp) SMART TPU TRAINER ===")
+    print(f"=== SACCADION-5 (3-LOBE+AMACRINE+WORLD-MODEL) SMART TPU TRAINER ===")
     print(f"Devices      : {dev_label} (pmap={use_pmap})")
     print(f"Model Tier   : tier_id={cfg.tier_id} (acc_dim={cfg.acc_dim}, D={cfg.stream_b_dim}, CX={cfg.cx_dim}, T_max={cfg.cx_max_ticks})")
     print(f"Dataset      : train={len(train_ds):,} pos | val={len(val_ds):,} pos | traj={len(traj_ds)//12:,} windows")
@@ -509,11 +515,13 @@ def train_saccadion_smart(
         if key in compiled_train:
             return compiled_train[key]
 
-        def loss_single(cur_p, batch, apl_target, apl_w):
+        def loss_single(cur_p, batch, apl_target, apl_w, rng_key):
+            k1, k2 = jax.random.split(rng_key)
             out_a = forward_stream_a(
                 cur_p, cfg, claws_idx,
                 batch["sparse_stm"], batch["sparse_opp"],
-                batch["lh_feat"], batch["phase_bucket"], qat=qat,
+                batch["lh_feat"], batch["phase_bucket"],
+                qat=qat, dropout_key=k1, kc_drop_rate=0.08,
             )
             out_b = forward_stream_b(
                 cur_p, cfg, batch["board_feats"], out_a["mbon_summary"],
@@ -523,25 +531,25 @@ def train_saccadion_smart(
                 cur_p, cfg, claws_idx,
                 batch["sparse_stm"], batch["sparse_opp"],
                 batch["lh_feat"], batch["phase_bucket"],
-                cent_mask=out_b["cent_kc_mask"], qat=qat,
+                cent_mask=out_b["cent_kc_mask"], qat=qat, dropout_key=k2, kc_drop_rate=0.08,
             )
             return compute_multitask_loss(
                 out_a_steered, out_b, batch, apl_target_active=apl_target, apl_weight=apl_w
             )
 
         if use_pmap:
-            def pstep(p, ost, batch, apl_target, apl_w):
-                (_, metrics), grads = jax.value_and_grad(loss_single, has_aux=True)(p, batch, apl_target, apl_w)
+            def pstep(p, ost, batch, apl_target, apl_w, rng_key):
+                (_, metrics), grads = jax.value_and_grad(loss_single, has_aux=True)(p, batch, apl_target, apl_w, rng_key)
                 grads = jax.lax.pmean(grads, axis_name="dev")
                 metrics = jax.lax.pmean(metrics, axis_name="dev")
                 updates, new_ost = tx.update(grads, ost, p)
                 return optax.apply_updates(p, updates), new_ost, metrics
 
-            fn = jax.pmap(pstep, axis_name="dev", in_axes=(0, 0, 0, None, None))
+            fn = jax.pmap(pstep, axis_name="dev", in_axes=(0, 0, 0, None, None, 0))
         else:
             @jax.jit
-            def jstep(p, ost, batch, apl_target, apl_w):
-                (_, metrics), grads = jax.value_and_grad(loss_single, has_aux=True)(p, batch, apl_target, apl_w)
+            def jstep(p, ost, batch, apl_target, apl_w, rng_key):
+                (_, metrics), grads = jax.value_and_grad(loss_single, has_aux=True)(p, batch, apl_target, apl_w, rng_key)
                 updates, new_ost = tx.update(grads, ost, p)
                 return optax.apply_updates(p, updates), new_ost, metrics
 
@@ -612,7 +620,8 @@ def train_saccadion_smart(
             loss_apl = jax.nn.relu(out["active_kc_ratio"] - 0.08) * 0.25
             adapt_gain = per_step[0] - per_step[-1]
 
-            # JEPA 2-Ply Mental Simulation: predict future Stream B latent at t+2 from state t!
+            # Multi-Horizon Action-Conditioned hDelta Latent World Model:
+            # Predicts future board latents z_{t+2} from (z_t, do(m_t)) AND z_{t+4} from (z_{t+2}, do(m_{t+2}))!
             out_a0 = forward_stream_a(
                 cur_p, cfg, claws_idx,
                 tbatch["sparse_stm"][:, 0], tbatch["sparse_opp"][:, 0],
@@ -631,8 +640,22 @@ def train_saccadion_smart(
                 cur_p, cfg, tbatch["board_feats"][:, 2], out_a2["mbon_summary"],
                 num_ticks=2, sez_cp=out_a2["sez_cp"], qat=False,
             )
-            loss_jepa = jepa_vicreg_loss(out_b0["global_latent"], out_b2["global_latent"])
-            return loss_traj + loss_apl + 0.25 * loss_jepa, {
+            out_a4 = forward_stream_a(
+                cur_p, cfg, claws_idx,
+                tbatch["sparse_stm"][:, 4], tbatch["sparse_opp"][:, 4],
+                tbatch["lh_feat"][:, 4], tbatch["phase_bucket"][:, 4], qat=False,
+            )
+            out_b4 = forward_stream_b(
+                cur_p, cfg, tbatch["board_feats"][:, 4], out_a4["mbon_summary"],
+                num_ticks=2, sez_cp=out_a4["sez_cp"], qat=False,
+            )
+            pred_z2 = predict_action_world_model(cur_p, out_b0, tbatch["top4_moves"][:, 0, 0])
+            pred_z4 = predict_action_world_model(cur_p, out_b2, tbatch["top4_moves"][:, 2, 0])
+            loss_jepa = 0.5 * (
+                jepa_vicreg_loss(pred_z2, out_b2["global_latent"])
+                + jepa_vicreg_loss(pred_z4, out_b4["global_latent"])
+            )
+            return loss_traj + loss_apl + 0.30 * loss_jepa, {
                 "meta_loss": loss_traj,
                 "jepa_loss": loss_jepa,
                 "adapt_gain": adapt_gain,
@@ -696,17 +719,23 @@ def train_saccadion_smart(
             ep_losses: List[float] = []
             pos_seen = 0
             ema_step_ms = 25.0
+            aug_rng = np.random.default_rng(epoch * 7919 + 13)
+            jax_rng = jax.random.PRNGKey(epoch * 4241 + 7)
 
             for step_idx, batch_np in enumerate(train_ds.iter_batches(eff_bsz, seed=epoch * 997), start=1):
                 t_s0 = time.time()
+                # Exact horizontal file-mirror symmetry augmentation (a <-> h) on castling-free positions!
+                batch_np = augment_batch_file_mirror(batch_np, aug_rng, prob=0.5)
+                jax_rng, step_key = jax.random.split(jax_rng)
                 if use_pmap:
                     b_in = _shard_batch_for_pmap(batch_np, n_dev)
-                    params_dev, opt_dev, m = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight)
+                    dev_keys = jax.random.split(step_key, n_dev)
+                    params_dev, opt_dev, m = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight, dev_keys)
                     loss_val = float(m["total"][0])
                     kc_val = float(m["active_kc_ratio"][0])
                 else:
                     b_in = {k: jnp.asarray(v) for k, v in batch_np.items()}
-                    params_dev, opt_dev, m = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight)
+                    params_dev, opt_dev, m = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight, step_key)
                     loss_val = float(m["total"])
                     kc_val = float(m["active_kc_ratio"])
 
@@ -801,6 +830,7 @@ def train_saccadion_smart(
             eta_ppl1_v = float(jax.nn.softplus(host_params["meta_eta_ppl1"]))
             eta_dop1r2_v = float(jax.nn.softplus(host_params.get("meta_eta_dop1r2", jnp.array(-1.9))))
             eta_soc_v = float(jax.nn.softplus(host_params.get("meta_eta_soc", jnp.array(-1.4))))
+            eta_dpm_v = float(jax.nn.softplus(host_params.get("meta_eta_dpm", jnp.array(-1.8))))
             rho_v = float(jax.nn.sigmoid(host_params["meta_trace_decay"]))
             est_raw_elo = estimate_elo_proxy(v_mean["top1_acc"], v_mean["wdl_acc"], v_mean["cp_mae"])
             est_search_elo = min(3700.0, est_raw_elo + 520.0)
@@ -853,6 +883,7 @@ def train_saccadion_smart(
                 "eta_ppl1": eta_ppl1_v,
                 "eta_dop1r2": eta_dop1r2_v,
                 "eta_soc": eta_soc_v,
+                "eta_dpm": eta_dpm_v,
                 "trace_rho": rho_v,
                 "lr_muon": float(sched_muon(global_step)),
                 "lr_adamw": float(sched_adamw(global_step)),

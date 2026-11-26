@@ -589,12 +589,12 @@ def build_or_open_memmap_cache(
     if not shard_paths:
         return None
     fp = _shards_fingerprint(shard_paths)
-    cdir = cache_root / f"{split_name}_v3_{fp}"
+    cdir = cache_root / f"{split_name}_v4_{fp}"
     meta_file = cdir / "meta.json"
     if meta_file.exists():
         try:
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
-            if meta.get("version") == 3 and int(meta.get("count", 0)) > 0:
+            if meta.get("version") == 4 and int(meta.get("count", 0)) > 0:
                 return cdir
         except Exception:
             pass
@@ -602,7 +602,7 @@ def build_or_open_memmap_cache(
     cdir.mkdir(parents=True, exist_ok=True)
     rust_bin = _find_rust_data_binary()
     if rust_bin is not None:
-        print(f"[FastCache] Rust multi-threaded pre-decoding `{split_name}` ({len(shard_paths)} shards)...")
+        print(f"[FastCache] Rust multi-threaded pre-decoding `{split_name}` ({len(shard_paths)} shards, global cross-shard shuffle)...")
         res = subprocess.run(
             [str(rust_bin), "predecode", str(cdir)] + [str(p) for p in shard_paths],
             capture_output=True,
@@ -612,7 +612,7 @@ def build_or_open_memmap_cache(
         if res.returncode == 0 and meta_file.exists():
             try:
                 m_chk = json.loads(meta_file.read_text(encoding="utf-8"))
-                if m_chk.get("version") == 3:
+                if m_chk.get("version") == 4:
                     print(" ", res.stdout.strip())
                     return cdir
             except Exception:
@@ -636,6 +636,11 @@ def build_or_open_memmap_cache(
     all_recs = np.concatenate(recs_list, axis=0)
     all_concepts = np.concatenate(concepts_list, axis=0)
     n = len(all_recs)
+    # Global cross-shard shuffle prevents contiguous puzzle/survival blocks from skewing epochs!
+    if len(shard_paths) > 1 and n > 1:
+        g_perm = np.random.default_rng(202605).permutation(n)
+        all_recs = all_recs[g_perm]
+        all_concepts = all_concepts[g_perm]
     n_workers = max(1, min(os.cpu_count() or 2, 8))
     chunk_sz = max(512, min(8192, (n + n_workers * 4 - 1) // (n_workers * 4)))
     print(
@@ -702,7 +707,7 @@ def build_or_open_memmap_cache(
     np.ascontiguousarray(all_concepts, dtype="<u2").tofile(cdir / "causal_bits.u16")
 
     meta_file.write_text(
-        json.dumps({"count": n, "max_sparse": max_sparse, "version": 3, "num_shards": len(shard_paths)}),
+        json.dumps({"count": n, "max_sparse": max_sparse, "version": 4, "num_shards": len(shard_paths)}),
         encoding="utf-8",
     )
     dt = max(1e-3, time.time() - t0)
@@ -978,3 +983,55 @@ class SaccShardDataset:
             flat_idx = np.concatenate([np.arange(w * window_k, (w + 1) * window_k) for w in w_ids])
             flat = self._collate(flat_idx)
             yield {k: v.reshape((batch_size, window_k) + v.shape[1:]) for k, v in flat.items()}
+
+
+_SQ_MIRROR_IDX = np.array([sq ^ 7 for sq in range(64)], dtype=np.int32)
+_SLIDE_MIRROR = np.array([0, 7, 6, 5, 4, 3, 2, 1], dtype=np.int32)
+_KNIGHT_MIRROR = np.array([7, 6, 5, 4, 3, 2, 1, 0], dtype=np.int32)
+
+
+def augment_batch_file_mirror(
+    batch: Dict[str, np.ndarray], rng: np.random.Generator, prob: float = 0.5
+) -> Dict[str, np.ndarray]:
+    """Applies exact horizontal file-mirror symmetry (a <-> h) on castling-free positions.
+
+    HalfKA and FullRays sparse indices are already horizontally mirror-invariant via king_bucket,
+    so mirroring board_feats (squares + directional sliding/knight rays + file_norm), move targets,
+    and threat_map_64 is 100% mathematically exact and doubles structural generalization!
+    """
+    bd = batch["board_feats"]
+    bsz = bd.shape[0]
+    # Castling-free check: col 45 is castling_own (0.0 when STM has no castling rights)
+    no_castle = bd[:, 0, 45] == 0.0
+    do_flip = no_castle & (rng.random(bsz) < prob)
+    if not np.any(do_flip):
+        return batch
+
+    out = dict(batch)
+    bd_new = bd.copy()
+    sub = bd_new[do_flip][:, _SQ_MIRROR_IDX, :]
+    sub[:, :, 12:20] = sub[:, :, 12 + _SLIDE_MIRROR]
+    sub[:, :, 20:28] = sub[:, :, 20 + _SLIDE_MIRROR]
+    sub[:, :, 28:36] = sub[:, :, 28 + _KNIGHT_MIRROR]
+    sub[:, :, 43] = 1.0 - sub[:, :, 43]
+    bd_new[do_flip] = sub
+    out["board_feats"] = bd_new
+
+    def _mirror_mv(m: np.ndarray) -> np.ndarray:
+        nonzero = m != 0
+        u = ((m >> 6) & 63) ^ 7
+        v = (m & 63) ^ 7
+        return np.where(nonzero, (u << 6) | v, m)
+
+    t4 = batch["top4_moves"].copy()
+    t4[do_flip] = _mirror_mv(t4[do_flip])
+    out["top4_moves"] = t4
+
+    nm = batch["next_move"].copy()
+    nm[do_flip] = _mirror_mv(nm[do_flip])
+    out["next_move"] = nm
+
+    th = batch["threat_map_64"].copy()
+    th[do_flip] = th[do_flip][:, _SQ_MIRROR_IDX]
+    out["threat_map_64"] = th
+    return out

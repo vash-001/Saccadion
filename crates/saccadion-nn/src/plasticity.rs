@@ -5,7 +5,7 @@
 //! gamma (intra-search) and alpha'/beta' (intra-game) plasticity vectors adapt in < 50 ns
 //! via asymmetric PAM (opportunity) and 12x denser bilateral PPL1 (blunder alarm) Dopamine.
 
-use crate::config::ModelConfig;
+use crate::config::{ModelConfig, PLASTIC_RANK};
 
 /// Hyperparameters controlling three-factor causal eligibility-trace plasticity and bounds.
 ///
@@ -88,6 +88,15 @@ pub struct DopaminePlasticityState {
     /// Intra-game fast weights per hemisphere (persists across moves, zeroed on ucinewgame).
     pub dw_apbp_stm: Vec<f32>,
     pub dw_apbp_opp: Vec<f32>,
+    /// Saccadion-5 L1-resident 3-Lobe Fast Synaptic Matrices [lobe_dim * PLASTIC_RANK]:
+    /// Directly rewire the 32-dim MBON semantic vector feeding BOTH SMP and Stream B CX!
+    pub dw_gamma_mat_stm: Vec<f32>,
+    pub dw_gamma_mat_opp: Vec<f32>,
+    pub dw_apbp_mat_stm: Vec<f32>,
+    pub dw_apbp_mat_opp: Vec<f32>,
+    /// Accumulated gamma search-level latent lesson transferred into alpha'/beta' by DPM!
+    pub gamma_lesson_stm: [f32; PLASTIC_RANK],
+    pub gamma_lesson_opp: [f32; PLASTIC_RANK],
     /// Biochemical eligibility trace vectors accumulated along the current search stack.
     pub elig_gamma_stm: Vec<f32>,
     pub elig_gamma_opp: Vec<f32>,
@@ -117,6 +126,12 @@ impl DopaminePlasticityState {
             dw_gamma_opp: vec![0.0; gamma_dim],
             dw_apbp_stm: vec![0.0; apbp_dim],
             dw_apbp_opp: vec![0.0; apbp_dim],
+            dw_gamma_mat_stm: vec![0.0; gamma_dim * PLASTIC_RANK],
+            dw_gamma_mat_opp: vec![0.0; gamma_dim * PLASTIC_RANK],
+            dw_apbp_mat_stm: vec![0.0; apbp_dim * PLASTIC_RANK],
+            dw_apbp_mat_opp: vec![0.0; apbp_dim * PLASTIC_RANK],
+            gamma_lesson_stm: [0.0; PLASTIC_RANK],
+            gamma_lesson_opp: [0.0; PLASTIC_RANK],
             elig_gamma_stm: vec![0.0; gamma_dim],
             elig_gamma_opp: vec![0.0; gamma_dim],
             familiarity_table: vec![0.0; 256],
@@ -136,6 +151,12 @@ impl DopaminePlasticityState {
         self.dw_gamma_opp.fill(0.0);
         self.dw_apbp_stm.fill(0.0);
         self.dw_apbp_opp.fill(0.0);
+        self.dw_gamma_mat_stm.fill(0.0);
+        self.dw_gamma_mat_opp.fill(0.0);
+        self.dw_apbp_mat_stm.fill(0.0);
+        self.dw_apbp_mat_opp.fill(0.0);
+        self.gamma_lesson_stm = [0.0; PLASTIC_RANK];
+        self.gamma_lesson_opp = [0.0; PLASTIC_RANK];
         self.elig_gamma_stm.fill(0.0);
         self.elig_gamma_opp.fill(0.0);
         self.familiarity_table.fill(0.0);
@@ -156,6 +177,14 @@ impl DopaminePlasticityState {
         for x in &mut self.dw_gamma_opp {
             *x *= 0.25;
         }
+        for x in &mut self.dw_gamma_mat_stm {
+            *x *= 0.25;
+        }
+        for x in &mut self.dw_gamma_mat_opp {
+            *x *= 0.25;
+        }
+        self.gamma_lesson_stm = [0.0; PLASTIC_RANK];
+        self.gamma_lesson_opp = [0.0; PLASTIC_RANK];
         self.elig_gamma_stm.fill(0.0);
         self.elig_gamma_opp.fill(0.0);
         self.prev_delta = 0.0;
@@ -230,6 +259,75 @@ impl DopaminePlasticityState {
         (gamma_cp, game_cp)
     }
 
+    /// True 3-Lobe Closed Cognitive Loop: projects active sparse gamma (intra-search) and
+    /// DPM-consolidated alpha'/beta' (intra-game) rank-8 fast synapses directly into the
+    /// 32-dim MBON vector BEFORE Push-Pull SiLU and BEFORE Stream B Central Complex!
+    pub fn inject_mbon_plasticity(
+        &self,
+        a_plastic_to_mbon: &[f32],
+        gamma_stm: &SparseActiveKc,
+        gamma_opp: &SparseActiveKc,
+        apbp_stm: &SparseActiveKc,
+        apbp_opp: &SparseActiveKc,
+        mbon_stm: &mut [f32],
+        mbon_opp: &mut [f32],
+    ) {
+        let mut lat_s = [0.0f32; PLASTIC_RANK];
+        let mut lat_o = [0.0f32; PLASTIC_RANK];
+
+        for &(idx, val) in &gamma_stm.items {
+            let base = (idx as usize) * PLASTIC_RANK;
+            for r in 0..PLASTIC_RANK {
+                lat_s[r] += self.dw_gamma_mat_stm[base + r] * val;
+            }
+        }
+        for &(idx, val) in &apbp_stm.items {
+            let base = (idx as usize) * PLASTIC_RANK;
+            for r in 0..PLASTIC_RANK {
+                lat_s[r] += self.dw_apbp_mat_stm[base + r] * val;
+            }
+        }
+        for &(idx, val) in &gamma_opp.items {
+            let base = (idx as usize) * PLASTIC_RANK;
+            for r in 0..PLASTIC_RANK {
+                lat_o[r] += self.dw_gamma_mat_opp[base + r] * val;
+            }
+        }
+        for &(idx, val) in &apbp_opp.items {
+            let base = (idx as usize) * PLASTIC_RANK;
+            for r in 0..PLASTIC_RANK {
+                lat_o[r] += self.dw_apbp_mat_opp[base + r] * val;
+            }
+        }
+
+        // Smooth bounded neuromodulatory gain so MBON representation shifts cleanly without blowup
+        let mut has_signal = false;
+        for r in 0..PLASTIC_RANK {
+            lat_s[r] = lat_s[r].tanh() * 0.65;
+            lat_o[r] = lat_o[r].tanh() * 0.65;
+            if lat_s[r].abs() > 1e-6 || lat_o[r].abs() > 1e-6 {
+                has_signal = true;
+            }
+        }
+        if !has_signal {
+            return;
+        }
+
+        let mbon_dim = mbon_stm.len();
+        for m in 0..mbon_dim {
+            let row = &a_plastic_to_mbon[m * PLASTIC_RANK..(m + 1) * PLASTIC_RANK];
+            let mut ds = 0.0f32;
+            let mut do_ = 0.0f32;
+            for r in 0..PLASTIC_RANK {
+                ds += row[r] * lat_s[r];
+                do_ += row[r] * lat_o[r];
+            }
+            // Exact FlyWire 2:1 ipsilateral / contralateral push-pull contrast
+            mbon_stm[m] += ds - 0.5 * do_;
+            mbon_opp[m] += do_ - 0.5 * ds;
+        }
+    }
+
     /// Applies an asymmetric three-factor PAM / PPL1 Dopamine update triggered by search surprise
     /// `delta_cp = V_search - V_static`.
     pub fn apply_dopamine_surprise(
@@ -284,6 +382,15 @@ impl DopaminePlasticityState {
             for &(idx, val) in &gamma_stm.items {
                 let i = idx as usize;
                 self.dw_gamma_stm[i] = (self.dw_gamma_stm[i] + step * val).clamp(-2.0, 2.0);
+                let base = i * PLASTIC_RANK;
+                for r in 0..PLASTIC_RANK {
+                    let sign = if (r & 1) == 0 { 1.0 } else { -0.5 };
+                    let upd = step * val * sign * (1.0 / (1.0 + (r as f32) * 0.25));
+                    self.dw_gamma_mat_stm[base + r] =
+                        (self.dw_gamma_mat_stm[base + r] + upd).clamp(-1.5, 1.5);
+                    self.gamma_lesson_stm[r] =
+                        (0.92 * self.gamma_lesson_stm[r] + 0.08 * upd).clamp(-1.5, 1.5);
+                }
             }
             // Retroactive forward-causal credit along eligibility trace
             let trace_step = 0.5 * step;
@@ -302,10 +409,28 @@ impl DopaminePlasticityState {
             for &(idx, val) in &gamma_stm.items {
                 let i = idx as usize;
                 self.dw_gamma_stm[i] = (self.dw_gamma_stm[i] - step_stm * val).clamp(-2.0, 2.0);
+                let base = i * PLASTIC_RANK;
+                for r in 0..PLASTIC_RANK {
+                    let sign = if (r & 1) == 0 { -1.0 } else { 0.5 };
+                    let upd = step_stm * val * sign * (1.0 / (1.0 + (r as f32) * 0.25));
+                    self.dw_gamma_mat_stm[base + r] =
+                        (self.dw_gamma_mat_stm[base + r] + upd).clamp(-1.5, 1.5);
+                    self.gamma_lesson_stm[r] =
+                        (0.92 * self.gamma_lesson_stm[r] + 0.08 * upd).clamp(-1.5, 1.5);
+                }
             }
             for &(idx, val) in &gamma_opp.items {
                 let i = idx as usize;
                 self.dw_gamma_opp[i] = (self.dw_gamma_opp[i] + step_opp * val).clamp(-2.0, 2.0);
+                let base = i * PLASTIC_RANK;
+                for r in 0..PLASTIC_RANK {
+                    let sign = if (r & 1) == 0 { 1.0 } else { -0.5 };
+                    let upd = step_opp * val * sign * (1.0 / (1.0 + (r as f32) * 0.25));
+                    self.dw_gamma_mat_opp[base + r] =
+                        (self.dw_gamma_mat_opp[base + r] + upd).clamp(-1.5, 1.5);
+                    self.gamma_lesson_opp[r] =
+                        (0.92 * self.gamma_lesson_opp[r] + 0.08 * upd).clamp(-1.5, 1.5);
+                }
             }
             let trace_stm = 0.5 * step_stm;
             for i in 0..self.gamma_dim {
@@ -345,8 +470,8 @@ impl DopaminePlasticityState {
         }
     }
 
-    /// DPM consolidation between played moves: transfers root surprise slowly into intra-game
-    /// alpha'/beta' fast weights so the engine adapts to the game's strategic character.
+    /// True DPM consolidation between played moves: transfers BOTH root surprise AND the
+    /// gamma-lobe synaptic lesson (`gamma_lesson_*`) into semi-plastic alpha'/beta' fast synapses!
     pub fn dpm_consolidate_move(
         &mut self,
         root_delta_cp: f32,
@@ -360,6 +485,12 @@ impl DopaminePlasticityState {
         for x in &mut self.dw_apbp_opp {
             *x *= keep;
         }
+        for x in &mut self.dw_apbp_mat_stm {
+            *x *= keep;
+        }
+        for x in &mut self.dw_apbp_mat_opp {
+            *x *= keep;
+        }
         let delta = (root_delta_cp / 250.0).clamp(-1.5, 1.5);
         let norm_stm = apbp_stm.l2_sq() + 1e-4;
         let norm_opp = apbp_opp.l2_sq() + 1e-4;
@@ -367,10 +498,22 @@ impl DopaminePlasticityState {
         for &(idx, val) in &apbp_stm.items {
             let i = idx as usize;
             self.dw_apbp_stm[i] = (self.dw_apbp_stm[i] + (lr * delta * val) / norm_stm).clamp(-1.5, 1.5);
+            let base = i * PLASTIC_RANK;
+            for r in 0..PLASTIC_RANK {
+                let dpm_sig = self.gamma_lesson_stm[r] + 0.35 * delta * if (r & 1) == 0 { 1.0 } else { -0.5 };
+                self.dw_apbp_mat_stm[base + r] =
+                    (self.dw_apbp_mat_stm[base + r] + (lr * dpm_sig * val) / norm_stm).clamp(-1.2, 1.2);
+            }
         }
         for &(idx, val) in &apbp_opp.items {
             let i = idx as usize;
             self.dw_apbp_opp[i] = (self.dw_apbp_opp[i] - (0.33 * lr * delta * val) / norm_opp).clamp(-1.5, 1.5);
+            let base = i * PLASTIC_RANK;
+            for r in 0..PLASTIC_RANK {
+                let dpm_sig = self.gamma_lesson_opp[r] - 0.15 * delta * if (r & 1) == 0 { 1.0 } else { -0.5 };
+                self.dw_apbp_mat_opp[base + r] =
+                    (self.dw_apbp_mat_opp[base + r] + (lr * dpm_sig * val) / norm_opp).clamp(-1.2, 1.2);
+            }
         }
     }
 

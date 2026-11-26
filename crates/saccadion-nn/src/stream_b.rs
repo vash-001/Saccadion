@@ -9,7 +9,7 @@
 //! - B6. PFL3 (99% Contralateral) Policy, PFL2 (50/50) Urgency Gain, Noduli Efference Copy,
 //!       10-20 Ply Strategic Pressure Forecast, and Top-Down Seed Injection -> Stream A.
 
-use crate::config::OPTIC_LAYERS;
+use crate::config::{AMACRINE_RANK, OPTIC_LAYERS};
 use crate::plasticity::DopaminePlasticityState;
 use crate::simd::{dot_f32, layer_norm, sigmoid, silu, softmax_inplace, softplus};
 use crate::stream_a::wdl_to_cp;
@@ -129,6 +129,13 @@ pub fn evaluate_stream_b(
     let mut sq_ln = vec![0.0f32; d];
     let mut ffn_g = vec![0.0f32; ffn_d];
     let mut ffn_u = vec![0.0f32; ffn_d];
+    let ama_tot = n_lob_heads * AMACRINE_RANK;
+    let inv_sqrt_ama = 1.0 / (AMACRINE_RANK as f32).sqrt();
+    let mut x1_all = vec![0.0f32; 64 * d];
+    let mut x1_mean = vec![0.0f32; d];
+    let mut ama_g = vec![0.0f32; ama_tot];
+    let mut ama_u = vec![0.0f32; 64 * ama_tot];
+    let mut ama_v = vec![0.0f32; 64 * ama_tot];
 
     for l in 0..OPTIC_LAYERS {
         let ln1_g = &w.b_opt_ln1_g[l * d..(l + 1) * d];
@@ -138,24 +145,51 @@ pub fn evaluate_stream_b(
         let wv = &w.b_opt_v[l * d * d..(l + 1) * d * d];
         let wo = &w.b_opt_o[l * d * d..(l + 1) * d * d];
         let wrel = &w.b_opt_rel[l * 4 * 4096..(l + 1) * 4 * 4096];
+        let w_au = &w.b_ama_u[l * ama_tot * d..(l + 1) * ama_tot * d];
+        let w_av = &w.b_ama_v[l * ama_tot * d..(l + 1) * ama_tot * d];
+        let w_ag = &w.b_ama_g[l * ama_tot * d..(l + 1) * ama_tot * d];
 
-        // 1) Pre-LN + Dm/Pm 4-Head 64x64 Retinotopic Spatial Attention
+        // 1) Pre-LN + Amacrine (Dm/Pm) Dynamic Position-Conditioned Attention Gate
+        x1_mean.fill(0.0);
         for sq in 0..64 {
-            layer_norm(&sq_state[sq * d..(sq + 1) * d], ln1_g, ln1_b, &mut sq_ln);
-            matvec(wq, &sq_ln, d, d, &mut lob_q[sq * d..(sq + 1) * d]);
-            matvec(wk, &sq_ln, d, d, &mut lob_k[sq * d..(sq + 1) * d]);
-            matvec(wv, &sq_ln, d, d, &mut lob_v[sq * d..(sq + 1) * d]);
+            let x1_sq = &mut x1_all[sq * d..(sq + 1) * d];
+            layer_norm(&sq_state[sq * d..(sq + 1) * d], ln1_g, ln1_b, x1_sq);
+            for j in 0..d {
+                x1_mean[j] += x1_sq[j] * (1.0 / 64.0);
+            }
+            matvec(wq, x1_sq, d, d, &mut lob_q[sq * d..(sq + 1) * d]);
+            matvec(wk, x1_sq, d, d, &mut lob_k[sq * d..(sq + 1) * d]);
+            matvec(wv, x1_sq, d, d, &mut lob_v[sq * d..(sq + 1) * d]);
+            matvec(w_au, x1_sq, ama_tot, d, &mut ama_u[sq * ama_tot..(sq + 1) * ama_tot]);
+            matvec(w_av, x1_sq, ama_tot, d, &mut ama_v[sq * ama_tot..(sq + 1) * ama_tot]);
+            for k in 0..ama_tot {
+                ama_u[sq * ama_tot + k] = ama_u[sq * ama_tot + k].tanh();
+                ama_v[sq * ama_tot + k] = ama_v[sq * ama_tot + k].tanh();
+            }
         }
+        matvec(w_ag, &x1_mean, ama_tot, d, &mut ama_g);
+        for k in 0..ama_tot {
+            ama_g[k] = sigmoid(ama_g[k]);
+        }
+
         lob_ctx.fill(0.0);
         for h in 0..n_lob_heads {
             let h_off = h * lob_hd;
             let rel_head_off = h * 4096;
+            let ama_h_off = h * AMACRINE_RANK;
             for u in 0..64 {
                 let qu = &lob_q[u * d + h_off..u * d + h_off + lob_hd];
                 let rel_row = &wrel[rel_head_off + u * 64..rel_head_off + (u + 1) * 64];
+                let au = &ama_u[u * ama_tot + ama_h_off..u * ama_tot + ama_h_off + AMACRINE_RANK];
                 for v in 0..64 {
                     let kv = &lob_k[v * d + h_off..v * d + h_off + lob_hd];
-                    attn_scores[v] = dot_f32(qu, kv) * inv_sqrt_hd + rel_row[v];
+                    let av = &ama_v[v * ama_tot + ama_h_off..v * ama_tot + ama_h_off + AMACRINE_RANK];
+                    let mut ama_bias = 0.0f32;
+                    for k in 0..AMACRINE_RANK {
+                        ama_bias += au[k] * ama_g[ama_h_off + k] * av[k];
+                    }
+                    attn_scores[v] =
+                        dot_f32(qu, kv) * inv_sqrt_hd + rel_row[v] + ama_bias * inv_sqrt_ama;
                 }
                 softmax_inplace(&mut attn_scores);
                 let dst = &mut lob_ctx[u * d + h_off..u * d + h_off + lob_hd];
@@ -348,7 +382,7 @@ pub fn evaluate_stream_b(
                 &mut delta7_scores[sec * cx_d..(sec + 1) * cx_d],
             );
         }
-        // Softmax along the 16-sector ring per channel to emulate Delta7 sinusoidal inhibition
+        // Softmax along the 16-sector ring per channel + CX LayerNorm stabilizing deep multi-tick reasoning!
         for j in 0..cx_d {
             let mut ring_col = [0.0f32; 16];
             for sec in 0..sectors {
@@ -361,6 +395,12 @@ pub fn evaluate_stream_b(
                 let ctx_inh = ring_gate[j] * u_val.abs() * 0.5;
                 cx_phasor[sec * cx_d + j] = (u_val - d7_inh - ctx_inh).max(0.0);
             }
+        }
+        let mut cx_ln_tmp = vec![0.0f32; cx_d];
+        for sec in 0..sectors {
+            let sl = &cx_phasor[sec * cx_d..(sec + 1) * cx_d];
+            layer_norm(sl, &w.b_cx_ln_g, &w.b_cx_ln_b, &mut cx_ln_tmp);
+            cx_phasor[sec * cx_d..(sec + 1) * cx_d].copy_from_slice(&cx_ln_tmp);
         }
 
         // Step D: Visual Centrifugal Inhibitory Feedback (71.8% I -> 64 squares) + Broadcaster update
@@ -490,6 +530,18 @@ pub fn evaluate_stream_b(
         matvec(&w.b_pfl3_opp, s, cx_d, d, &mut opp_sq[sq * cx_d..(sq + 1) * cx_d]);
     }
 
+    // FC2 x EPG -> PFL3 Conjunctive Allocentric-to-Egocentric Goal Steering (Nature Feb 2024):
+    // Compares committed allocentric FC2 goal with current EPG compass heading!
+    let mut conj_in = vec![0.0f32; 2 * cx_d];
+    conj_in[..cx_d].copy_from_slice(&committed_goal);
+    conj_in[cx_d..].copy_from_slice(&cx_pooled);
+    let mut conj_steer = vec![0.0f32; cx_d];
+    matvec(&w.b_fc2_conj, &conj_in, cx_d, 2 * cx_d, &mut conj_steer);
+    let mut eff_goal = vec![0.0f32; cx_d];
+    for j in 0..cx_d {
+        eff_goal[j] = committed_goal[j] + 0.5 * conj_steer[j].tanh();
+    }
+
     let mut policy_moves = Vec::with_capacity(legal_moves.len());
     let mut logits_tmp = Vec::with_capacity(legal_moves.len());
     let inv_sqrt_cx = 1.0 / (cx_d as f32).sqrt();
@@ -504,7 +556,7 @@ pub fn evaluate_stream_b(
         let mut score = 0.0f32;
         let mut noduli_dot = 0.0f32;
         for j in 0..cx_d {
-            let aligned_from = qu[j] * (1.0 + committed_goal[j]);
+            let aligned_from = qu[j] * (1.0 + eff_goal[j]);
             let contra_to = kv[j] - 0.99 * ov[j]; // 99% contralateral opponent-defense comparison!
             score += aligned_from * contra_to;
             noduli_dot += w.b_noduli_w[j] * (aligned_from - contra_to);

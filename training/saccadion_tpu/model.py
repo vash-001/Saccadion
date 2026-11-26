@@ -18,8 +18,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from .config import (
+    AMACRINE_RANK,
     NUM_CAUSAL_CONCEPTS,
     OPTIC_LAYERS,
+    PLASTIC_RANK,
     SaccadionConfig,
     build_flyhash_claws,
     init_sez_innate_weights,
@@ -139,18 +141,31 @@ def init_saccadion_params(cfg: SaccadionConfig, seed: int = 42) -> Dict[str, jnp
         "b_opt_fg": u((OPTIC_LAYERS, 2 * d, d), s_d),
         "b_opt_fu": u((OPTIC_LAYERS, 2 * d, d), s_d),
         "b_opt_fd": u((OPTIC_LAYERS, d, 2 * d), s_d * 0.5),
+        # Saccadion-5 Deep Fly-Brain Genius Circuits (exported to Rust SACCNET v5!)
+        "a_plastic_to_mbon": u((mbon, PLASTIC_RANK), 0.15),
+        "b_ama_u": u((OPTIC_LAYERS, 4 * AMACRINE_RANK, d), s_d * 0.5),
+        "b_ama_v": u((OPTIC_LAYERS, 4 * AMACRINE_RANK, d), s_d * 0.5),
+        "b_ama_g": u((OPTIC_LAYERS, 4 * AMACRINE_RANK, d), s_d * 0.5),
+        "b_cx_ln_g": jnp.ones((cx,), dtype=jnp.float32),
+        "b_cx_ln_b": jnp.zeros((cx,), dtype=jnp.float32),
+        "b_fc2_conj": u((cx, 2 * cx), s_cx * 0.5),
         # Training-only AOTU -> LAL -> SMP 16-Causal-Concept Effectome Head (zero Rust latency!)
         "aux_causal_w": u((NUM_CAUSAL_CONCEPTS, d + cx), s_d),
         "aux_causal_b": jnp.full((NUM_CAUSAL_CONCEPTS,), -0.5, dtype=jnp.float32),
         # Training-only 2-Ply VNC Causal Consequence Head (predicts m_{t+2} enabled by m_t)
         "aux_vnc2_q": u((cx, d), s_d),
         "aux_vnc2_k": u((cx, d), s_d),
-        # Learnable meta-plasticity scalars (Dop1R1 PAM/PPL1, trace rho, Dop1R2 erosion, MBON->DAN SOC)
+        # Training-only Action-Conditioned hDelta Latent World Model (predicts z_{t+2} from z_t + do(m_t))
+        "aux_wm_w1": u((d + cx, d + 2 * cx), s_d),
+        "aux_wm_b1": jnp.zeros((d + cx,), dtype=jnp.float32),
+        "aux_wm_w2": u((d + cx, d + cx), s_d * 0.5),
+        # Learnable meta-plasticity scalars (Dop1R1 PAM/PPL1, trace rho, Dop1R2, SOC, DPM consolidation)
         "meta_eta_pam": jnp.array(-2.484, dtype=jnp.float32),
         "meta_eta_ppl1": jnp.array(-1.130, dtype=jnp.float32),
         "meta_trace_decay": jnp.array(0.619, dtype=jnp.float32),
         "meta_eta_dop1r2": jnp.array(-1.900, dtype=jnp.float32),
         "meta_eta_soc": jnp.array(-1.400, dtype=jnp.float32),
+        "meta_eta_dpm": jnp.array(-1.800, dtype=jnp.float32),
     }
 
 
@@ -163,10 +178,14 @@ def forward_stream_a(
     lh_feat: jnp.ndarray,      # [B, 32] float32
     phase_bucket: jnp.ndarray, # [B] int32 in 0..7
     cent_mask: jnp.ndarray | None = None,  # Optional [B, acc_dim] top-down inhibitory mask
-    dw_gamma_stm: jnp.ndarray | None = None,  # Optional [B, gamma_dim] fast weights
+    dw_gamma_stm: jnp.ndarray | None = None,  # Optional [B, gamma_dim, PLASTIC_RANK] fast matrix
     dw_gamma_opp: jnp.ndarray | None = None,
+    dw_apbp_stm: jnp.ndarray | None = None,   # Optional [B, apbp_dim, PLASTIC_RANK] DPM matrix
+    dw_apbp_opp: jnp.ndarray | None = None,
     octopamine: float = 1.0,
     qat: bool = False,
+    dropout_key: Any | None = None,
+    kc_drop_rate: float = 0.0,
 ) -> Dict[str, jnp.ndarray]:
     """Batched Stream A forward pass on TPU matching `crates/saccadion-nn/src/stream_a.rs`."""
     ab_dim, gamma_dim, _ = cfg.lobe_dims_per_hemi()
@@ -214,13 +233,44 @@ def forward_stream_a(
 
     active_kc_ratio = 0.5 * (jnp.mean((kc_stm > 0.0).astype(jnp.float32)) + jnp.mean((kc_opp > 0.0).astype(jnp.float32)))
 
+    # Optional structured KC dropout during training only (prevents table memorization!)
+    if dropout_key is not None and kc_drop_rate > 0.0:
+        k1, k2 = jax.random.split(dropout_key)
+        keep = 1.0 - kc_drop_rate
+        m1 = (jax.random.uniform(k1, kc_stm.shape) < keep).astype(jnp.float32) / keep
+        m2 = (jax.random.uniform(k2, kc_opp.shape) < keep).astype(jnp.float32) / keep
+        kc_stm_eff = kc_stm * m1
+        kc_opp_eff = kc_opp * m2
+    else:
+        kc_stm_eff = kc_stm
+        kc_opp_eff = kc_opp
+
     # 4. Push-Pull MBONs (2:1 Ipsi / Contra mixing selected per game phase bucket)
     w_ipsi = ste_quantize(params["a_mbon_ipsi"], bits=8, enabled=qat)[phase_bucket]     # [B, acc, 32]
     w_contra = ste_quantize(params["a_mbon_contra"], bits=8, enabled=qat)[phase_bucket] # [B, acc, 32]
     b_mbon = params["a_mbon_bias"][phase_bucket]                                        # [B, 32]
 
-    raw_mbon_stm = jnp.einsum("bi,bim->bm", kc_stm, w_ipsi) + 0.5 * jnp.einsum("bi,bim->bm", kc_opp, w_contra) + b_mbon
-    raw_mbon_opp = jnp.einsum("bi,bim->bm", kc_opp, w_ipsi) + 0.5 * jnp.einsum("bi,bim->bm", kc_stm, w_contra) + b_mbon
+    raw_mbon_stm = jnp.einsum("bi,bim->bm", kc_stm_eff, w_ipsi) + 0.5 * jnp.einsum("bi,bim->bm", kc_opp_eff, w_contra) + b_mbon
+    raw_mbon_opp = jnp.einsum("bi,bim->bm", kc_opp_eff, w_ipsi) + 0.5 * jnp.einsum("bi,bim->bm", kc_stm_eff, w_contra) + b_mbon
+
+    # True 3-Lobe Closed Cognitive Loop: inject active gamma + DPM alpha'/beta' rank-8 synapses
+    # directly into the 32-dim MBON vector BEFORE Push-Pull SiLU and BEFORE Stream B CX!
+    kc_gamma_stm = kc_stm[:, ab_dim : ab_dim + gamma_dim]
+    kc_gamma_opp = kc_opp[:, ab_dim : ab_dim + gamma_dim]
+    kc_apbp_stm = kc_stm[:, ab_dim + gamma_dim :]
+    kc_apbp_opp = kc_opp[:, ab_dim + gamma_dim :]
+    if dw_gamma_stm is not None and dw_gamma_opp is not None:
+        lat_s = jnp.einsum("bg,bgr->br", kc_gamma_stm, dw_gamma_stm)
+        lat_o = jnp.einsum("bg,bgr->br", kc_gamma_opp, dw_gamma_opp)
+        if dw_apbp_stm is not None and dw_apbp_opp is not None:
+            lat_s = lat_s + jnp.einsum("ba,bar->br", kc_apbp_stm, dw_apbp_stm)
+            lat_o = lat_o + jnp.einsum("ba,bar->br", kc_apbp_opp, dw_apbp_opp)
+        lat_s = jnp.tanh(lat_s) * 0.65
+        lat_o = jnp.tanh(lat_o) * 0.65
+        ds = jnp.einsum("br,mr->bm", lat_s, params["a_plastic_to_mbon"])
+        do = jnp.einsum("br,mr->bm", lat_o, params["a_plastic_to_mbon"])
+        raw_mbon_stm = raw_mbon_stm + ds - 0.5 * do
+        raw_mbon_opp = raw_mbon_opp + do - 0.5 * ds
 
     signs = jnp.concatenate([jnp.ones((half_mbon,)), -jnp.ones((cfg.mbon_dim - half_mbon,))])
     mbon_stm = jax.nn.silu(raw_mbon_stm) * signs * octopamine
@@ -246,14 +296,6 @@ def forward_stream_a(
     smp_b = params["a_smp_b"][phase_bucket]                                     # [B, 3]
     wdl_logits_raw = jnp.einsum("bi,bki->bk", smp_in, smp_w) + smp_b
 
-    # Optional bounded fast-weight shift on Win vs Loss logits (Stage-3 Meta-Dopamine)
-    kc_gamma_stm = kc_stm[:, ab_dim : ab_dim + gamma_dim]
-    kc_gamma_opp = kc_opp[:, ab_dim : ab_dim + gamma_dim]
-    if dw_gamma_stm is not None and dw_gamma_opp is not None:
-        raw_fast = jnp.sum(dw_gamma_stm * kc_gamma_stm, axis=-1) - 0.5 * jnp.sum(dw_gamma_opp * kc_gamma_opp, axis=-1)
-        fast_shift = jnp.clip(raw_fast, -1.2, 1.2)
-        wdl_logits_raw = wdl_logits_raw + jnp.stack([fast_shift, jnp.zeros_like(fast_shift), -fast_shift], axis=-1)
-
     mbon_probs = jax.nn.softmax(wdl_logits_raw, axis=-1)
     mbon_cp = 400.0 * jnp.arctanh(jnp.clip(mbon_probs[:, 0] - mbon_probs[:, 2], -0.999, 0.999))
     fortress_scale = 1.0 - 0.55 * lh_veto[:, 1]
@@ -275,6 +317,8 @@ def forward_stream_a(
         "kc_opp": kc_opp,
         "kc_gamma_stm": kc_gamma_stm,
         "kc_gamma_opp": kc_gamma_opp,
+        "kc_apbp_stm": kc_apbp_stm,
+        "kc_apbp_opp": kc_apbp_opp,
         "active_kc_ratio": active_kc_ratio,
         "mbon_ei_ratio": mbon_e / (mbon_i + 1e-5),
         "lh_veto_mean": jnp.mean(lh_veto),
@@ -334,7 +378,8 @@ def forward_stream_b(
     shunt_gain = jnp.mean(exc.astype(jnp.float32) / (leak + inh.astype(jnp.float32)))
 
     # B1b. 3-Layer Untied FlyWire Optic Lobe Stack (Medulla -> Lobula -> Lobula Plate):
-    # Pre-LN -> Dm/Pm 4-Head 64x64 Retinotopic Attention -> Pre-LN -> Tm/TmY SwiGLU FFN
+    # Pre-LN -> Amacrine Dynamic Attention (Dm/Pm) -> Pre-LN -> Tm/TmY SwiGLU FFN
+    inv_sqrt_ama = float(1.0 / (AMACRINE_RANK ** 0.5))
     lob_focus = jnp.array(0.0, dtype=jnp.float32)
     for l_idx in range(OPTIC_LAYERS):
         x1 = layer_norm(sq_state, params["b_opt_ln1_g"][l_idx], params["b_opt_ln1_b"][l_idx])
@@ -344,10 +389,23 @@ def forward_stream_b(
         wo_l = ste_quantize(params["b_opt_o"][l_idx], 8, qat)
         rel_l = params["b_opt_rel"][l_idx]
 
+        # Amacrine (Dm/Pm) Dynamic Position-Conditioned Relational Attention Gate
+        x1_mean = jnp.mean(x1, axis=1)  # [B, D]
+        ama_g = jax.nn.sigmoid(jnp.einsum("bd,rd->br", x1_mean, params["b_ama_g"][l_idx])).reshape(
+            (bsz, n_lob_h, AMACRINE_RANK)
+        )
+        ama_u = jnp.tanh(jnp.einsum("bsd,rd->bsr", x1, params["b_ama_u"][l_idx])).reshape(
+            (bsz, 64, n_lob_h, AMACRINE_RANK)
+        )
+        ama_v = jnp.tanh(jnp.einsum("bsd,rd->bsr", x1, params["b_ama_v"][l_idx])).reshape(
+            (bsz, 64, n_lob_h, AMACRINE_RANK)
+        )
+        ama_bias = jnp.einsum("buhr,bhr,bvhr->bhuv", ama_u, ama_g, ama_v) * inv_sqrt_ama
+
         lq = jnp.einsum("bsd,ed->bse", x1, wq_l).reshape((bsz, 64, n_lob_h, lob_hd))
         lk = jnp.einsum("bsd,ed->bse", x1, wk_l).reshape((bsz, 64, n_lob_h, lob_hd))
         lv = jnp.einsum("bsd,ed->bse", x1, wv_l).reshape((bsz, 64, n_lob_h, lob_hd))
-        l_scores = jnp.einsum("buhd,bvhd->bhuv", lq, lk) * inv_sqrt_hd + rel_l[None, :, :, :]
+        l_scores = jnp.einsum("buhd,bvhd->bhuv", lq, lk) * inv_sqrt_hd + rel_l[None, :, :, :] + ama_bias
         l_attn = jax.nn.softmax(l_scores, axis=-1)
         lob_focus = jnp.mean(jnp.max(l_attn, axis=-1))
         l_ctx = jnp.einsum("bhuv,bvhd->buhd", l_attn, lv).reshape((bsz, 64, d))
@@ -399,6 +457,7 @@ def forward_stream_b(
         d7_scores = jnp.einsum("brc,ec->bre", u_phasor, w_d7)
         d7_ring = jax.nn.softmax(d7_scores, axis=1)
         cx_phasor = jax.nn.relu(u_phasor - d7_ring * jnp.abs(u_phasor) - 0.5 * ring_gate[:, None, :] * jnp.abs(u_phasor))
+        cx_phasor = layer_norm(cx_phasor, params["b_cx_ln_g"], params["b_cx_ln_b"])
 
         # Step D: Visual Centrifugal Top-Down Inhibitory Gate (71.8% I -> 64 squares)
         cent_mask_64 = jax.nn.sigmoid(jnp.einsum("bd,sd->bs", broad_mean, w_cent) + params["b_cent_b"])
@@ -434,19 +493,22 @@ def forward_stream_b(
     pfl2_sharpness = jax.nn.sigmoid(jnp.einsum("bg,g->b", global_vec, params["b_pfl2_w"]) + params["b_pfl2_b"])
     strategic_pressure = jnp.tanh(jnp.einsum("bg,pg->bp", global_vec, params["b_press_w"]) + params["b_press_b"])
 
+    # FC2 x EPG -> PFL3 Conjunctive Allocentric-to-Egocentric Goal Steering (Nature Feb 2024)
+    conj_in = jnp.concatenate([committed_goal, cx_pooled], axis=-1)  # [B, 2 * cx_d]
+    conj_steer = jnp.tanh(jnp.einsum("bi,ci->bc", conj_in, params["b_fc2_conj"]))
+    eff_goal = committed_goal + 0.5 * conj_steer
+
     # PFL3 99% Contralateral Bilinear Policy Logits [B, 64, 64] -> flattened [B, 4096]
     q_sq = jnp.einsum("bsd,cd->bsc", sq_state, params["b_pfl3_q"])
     k_sq = jnp.einsum("bsd,cd->bsc", sq_state, params["b_pfl3_k"])
     o_sq = jnp.einsum("bsd,cd->bsc", sq_state, params["b_pfl3_opp"])
-    aligned_q = q_sq * (1.0 + committed_goal[:, None, :])
+    aligned_q = q_sq * (1.0 + eff_goal[:, None, :])
     contra_k = k_sq - 0.99 * o_sq
     inv_sqrt_cx = float(1.0 / (cx_d ** 0.5))
     policy_logits = jnp.einsum("buc,bvc->buv", aligned_q, contra_k) * inv_sqrt_cx
     policy_flat = policy_logits.reshape((bsz, 4096))
 
     # Noduli Efference-Copy Counterfactual Causal Advantage Matrix [B, 64, 64] -> [B, 4096]
-    # Exact algebraic match with Rust `stream_b.rs`:
-    #   noduli_dot(u, v) = w_noduli . (aligned_q[u] - contra_k[v]) = (w.aligned_q[u]) - (w.contra_k[v])
     nod_from = jnp.einsum("buc,c->bu", aligned_q, params["b_noduli_w"]) * inv_sqrt_cx  # [B, 64]
     nod_to = jnp.einsum("bvc,c->bv", contra_k, params["b_noduli_w"]) * inv_sqrt_cx     # [B, 64]
     noduli_delta_map = jnp.tanh(nod_from[:, :, None] - nod_to[:, None, :] + params["b_noduli_b"]).reshape((bsz, 4096))
@@ -459,7 +521,7 @@ def forward_stream_b(
 
     # Training-only 2-Ply VNC Causal Consequence Policy [B, 4096] (predicts follow-up move m_{t+2})
     if "aux_vnc2_q" in params:
-        vq = jnp.einsum("bsd,cd->bsc", sq_state, params["aux_vnc2_q"]) * (1.0 + committed_goal[:, None, :])
+        vq = jnp.einsum("bsd,cd->bsc", sq_state, params["aux_vnc2_q"]) * (1.0 + eff_goal[:, None, :])
         vk = jnp.einsum("bsd,cd->bsc", sq_state, params["aux_vnc2_k"])
         vnc2_logits = (jnp.einsum("buc,bvc->buv", vq, vk) * inv_sqrt_cx).reshape((bsz, 4096))
     else:
@@ -482,7 +544,9 @@ def forward_stream_b(
         "pfl2_sharpness": pfl2_sharpness,
         "strategic_pressure": strategic_pressure,
         "creative_plans": plans,
-        "global_latent": global_vec,  # Used by JEPA 2-ply Mental Simulation!
+        "global_latent": global_vec,  # Used by Action-Conditioned hDelta World Model!
+        "aligned_q": aligned_q,       # [B, 64, cx_d] used by hDelta World Model
+        "contra_k": contra_k,         # [B, 64, cx_d] used by hDelta World Model
         "cent_board_mask": cent_mask_64,
         "gamma_seed": gamma_seed,
         "cent_kc_mask": cent_kc_mask,
@@ -497,6 +561,23 @@ def forward_stream_b(
     }
 
 
+def predict_action_world_model(
+    params: Dict[str, jnp.ndarray],
+    out_b: Dict[str, jnp.ndarray],
+    move_u16: jnp.ndarray,  # [B] int32 packed (u << 6) | v
+) -> jnp.ndarray:
+    """Action-Conditioned hDelta Latent World Model: predicts future global_latent z_{t+2}
+    conditioned on current latent z_t and the played action embedding do(m_t)!"""
+    bsz = move_u16.shape[0]
+    row = jnp.arange(bsz)
+    u = (move_u16 >> 6) & 63
+    v = move_u16 & 63
+    act_emb = out_b["aligned_q"][row, u] - out_b["contra_k"][row, v]  # [B, cx_d]
+    wm_in = jnp.concatenate([out_b["global_latent"], act_emb], axis=-1)
+    h = jax.nn.silu(jnp.einsum("bi,hi->bh", wm_in, params["aux_wm_w1"]) + params["aux_wm_b1"])
+    return out_b["global_latent"] + jnp.einsum("bh,oh->bo", h, params["aux_wm_w2"])
+
+
 def meta_dopamine_trajectory_scan(
     params: Dict[str, jnp.ndarray],
     cfg: SaccadionConfig,
@@ -504,22 +585,25 @@ def meta_dopamine_trajectory_scan(
     traj_batch: Dict[str, jnp.ndarray],
     qat: bool = False,
 ) -> Dict[str, jnp.ndarray]:
-    """Stage-3 Differentiable Meta-Plasticity over [B, K] correlated game trajectories.
+    """Saccadion-5 Differentiable 3-Lobe Meta-Plasticity over [B, K] correlated game trajectories.
 
-    Unrolls the exact Eligibility-Trace PAM/12x-PPL1 fast-weight update inside `jax.lax.scan`,
-    so TPU gradients train W_slow, FlyHash Claws, and plasticity gates to adapt in 1-3 steps
-    while W_slow remains frozen at test time!
+    Unrolls BOTH ultra-plastic gamma (`dw_gamma_mat: [B, gamma, 8]`) AND semi-plastic
+    DPM-consolidated alpha'/beta' (`dw_apbp_mat: [B, apbp, 8]`) injecting directly into the
+    32-dim MBON vector via `a_plastic_to_mbon`! Trains the entire 3-lobe cognitive loop end-to-end!
     """
-    bsz, k_steps = traj_batch["phase_bucket"].shape
-    _, gamma_dim, _ = cfg.lobe_dims_per_hemi()
+    bsz, _k_steps = traj_batch["phase_bucket"].shape
+    _, gamma_dim, apbp_dim = cfg.lobe_dims_per_hemi()
 
     init_carry = (
-        jnp.zeros((bsz, gamma_dim), dtype=jnp.float32),  # dw_gamma_stm
-        jnp.zeros((bsz, gamma_dim), dtype=jnp.float32),  # dw_gamma_opp
-        jnp.zeros((bsz, gamma_dim), dtype=jnp.float32),  # elig_stm
-        jnp.zeros((bsz, gamma_dim), dtype=jnp.float32),  # elig_opp
-        jnp.zeros((bsz,), dtype=jnp.float32),            # prev_delta (Dop1R2 reversal detector)
-        jnp.zeros((bsz,), dtype=jnp.float32),            # prev_mbon_val (MBON->DAN SOC)
+        jnp.zeros((bsz, gamma_dim, PLASTIC_RANK), dtype=jnp.float32),  # dw_gamma_stm
+        jnp.zeros((bsz, gamma_dim, PLASTIC_RANK), dtype=jnp.float32),  # dw_gamma_opp
+        jnp.zeros((bsz, apbp_dim, PLASTIC_RANK), dtype=jnp.float32),   # dw_apbp_stm (DPM!)
+        jnp.zeros((bsz, apbp_dim, PLASTIC_RANK), dtype=jnp.float32),   # dw_apbp_opp (DPM!)
+        jnp.zeros((bsz, gamma_dim), dtype=jnp.float32),                # elig_stm
+        jnp.zeros((bsz, gamma_dim), dtype=jnp.float32),                # elig_opp
+        jnp.zeros((bsz, PLASTIC_RANK), dtype=jnp.float32),             # gamma_lesson_stm
+        jnp.zeros((bsz,), dtype=jnp.float32),                          # prev_delta (Dop1R2)
+        jnp.zeros((bsz,), dtype=jnp.float32),                          # prev_mbon_val (SOC)
     )
 
     eta_pam = jnp.clip(jax.nn.softplus(params["meta_eta_pam"]), 0.01, 0.5)
@@ -527,57 +611,77 @@ def meta_dopamine_trajectory_scan(
     rho = jax.nn.sigmoid(params["meta_trace_decay"])
     eta_dop1r2 = jnp.clip(jax.nn.softplus(params.get("meta_eta_dop1r2", jnp.array(-1.9))), 0.01, 0.5)
     eta_soc = jnp.clip(jax.nn.softplus(params.get("meta_eta_soc", jnp.array(-1.4))), 0.01, 0.5)
+    eta_dpm = jnp.clip(jax.nn.softplus(params.get("meta_eta_dpm", jnp.array(-1.8))), 0.01, 0.5)
+
+    # Deterministic rank-8 channel polarity basis matching Rust plasticity.rs
+    r_idx = jnp.arange(PLASTIC_RANK, dtype=jnp.float32)
+    r_basis = jnp.where((r_idx % 2) == 0, 1.0, -0.5) / (1.0 + 0.25 * r_idx)  # [R]
 
     def scan_step(carry, step_inputs):
-        dw_s, dw_o, elig_s, elig_o, prev_delta, prev_mbon_val = carry
+        dw_gs, dw_go, dw_as, dw_ao, elig_s, elig_o, g_lesson, prev_delta, prev_mbon_val = carry
         sp_s, sp_o, lh, ph, target_wdl = step_inputs
 
         out_a = forward_stream_a(
             params, cfg, claws_idx, sp_s, sp_o, lh, ph,
-            dw_gamma_stm=dw_s, dw_gamma_opp=dw_o, qat=qat,
+            dw_gamma_stm=dw_gs, dw_gamma_opp=dw_go,
+            dw_apbp_stm=dw_as, dw_apbp_opp=dw_ao,
+            qat=qat,
         )
         probs = jax.nn.softmax(out_a["wdl_logits"], axis=-1)
         pred_val = probs[:, 0] - probs[:, 2]
         true_val = target_wdl[:, 0] - target_wdl[:, 2]
         td_delta = jnp.clip(true_val - pred_val, -1.5, 1.5)
 
-        # MBON -> DAN Second-Order Conditioning (SOC):
-        # Stable MBON valuation shift generates internal pseudo-dopamine chaining A -> B -> C!
+        # MBON -> DAN Second-Order Conditioning (SOC)
         mbon_val = jax.lax.stop_gradient(pred_val)
         soc_delta = jnp.clip(mbon_val - prev_mbon_val, -1.0, 1.0)
         delta = jnp.clip(td_delta + eta_soc * soc_delta, -1.5, 1.5)
 
         k_s = out_a["kc_gamma_stm"]
         k_o = out_a["kc_gamma_opp"]
+        ap_s = out_a["kc_apbp_stm"]
+        ap_o = out_a["kc_apbp_opp"]
         elig_s = rho * elig_s + k_s
         elig_o = rho * elig_o + k_o
 
-        # Dop1R2 (G_alpha_q) bidirectional causal order erosion on sign reversals (trap / illusion)
+        # Dop1R2 bidirectional causal order erosion on sign reversals
         reversal = jax.nn.sigmoid(-8.0 * (prev_delta * td_delta))
-        erode_gate = 1.0 - eta_dop1r2 * reversal[:, None] * jnp.minimum(k_s * 2.0, 1.0)
-        dw_s_eroded = dw_s * erode_gate
-        dw_o_eroded = dw_o * (1.0 - eta_dop1r2 * reversal[:, None] * jnp.minimum(k_o * 2.0, 1.0))
+        dw_gs_e = dw_gs * (1.0 - eta_dop1r2 * reversal[:, None, None] * jnp.minimum(k_s[:, :, None] * 2.0, 1.0))
+        dw_go_e = dw_go * (1.0 - eta_dop1r2 * reversal[:, None, None] * jnp.minimum(k_o[:, :, None] * 2.0, 1.0))
 
         norm_s = jnp.sum(k_s ** 2, axis=-1, keepdims=True) + 0.25 * jnp.sum(elig_s ** 2, axis=-1, keepdims=True) + 1e-4
         norm_o = jnp.sum(k_o ** 2, axis=-1, keepdims=True) + 0.25 * jnp.sum(elig_o ** 2, axis=-1, keepdims=True) + 1e-4
+        norm_as = jnp.sum(ap_s ** 2, axis=-1, keepdims=True) + 1e-4
+        norm_ao = jnp.sum(ap_o ** 2, axis=-1, keepdims=True) + 1e-4
 
         pos_d = jnp.maximum(delta, 0.0)[:, None]
         neg_d = jnp.maximum(-delta, 0.0)[:, None]
-        # Asymmetric Dop1R1 PAM (+) vs bilateral 33.2% contralateral PPL1 (-)
-        dw_s_next = jnp.clip(
-            0.98 * dw_s_eroded + (eta_pam * pos_d - eta_ppl1 * neg_d) * (k_s + 0.5 * elig_s) / norm_s,
-            -2.0, 2.0,
-        )
-        dw_o_next = jnp.clip(
-            0.98 * dw_o_eroded + (0.332 * eta_ppl1 * neg_d) * (k_o + 0.5 * elig_o) / norm_o,
-            -2.0, 2.0,
-        )
-        return (dw_s_next, dw_o_next, elig_s, elig_o, td_delta, mbon_val), (
-            out_a["wdl_logits"],
-            out_a["active_kc_ratio"],
-        )
+        # Asymmetric Dop1R1 PAM (+) vs 33.2% contralateral PPL1 (-) onto rank-8 gamma synapses
+        g_drive_s = (eta_pam * pos_d - eta_ppl1 * neg_d) / norm_s  # [B, 1]
+        g_drive_o = (0.332 * eta_ppl1 * neg_d) / norm_o            # [B, 1]
+        upd_gs = g_drive_s[:, :, None] * (k_s + 0.5 * elig_s)[:, :, None] * r_basis[None, None, :]
+        upd_go = g_drive_o[:, :, None] * (k_o + 0.5 * elig_o)[:, :, None] * r_basis[None, None, :]
+        dw_gs_next = jnp.clip(0.98 * dw_gs_e + upd_gs, -1.5, 1.5)
+        dw_go_next = jnp.clip(0.98 * dw_go_e + upd_go, -1.5, 1.5)
 
-    # Transpose [B, K, ...] -> [K, B, ...] for jax.lax.scan
+        # True DPM Cross-Lobe Consolidation: slowly transfers gamma synaptic lesson -> semi-plastic alpha'/beta'!
+        step_lesson = jnp.mean(upd_gs, axis=1) * 4.0  # [B, R]
+        g_lesson_next = jnp.clip(0.85 * g_lesson + 0.15 * step_lesson, -1.5, 1.5)
+        dpm_sig_s = g_lesson_next + 0.35 * delta[:, None] * r_basis[None, :]
+        dpm_sig_o = -0.15 * delta[:, None] * r_basis[None, :]
+        dw_as_next = jnp.clip(
+            0.96 * dw_as + (eta_dpm * ap_s[:, :, None] / norm_as[:, :, None]) * dpm_sig_s[:, None, :],
+            -1.2, 1.2,
+        )
+        dw_ao_next = jnp.clip(
+            0.96 * dw_ao + (eta_dpm * ap_o[:, :, None] / norm_ao[:, :, None]) * dpm_sig_o[:, None, :],
+            -1.2, 1.2,
+        )
+        return (
+            dw_gs_next, dw_go_next, dw_as_next, dw_ao_next,
+            elig_s, elig_o, g_lesson_next, td_delta, mbon_val,
+        ), (out_a["wdl_logits"], out_a["active_kc_ratio"])
+
     seq_in = (
         jnp.swapaxes(traj_batch["sparse_stm"], 0, 1),
         jnp.swapaxes(traj_batch["sparse_opp"], 0, 1),

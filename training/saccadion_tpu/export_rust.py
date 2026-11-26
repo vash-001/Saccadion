@@ -14,7 +14,9 @@ from typing import Dict, Tuple
 import numpy as np
 
 from .config import (
+    AMACRINE_RANK,
     OPTIC_LAYERS,
+    PLASTIC_RANK,
     SACCNET_MAGIC,
     SACCNET_VERSION,
     SaccadionConfig,
@@ -93,6 +95,13 @@ SACCNET_TENSOR_ORDER = [
     "b_opt_fg",
     "b_opt_fu",
     "b_opt_fd",
+    "a_plastic_to_mbon",
+    "b_ama_u",
+    "b_ama_v",
+    "b_ama_g",
+    "b_cx_ln_g",
+    "b_cx_ln_b",
+    "b_fc2_conj",
 ]
 
 
@@ -216,6 +225,13 @@ def init_numpy_params(cfg: SaccadionConfig, seed: int = 1234) -> Dict[str, np.nd
         "b_opt_fg": u((OPTIC_LAYERS, 2 * d, d), s_d),
         "b_opt_fu": u((OPTIC_LAYERS, 2 * d, d), s_d),
         "b_opt_fd": u((OPTIC_LAYERS, d, 2 * d), s_d * 0.5),
+        "a_plastic_to_mbon": u((mbon, PLASTIC_RANK), 0.15),
+        "b_ama_u": u((OPTIC_LAYERS, 4 * AMACRINE_RANK, d), s_d * 0.5),
+        "b_ama_v": u((OPTIC_LAYERS, 4 * AMACRINE_RANK, d), s_d * 0.5),
+        "b_ama_g": u((OPTIC_LAYERS, 4 * AMACRINE_RANK, d), s_d * 0.5),
+        "b_cx_ln_g": np.ones((cx,), dtype=np.float32),
+        "b_cx_ln_b": np.zeros((cx,), dtype=np.float32),
+        "b_fc2_conj": u((cx, 2 * cx), s_cx * 0.5),
     }
 
 
@@ -314,13 +330,20 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
     lob_hd = d // n_lob_h
     inv_shd = 1.0 / np.sqrt(lob_hd)
 
-    # B1b. 3-Layer Untied FlyWire Optic Lobe Stack (Dm/Pm Attention + Tm/TmY SwiGLU FFN)
+    # B1b. 3-Layer Untied FlyWire Optic Lobe Stack (Amacrine Dynamic Attention + Tm/TmY SwiGLU FFN)
+    inv_sqrt_ama = 1.0 / np.sqrt(AMACRINE_RANK)
     for l_idx in range(OPTIC_LAYERS):
         x1 = _ln(sq_state, params["b_opt_ln1_g"][l_idx], params["b_opt_ln1_b"][l_idx])
+        x1_mean = np.mean(x1, axis=0)
+        ama_g = _sigmoid(params["b_ama_g"][l_idx] @ x1_mean).reshape(n_lob_h, AMACRINE_RANK)
+        ama_u = np.tanh(x1 @ params["b_ama_u"][l_idx].T).reshape(64, n_lob_h, AMACRINE_RANK)
+        ama_v = np.tanh(x1 @ params["b_ama_v"][l_idx].T).reshape(64, n_lob_h, AMACRINE_RANK)
+        ama_bias = np.einsum("uhr,hr,vhr->huv", ama_u, ama_g, ama_v) * inv_sqrt_ama
+
         lq = (x1 @ params["b_opt_q"][l_idx].T).reshape(64, n_lob_h, lob_hd)
         lk = (x1 @ params["b_opt_k"][l_idx].T).reshape(64, n_lob_h, lob_hd)
         lv = (x1 @ params["b_opt_v"][l_idx].T).reshape(64, n_lob_h, lob_hd)
-        l_scores = np.einsum("uhd,vhd->huv", lq, lk) * inv_shd + params["b_opt_rel"][l_idx]
+        l_scores = np.einsum("uhd,vhd->huv", lq, lk) * inv_shd + params["b_opt_rel"][l_idx] + ama_bias
         l_attn = _softmax(l_scores, axis=-1)
         l_ctx = np.einsum("huv,vhd->uhd", l_attn, lv).reshape(64, d)
         sq_state = sq_state + l_ctx @ params["b_opt_o"][l_idx].T
@@ -353,6 +376,7 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
         ring_gate = _sigmoid(params["b_ring_inh"] @ np.concatenate([int_mean, mbon_summary]) + params["b_ring_b"])
         d7_ring = _softmax(u_p @ params["b_delta7"].T, axis=0)
         cx_p = np.maximum(u_p - d7_ring * np.abs(u_p) - 0.5 * ring_gate[None, :] * np.abs(u_p), 0.0)
+        cx_p = _ln(cx_p, params["b_cx_ln_g"], params["b_cx_ln_b"])
 
         cent_64 = _sigmoid(params["b_cent_w"] @ broad_mean + params["b_cent_b"])
         gate_64 = 1.0 - 0.718 * (1.0 - cent_64)[:, None]

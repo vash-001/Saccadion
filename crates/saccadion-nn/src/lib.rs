@@ -93,7 +93,8 @@ mod tests {
         plasticity.apply_mbon_soc_feedback(120.0);
         assert_eq!(plasticity.soc_updates, 1);
 
-        // Verify frozen base slow_cp is 100% invariant while fast residual adapted within bounds
+        // Verify 3-Lobe Closed Cognitive Loop (gamma + DPM alpha'/beta' -> 32-dim MBON vector)
+        plasticity.dpm_consolidate_move(180.0, &out_a0.active_apbp_stm, &out_a0.active_apbp_opp);
         let out_a1 = evaluate_stream_a(
             &pos,
             &weights,
@@ -103,9 +104,12 @@ mod tests {
             1.0,
         );
         assert!(out_a1.gamma_cp.abs() <= plasticity.params.clamp_gamma_cp + 1e-4);
+        assert!(out_a1.total_cp.is_finite());
 
         // Verify ucinewgame clean reset restores exact bit-identical baseline!
         plasticity.reset_game();
+        assert!(plasticity.dw_gamma_mat_stm.iter().all(|&x| x == 0.0));
+        assert!(plasticity.dw_apbp_mat_stm.iter().all(|&x| x == 0.0));
         let out_a_reset = evaluate_stream_a(&pos, &weights, &mut ws, Some(&plasticity), None, 1.0);
         assert!((out_a_reset.total_cp - out_a0.total_cp).abs() < 1e-5);
 

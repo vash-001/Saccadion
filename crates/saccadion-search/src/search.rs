@@ -47,7 +47,7 @@ impl Default for SearchConfig {
             max_nodes: u64::MAX,
             time_limit_ms: 0,
             threads: 1,
-            cx_min_depth: 7,
+            cx_min_depth: 6,
             use_stream_b: true,
             use_dopamine: true,
             use_lateral_horn: true,
@@ -90,6 +90,8 @@ struct DnpWorker {
     flushed_q_nodes: u64,
     killers: [[Move; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
+    countermoves: [[Move; 64]; 64],
+    dpm_corr: [i32; 4096],
     nodes: u64,
     q_nodes: u64,
     stream_b_evals: u64,
@@ -136,6 +138,8 @@ impl DnpWorker {
             flushed_q_nodes: 0,
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
+            countermoves: [[Move::NULL; 64]; 64],
+            dpm_corr: [0; 4096],
             nodes: 0,
             q_nodes: 0,
             stream_b_evals: 0,
@@ -197,6 +201,7 @@ impl DnpWorker {
         mut alpha: i32,
         beta: i32,
         is_pv: bool,
+        prev_move: Move,
         parent_cent_mask: Option<&[f32]>,
         expected_eval_from_parent: f32,
         pv_out: &mut Vec<Move>,
@@ -255,9 +260,9 @@ impl DnpWorker {
         };
 
         let use_fast_frontier = !is_pv && depth <= 2 && cached_strat_hit.is_none();
-        let (static_eval, out_a_opt, lh_tactical_alert, efference_surprise) = if use_fast_frontier {
+        let (raw_static_eval, out_a_opt, lh_tactical_alert, lh_deep_alert, efference_surprise) = if use_fast_frontier {
             let gf_cp = evaluate_giant_fiber_cp(pos, &self.weights, &mut self.ws_a);
-            (gf_cp, None, false, false)
+            (gf_cp, None, false, false, false)
         } else {
             let out_a = evaluate_stream_a(
                 pos,
@@ -278,6 +283,8 @@ impl DnpWorker {
                     .accumulate_eligibility(&out_a.active_gamma_stm, &out_a.active_gamma_opp);
             }
             let lh_alert = self.cfg.use_lateral_horn && out_a.veto.tactical_alert();
+            let lh_deep = self.cfg.use_lateral_horn
+                && (lh_alert || out_a.veto.fortress_alert() || out_a.veto.passer_urgency > 0.55);
             if lh_alert {
                 self.lh_veto_triggers += 1;
             }
@@ -288,8 +295,11 @@ impl DnpWorker {
             if eff_surp {
                 self.efference_surprises += 1;
             }
-            (se, Some(out_a), lh_alert, eff_surp)
+            (se, Some(out_a), lh_alert, lh_deep, eff_surp)
         };
+        let corr_idx = (pos.hash as usize) & 4095;
+        let static_eval = (raw_static_eval + (self.dpm_corr[corr_idx] / 4).clamp(-100, 100))
+            .clamp(-2600, 2600);
         let parent_eval_f32 = out_a_opt
             .as_ref()
             .map(|o| o.total_cp)
@@ -315,6 +325,7 @@ impl DnpWorker {
                     -beta,
                     -beta + 1,
                     false,
+                    Move::NULL,
                     parent_cent_mask,
                     0.0,
                     &mut dummy_pv,
@@ -336,13 +347,14 @@ impl DnpWorker {
             return if in_check { -MATE_SCORE + ply as i32 } else { 0 };
         }
 
-        // 5. Selective Stream B Central Complex Oracle (main thread & high-depth crossroads only!)
+        // 5. Selective Stream B Deep Strategic Brain (wakes up on PV, high-depth crossroads,
+        //    Lateral Horn tactical/fortress/passed-pawn alerts, or Noduli causal surprises!)
         let need_stream_b = self.cfg.use_stream_b
             && !self.is_helper
             && out_a_opt.is_some()
             && (depth >= self.cfg.cx_min_depth
-                || (is_pv && depth >= 6)
-                || (efference_surprise && depth >= 5));
+                || (is_pv && depth >= 5)
+                || ((efference_surprise || lh_deep_alert) && depth >= 4));
 
         let mut local_strat: Option<StrategicEntry> = cached_strat_hit;
         if local_strat.is_some() {
@@ -369,13 +381,23 @@ impl DnpWorker {
             }
         }
 
+        // Internal Iterative Reduction (IIR) when neither TT nor Stream B has prior guidance
+        if depth >= 4 && tt_move.is_null() && local_strat.is_none() && !in_check {
+            depth -= 1;
+        }
+
         // PFL2 Sharpness-driven depth extension on critical turning points
         let pfl2_sharpness = local_strat.as_ref().map(|s| s.pfl2_sharpness).unwrap_or(0.5);
         if is_pv && pfl2_sharpness > 0.78 && !in_check && ply < 16 && depth >= 3 {
             depth += 1;
         }
 
-        // 6. Move Ordering: TT Move > PFL3 Goal-Aligned Policy > MVV-LVA Captures > Killers > History
+        // 6. Move Ordering: TT > PFL3 Goal-Aligned > MVV-LVA > Killers > Countermove > History
+        let counter_mv = if !prev_move.is_null() {
+            self.countermoves[prev_move.from_sq().index()][prev_move.to_sq().index()]
+        } else {
+            Move::NULL
+        };
         let mut scored_moves: Vec<(Move, i32, usize, f32)> = Vec::with_capacity(moves.len());
         let stm_idx = pos.side_to_move.index();
         for &mv in moves.as_slice() {
@@ -407,6 +429,8 @@ impl DnpWorker {
                 priority += 950_000;
             } else if mv == self.killers[ply][0] {
                 priority += 400_000;
+            } else if mv == counter_mv {
+                priority += 375_000;
             } else if mv == self.killers[ply][1] {
                 priority += 350_000;
             } else {
@@ -445,21 +469,24 @@ impl DnpWorker {
                     -beta,
                     -alpha,
                     is_pv,
+                    mv,
                     child_cent_mask,
                     expected_child_eval,
                     &mut child_pv,
                 )
             } else {
+                // Logarithmic LMR modulated by PFL3 top-3 immunity, PFL2 sharpness, & Lateral Horn veto
                 let mut r = 0i32;
                 if depth >= 3 && move_idx >= 3 && is_quiet && !in_check && !gives_check {
-                    r = 1 + (depth / 4) + (move_idx as i32 / 8);
+                    let log_r = ((depth as f32).ln() * ((move_idx + 1) as f32).ln() * 0.48) as i32;
+                    r = log_r.max(1);
                     if pfl3_rank < 3 {
                         r = (r - 3).max(0);
                     }
                     if pfl2_sharpness < 0.30 {
                         r += 1;
                     }
-                    if lh_tactical_alert || efference_surprise {
+                    if lh_tactical_alert || lh_deep_alert || efference_surprise {
                         r = (r - 1).max(0);
                     }
                     r = r.min(depth - 2).max(0);
@@ -472,6 +499,7 @@ impl DnpWorker {
                     -alpha - 1,
                     -alpha,
                     false,
+                    mv,
                     child_cent_mask,
                     expected_child_eval,
                     &mut child_pv,
@@ -485,6 +513,7 @@ impl DnpWorker {
                         -alpha - 1,
                         -alpha,
                         false,
+                        mv,
                         child_cent_mask,
                         expected_child_eval,
                         &mut child_pv,
@@ -499,6 +528,7 @@ impl DnpWorker {
                         -beta,
                         -alpha,
                         true,
+                        mv,
                         child_cent_mask,
                         expected_child_eval,
                         &mut child_pv,
@@ -527,6 +557,9 @@ impl DnpWorker {
                         if is_quiet {
                             self.killers[ply][1] = self.killers[ply][0];
                             self.killers[ply][0] = mv;
+                            if !prev_move.is_null() {
+                                self.countermoves[prev_move.from_sq().index()][prev_move.to_sq().index()] = mv;
+                            }
                             let h = &mut self.history[stm_idx][mv.from_sq().index()][mv.to_sq().index()];
                             *h = (*h + depth * depth).min(200_000);
                         }
@@ -536,15 +569,19 @@ impl DnpWorker {
             }
         }
 
-        // 7. Live Bounded PAM / 12x PPL1 / Dop1R2 Dopamine Update
-        if self.cfg.use_dopamine && depth >= 3 && best_score.abs() < MATE_THRESHOLD {
-            if let Some(ref out_a) = out_a_opt {
-                let delta_cp = best_score as f32 - out_a.total_cp;
-                self.plasticity.apply_dopamine_surprise(
-                    delta_cp,
-                    &out_a.active_gamma_stm,
-                    &out_a.active_gamma_opp,
-                );
+        // 7. Live Bounded PAM / 12x PPL1 / Dop1R2 Dopamine Update + DPM Eval Correction Memory
+        if depth >= 3 && best_score.abs() < MATE_THRESHOLD {
+            let err = (best_score - raw_static_eval).clamp(-300, 300);
+            self.dpm_corr[corr_idx] = ((self.dpm_corr[corr_idx] * 7 + err * 2) / 8).clamp(-400, 400);
+            if self.cfg.use_dopamine {
+                if let Some(ref out_a) = out_a_opt {
+                    let delta_cp = best_score as f32 - out_a.total_cp;
+                    self.plasticity.apply_dopamine_surprise(
+                        delta_cp,
+                        &out_a.active_gamma_stm,
+                        &out_a.active_gamma_opp,
+                    );
+                }
             }
         }
 
@@ -572,14 +609,16 @@ impl DnpWorker {
         }
         self.nodes += 1;
         self.q_nodes += 1;
-        // QSearch stand-pat uses ultra-fast SEZ-only Giant Fiber (~150ns = millions NPS/core!)
-        // while interior PVS nodes blend SEZ + alpha/beta MBON + Full Stream A + Stream B!
+        // Saccadion-5 Full-Neural AVX2 INT16 Quiescence:
+        // NEVER drops back to blind SEZ-only PSQT! Every quiescence leaf evaluates SEZ +
+        // 16-wide AVX2 INT16 HalfKA + APL sparse alpha/beta MBONs + SMP so passed pawns,
+        // fortresses, king safety, and piece synergy are seen all the way to the leaf!
         if ply >= MAX_PLY - 1 {
-            return self.ws_a.finny.compute_sez_only_cp(pos, &self.weights).round() as i32;
+            return evaluate_giant_fiber_cp(pos, &self.weights, &mut self.ws_a);
         }
 
         let in_check = pos.in_check();
-        let stand_pat = self.ws_a.finny.compute_sez_only_cp(pos, &self.weights).round() as i32;
+        let stand_pat = evaluate_giant_fiber_cp(pos, &self.weights, &mut self.ws_a);
         if !in_check {
             if stand_pat >= beta {
                 return beta;
@@ -678,6 +717,7 @@ impl SearchEngine {
         self.tt.clear();
         self.strategic_tt.clear();
         self.ws_a.finny.clear();
+        self.ws_a.finny_i16.clear();
         self.plasticity.reset_game();
         self.killers = [[Move::NULL; 2]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
@@ -774,6 +814,8 @@ impl SearchEngine {
             flushed_q_nodes: 0,
             killers: self.killers,
             history: self.history,
+            countermoves: [[Move::NULL; 64]; 64],
+            dpm_corr: [0; 4096],
             nodes: 0,
             q_nodes: 0,
             stream_b_evals: initial_sb_evals,
@@ -827,7 +869,7 @@ impl SearchEngine {
                     let mut dummy_pv = Vec::with_capacity(32);
                     while d <= cfg_h.max_depth && !worker.aborted {
                         dummy_pv.clear();
-                        let _ = worker.pvs(&mut pos_h, d, 0, -INF, INF, true, None, 0.0, &mut dummy_pv);
+                        let _ = worker.pvs(&mut pos_h, d, 0, -INF, INF, true, Move::NULL, None, 0.0, &mut dummy_pv);
                         // Slight depth diversity across parallel DNp channels
                         d += if d >= 4 && ((tid + d as usize) & 1) == 0 { 2 } else { 1 };
                     }
@@ -849,7 +891,7 @@ impl SearchEngine {
                 let mut pv_line = Vec::with_capacity(depth as usize + 4);
                 let score = loop {
                     pv_line.clear();
-                    let s = main_worker.pvs(pos, depth, 0, alpha, beta, true, None, 0.0, &mut pv_line);
+                    let s = main_worker.pvs(pos, depth, 0, alpha, beta, true, Move::NULL, None, 0.0, &mut pv_line);
                     if main_worker.aborted {
                         break s;
                     }

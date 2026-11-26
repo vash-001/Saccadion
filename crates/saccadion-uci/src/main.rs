@@ -219,7 +219,7 @@ fn main() {
         }
         match tokens[0] {
             "uci" => {
-                println!("id name Saccadion 4.0 (Drosophila SEZ+GF+DNp)");
+                println!("id name Saccadion 5.0 (Drosophila 3-Lobe+Amacrine+INT16)");
                 println!("id author Saccadion Research Team");
                 println!("option name Hash type spin default {} min 1 max 4096", hash_mb);
                 println!("option name Threads type spin default {} min 1 max 64", default_threads);

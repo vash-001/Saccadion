@@ -4,11 +4,22 @@
 //! checkpoints load directly into Pure Rust with bit-verified numerical parity.
 
 use crate::config::{
-    build_flyhash_claws, splitmix64, ModelConfig, OPTIC_LAYERS, SACCNET_MAGIC, SACCNET_VERSION,
+    build_flyhash_claws, splitmix64, ModelConfig, AMACRINE_RANK, OPTIC_LAYERS, PLASTIC_RANK,
+    SACCNET_MAGIC, SACCNET_VERSION,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
+
+/// Quantization scale for AVX2 INT16 HalfKA accumulator (128 units = 1.0 float -> +/-256.0 range).
+pub const FT_I16_SCALE: f32 = 128.0;
+pub const FT_I16_INV_SCALE: f32 = 1.0 / FT_I16_SCALE;
+
+fn quantize_to_i16(src: &[f32]) -> Vec<i16> {
+    src.iter()
+        .map(|&v| (v * FT_I16_SCALE).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16)
+        .collect()
+}
 
 /// All static (frozen after TPU training) weights of Stream A + Stream B.
 #[derive(Clone, Debug)]
@@ -132,6 +143,27 @@ pub struct SaccadionWeights {
     pub b_opt_fg: Vec<f32>,        // [OPTIC_LAYERS * (2 * stream_b_dim) * stream_b_dim]
     pub b_opt_fu: Vec<f32>,        // [OPTIC_LAYERS * (2 * stream_b_dim) * stream_b_dim]
     pub b_opt_fd: Vec<f32>,        // [OPTIC_LAYERS * stream_b_dim * (2 * stream_b_dim)]
+
+    // ==================== SACCADION-5 DEEP FLY-BRAIN GENIUS CIRCUITS ====================
+    /// 3-Lobe Closed Cognitive Loop projection: maps rank-8 fast memory (gamma + DPM alpha'/beta')
+    /// directly into the 32-dim MBON vector feeding BOTH SMP and Stream B Central Complex!
+    pub a_plastic_to_mbon: Vec<f32>, // [mbon_dim * PLASTIC_RANK]
+    /// Amacrine (Dm/Pm) Dynamic Position-Conditioned Attention Gate (biological Smolgen):
+    /// Low-rank (4 heads * AMACRINE_RANK = 32) dynamic square-to-square bias per Optic layer.
+    pub b_ama_u: Vec<f32>,           // [OPTIC_LAYERS * (4 * AMACRINE_RANK) * stream_b_dim]
+    pub b_ama_v: Vec<f32>,           // [OPTIC_LAYERS * (4 * AMACRINE_RANK) * stream_b_dim]
+    pub b_ama_g: Vec<f32>,           // [OPTIC_LAYERS * (4 * AMACRINE_RANK) * stream_b_dim]
+    /// Central Complex Phasor LayerNorm stabilizing deep multi-tick reasoning (T = 4..8+ ticks).
+    pub b_cx_ln_g: Vec<f32>,         // [cx_dim]
+    pub b_cx_ln_b: Vec<f32>,         // [cx_dim]
+    /// FC2 x EPG -> PFL3 Conjunctive Allocentric-to-Egocentric Goal Steering (Nature Feb 2024):
+    /// [cx_dim * (2 * cx_dim)] comparing committed FC2 goal with current EPG board heading.
+    pub b_fc2_conj: Vec<f32>,
+
+    // ==================== DERIVED RUNTIME AVX2 INT16 CACHE (NOT ON DISK) ====================
+    /// Pre-quantized INT16 feature transformer for 16-wide AVX2 neural Quiescence evaluation.
+    pub a_ft_weight_i16: Vec<i16>,
+    pub a_ft_bias_i16: Vec<i16>,
 }
 
 fn rand_uniform_scaled(rng: &mut u64, scale: f32) -> f32 {
@@ -198,6 +230,8 @@ impl SaccadionWeights {
 
         let a_ft_weight = alloc_init(cfg.sparse_input_dim * cfg.acc_dim, s_ft, &mut rng);
         let a_ft_bias = vec![0.05; cfg.acc_dim];
+        let a_ft_weight_i16 = quantize_to_i16(&a_ft_weight);
+        let a_ft_bias_i16 = quantize_to_i16(&a_ft_bias);
         let a_sez_weight = init_sez_innate_weights(cfg.sparse_input_dim, stacks);
         let a_claw_weight = alloc_init(plastic_dim * cfg.flyhash_claws, 0.35, &mut rng);
         let a_apl_thresh = vec![0.18; cfg.acc_dim];
@@ -291,6 +325,15 @@ impl SaccadionWeights {
             b_opt_fg: alloc_init(OPTIC_LAYERS * (2 * d) * d, s_d, &mut rng),
             b_opt_fu: alloc_init(OPTIC_LAYERS * (2 * d) * d, s_d, &mut rng),
             b_opt_fd: alloc_init(OPTIC_LAYERS * d * (2 * d), s_d * 0.5, &mut rng),
+            a_plastic_to_mbon: alloc_init(mbon * PLASTIC_RANK, 0.15, &mut rng),
+            b_ama_u: alloc_init(OPTIC_LAYERS * (4 * AMACRINE_RANK) * d, s_d * 0.5, &mut rng),
+            b_ama_v: alloc_init(OPTIC_LAYERS * (4 * AMACRINE_RANK) * d, s_d * 0.5, &mut rng),
+            b_ama_g: alloc_init(OPTIC_LAYERS * (4 * AMACRINE_RANK) * d, s_d * 0.5, &mut rng),
+            b_cx_ln_g: vec![1.0; cx],
+            b_cx_ln_b: vec![0.0; cx],
+            b_fc2_conj: alloc_init(cx * (2 * cx), s_cx * 0.5, &mut rng),
+            a_ft_weight_i16,
+            a_ft_bias_i16,
             cfg,
         }
     }
@@ -364,7 +407,14 @@ impl SaccadionWeights {
             + self.b_opt_ln2_b.len()
             + self.b_opt_fg.len()
             + self.b_opt_fu.len()
-            + self.b_opt_fd.len();
+            + self.b_opt_fd.len()
+            + self.a_plastic_to_mbon.len()
+            + self.b_ama_u.len()
+            + self.b_ama_v.len()
+            + self.b_ama_g.len()
+            + self.b_cx_ln_g.len()
+            + self.b_cx_ln_b.len()
+            + self.b_fc2_conj.len();
         (sparse, dense)
     }
 
@@ -477,6 +527,13 @@ impl SaccadionWeights {
         write_slice(&mut w, &self.b_opt_fg)?;
         write_slice(&mut w, &self.b_opt_fu)?;
         write_slice(&mut w, &self.b_opt_fd)?;
+        write_slice(&mut w, &self.a_plastic_to_mbon)?;
+        write_slice(&mut w, &self.b_ama_u)?;
+        write_slice(&mut w, &self.b_ama_v)?;
+        write_slice(&mut w, &self.b_ama_g)?;
+        write_slice(&mut w, &self.b_cx_ln_g)?;
+        write_slice(&mut w, &self.b_cx_ln_b)?;
+        write_slice(&mut w, &self.b_fc2_conj)?;
 
         w.flush()
     }
@@ -507,10 +564,10 @@ impl SaccadionWeights {
         };
 
         let ver = read_u32(&mut r)?;
-        if ver != SACCNET_VERSION && ver != 3 {
+        if ver != SACCNET_VERSION && ver != 4 && ver != 3 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Unsupported SACCNET version: {} (expected 3 or {})", ver, SACCNET_VERSION),
+                format!("Unsupported SACCNET version: {} (expected 3, 4, or {})", ver, SACCNET_VERSION),
             ));
         }
         let tier_id = read_u32(&mut r)?;
@@ -628,6 +685,34 @@ impl SaccadionWeights {
         let b_opt_fu = read_vec(&mut r, OPTIC_LAYERS * (2 * d) * d)?;
         let b_opt_fd = read_vec(&mut r, OPTIC_LAYERS * d * (2 * d))?;
 
+        let ama_len = OPTIC_LAYERS * (4 * AMACRINE_RANK) * d;
+        let (a_plastic_to_mbon, b_ama_u, b_ama_v, b_ama_g, b_cx_ln_g, b_cx_ln_b, b_fc2_conj) =
+            if ver >= 5 {
+                (
+                    read_vec(&mut r, mbon * PLASTIC_RANK)?,
+                    read_vec(&mut r, ama_len)?,
+                    read_vec(&mut r, ama_len)?,
+                    read_vec(&mut r, ama_len)?,
+                    read_vec(&mut r, cx)?,
+                    read_vec(&mut r, cx)?,
+                    read_vec(&mut r, cx * (2 * cx))?,
+                )
+            } else {
+                // Backward-compatible neutral defaults when loading v3/v4 .saccnet weights
+                (
+                    vec![0.0; mbon * PLASTIC_RANK],
+                    vec![0.0; ama_len],
+                    vec![0.0; ama_len],
+                    vec![0.0; ama_len],
+                    vec![1.0; cx],
+                    vec![0.0; cx],
+                    vec![0.0; cx * (2 * cx)],
+                )
+            };
+
+        let a_ft_weight_i16 = quantize_to_i16(&a_ft_weight);
+        let a_ft_bias_i16 = quantize_to_i16(&a_ft_bias);
+
         Ok(Self {
             cfg,
             flyhash_claws,
@@ -701,6 +786,15 @@ impl SaccadionWeights {
             b_opt_fg,
             b_opt_fu,
             b_opt_fd,
+            a_plastic_to_mbon,
+            b_ama_u,
+            b_ama_v,
+            b_ama_g,
+            b_cx_ln_g,
+            b_cx_ln_b,
+            b_fc2_conj,
+            a_ft_weight_i16,
+            a_ft_bias_i16,
         })
     }
 }

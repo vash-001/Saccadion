@@ -66,8 +66,48 @@ pub fn add_inplace_f32(dst: &mut [f32], src: &[f32]) {
 #[inline]
 pub fn sub_inplace_f32(dst: &mut [f32], src: &[f32]) {
     debug_assert_eq!(dst.len(), src.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 verified at runtime.
+            unsafe { sub_inplace_f32_avx2(dst, src) };
+            return;
+        }
+    }
     for i in 0..dst.len() {
         dst[i] -= src[i];
+    }
+}
+
+/// Quantized INT16 vector add: `dst[i] = dst[i].saturating_add(src[i])` (16 neurons/AVX2 op!).
+#[inline]
+pub fn add_inplace_i16(dst: &mut [i16], src: &[i16]) {
+    debug_assert_eq!(dst.len(), src.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { add_inplace_i16_avx2(dst, src) };
+            return;
+        }
+    }
+    for i in 0..dst.len() {
+        dst[i] = dst[i].saturating_add(src[i]);
+    }
+}
+
+/// Quantized INT16 vector sub: `dst[i] = dst[i].saturating_sub(src[i])` (16 neurons/AVX2 op!).
+#[inline]
+pub fn sub_inplace_i16(dst: &mut [i16], src: &[i16]) {
+    debug_assert_eq!(dst.len(), src.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { sub_inplace_i16_avx2(dst, src) };
+            return;
+        }
+    }
+    for i in 0..dst.len() {
+        dst[i] = dst[i].saturating_sub(src[i]);
     }
 }
 
@@ -143,6 +183,72 @@ unsafe fn add_inplace_f32_avx2(dst: &mut [f32], src: &[f32]) {
         }
         while i < n {
             *pd.add(i) += *ps.add(i);
+            i += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sub_inplace_f32_avx2(dst: &mut [f32], src: &[f32]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = dst.len();
+        let mut i = 0usize;
+        let pd = dst.as_mut_ptr();
+        let ps = src.as_ptr();
+        while i + 8 <= n {
+            let vd = _mm256_loadu_ps(pd.add(i));
+            let vx = _mm256_loadu_ps(ps.add(i));
+            _mm256_storeu_ps(pd.add(i), _mm256_sub_ps(vd, vx));
+            i += 8;
+        }
+        while i < n {
+            *pd.add(i) -= *ps.add(i);
+            i += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_inplace_i16_avx2(dst: &mut [i16], src: &[i16]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = dst.len();
+        let mut i = 0usize;
+        let pd = dst.as_mut_ptr();
+        let ps = src.as_ptr();
+        while i + 16 <= n {
+            let vd = _mm256_loadu_si256(pd.add(i) as *const __m256i);
+            let vx = _mm256_loadu_si256(ps.add(i) as *const __m256i);
+            _mm256_storeu_si256(pd.add(i) as *mut __m256i, _mm256_adds_epi16(vd, vx));
+            i += 16;
+        }
+        while i < n {
+            *pd.add(i) = (*pd.add(i)).saturating_add(*ps.add(i));
+            i += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sub_inplace_i16_avx2(dst: &mut [i16], src: &[i16]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = dst.len();
+        let mut i = 0usize;
+        let pd = dst.as_mut_ptr();
+        let ps = src.as_ptr();
+        while i + 16 <= n {
+            let vd = _mm256_loadu_si256(pd.add(i) as *const __m256i);
+            let vx = _mm256_loadu_si256(ps.add(i) as *const __m256i);
+            _mm256_storeu_si256(pd.add(i) as *mut __m256i, _mm256_subs_epi16(vd, vx));
+            i += 16;
+        }
+        while i < n {
+            *pd.add(i) = (*pd.add(i)).saturating_sub(*ps.add(i));
             i += 1;
         }
     }

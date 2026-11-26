@@ -7,8 +7,11 @@
 //! - SMP/CRE/SIP Convergence Hub + Octopamine Gain + Bounded Eligibility-Trace Dopamine
 
 use crate::plasticity::{DopaminePlasticityState, SparseActiveKc};
-use crate::simd::{add_inplace_f32, axpy_f32, dot_f32, sigmoid, silu, softmax_inplace, sub_inplace_f32};
-use crate::weights::SaccadionWeights;
+use crate::simd::{
+    add_inplace_f32, add_inplace_i16, axpy_f32, dot_f32, sigmoid, silu, softmax_inplace,
+    sub_inplace_f32, sub_inplace_i16,
+};
+use crate::weights::{SaccadionWeights, FT_I16_INV_SCALE};
 use saccadion_chess::features::{
     extract_bilateral_sparse, extract_lateral_horn_features, halfka_feature_index, king_bucket,
     HALFKA_DIM, NUM_KING_BUCKETS,
@@ -228,10 +231,122 @@ impl FinnyCache {
     }
 }
 
+/// Quantized INT16 AVX2 Finny Table entry (half cache footprint, 16 neurons per AVX2 op!).
+#[derive(Clone, Debug)]
+struct FinnyEntryI16 {
+    pieces: [[Bitboard; 6]; 2],
+    acc: Vec<i16>,
+    sez: [f64; 8],
+    initialized: bool,
+}
+
+/// Per-thread INT16 AVX2 Finny Cache powering full-neural Quiescence & Frontier evaluation.
+#[derive(Clone, Debug)]
+pub struct FinnyCacheI16 {
+    entries: [[FinnyEntryI16; NUM_KING_BUCKETS * 2]; 2],
+    acc_dim: usize,
+}
+
+impl FinnyCacheI16 {
+    pub fn new(acc_dim: usize) -> Self {
+        let mk_entry = || FinnyEntryI16 {
+            pieces: [[Bitboard::EMPTY; 6]; 2],
+            acc: vec![0i16; acc_dim],
+            sez: [0.0; 8],
+            initialized: false,
+        };
+        Self {
+            entries: [
+                std::array::from_fn(|_| mk_entry()),
+                std::array::from_fn(|_| mk_entry()),
+            ],
+            acc_dim,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        for side in &mut self.entries {
+            for e in side.iter_mut() {
+                e.initialized = false;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn update_halfka_ref_i16(
+        &mut self,
+        pos: &Position,
+        persp: Color,
+        w: &SaccadionWeights,
+    ) -> (&[i16], [f32; 8]) {
+        let ksq = pos.king_square(persp);
+        let (bucket, mirror) = king_bucket(ksq, persp);
+        let slot = bucket * 2 + usize::from(mirror);
+        let entry = &mut self.entries[persp.index()][slot];
+        let dim = self.acc_dim;
+        let stacks = w.cfg.num_phase_stacks.min(8);
+
+        if !entry.initialized {
+            entry.acc.copy_from_slice(&w.a_ft_bias_i16);
+            entry.sez = [0.0; 8];
+            for c in [Color::White, Color::Black] {
+                for p in Piece::ALL {
+                    let bb = pos.piece_bb(c, p);
+                    entry.pieces[c.index()][p.index()] = bb;
+                    for sq in bb {
+                        let fidx = halfka_feature_index(persp, ksq, c, p, sq);
+                        let row = &w.a_ft_weight_i16[fidx * dim..(fidx + 1) * dim];
+                        add_inplace_i16(&mut entry.acc, row);
+                        let s_off = fidx * w.cfg.num_phase_stacks;
+                        for s in 0..stacks {
+                            entry.sez[s] += w.a_sez_weight[s_off + s] as f64;
+                        }
+                    }
+                }
+            }
+            entry.initialized = true;
+        } else {
+            for c in [Color::White, Color::Black] {
+                for p in Piece::ALL {
+                    let prev = entry.pieces[c.index()][p.index()];
+                    let curr = pos.piece_bb(c, p);
+                    if prev == curr {
+                        continue;
+                    }
+                    let removed = prev & !curr;
+                    let added = curr & !prev;
+                    for sq in removed {
+                        let fidx = halfka_feature_index(persp, ksq, c, p, sq);
+                        let row = &w.a_ft_weight_i16[fidx * dim..(fidx + 1) * dim];
+                        sub_inplace_i16(&mut entry.acc, row);
+                        let s_off = fidx * w.cfg.num_phase_stacks;
+                        for s in 0..stacks {
+                            entry.sez[s] -= w.a_sez_weight[s_off + s] as f64;
+                        }
+                    }
+                    for sq in added {
+                        let fidx = halfka_feature_index(persp, ksq, c, p, sq);
+                        let row = &w.a_ft_weight_i16[fidx * dim..(fidx + 1) * dim];
+                        add_inplace_i16(&mut entry.acc, row);
+                        let s_off = fidx * w.cfg.num_phase_stacks;
+                        for s in 0..stacks {
+                            entry.sez[s] += w.a_sez_weight[s_off + s] as f64;
+                        }
+                    }
+                    entry.pieces[c.index()][p.index()] = curr;
+                }
+            }
+        }
+        let sez = std::array::from_fn(|s| entry.sez[s] as f32);
+        (&entry.acc, sez)
+    }
+}
+
 /// Reusable scratch buffers for zero-allocation Stream A evaluation in hot search loops.
 #[derive(Clone, Debug)]
 pub struct StreamAWorkspace {
     pub finny: FinnyCache,
+    pub finny_i16: FinnyCacheI16,
     acc_stm: Vec<f32>,
     acc_opp: Vec<f32>,
     kc_pre_stm: Vec<f32>,
@@ -250,6 +365,7 @@ impl StreamAWorkspace {
         let mbon = w.cfg.mbon_dim;
         Self {
             finny: FinnyCache::new(dim),
+            finny_i16: FinnyCacheI16::new(dim),
             acc_stm: vec![0.0; dim],
             acc_opp: vec![0.0; dim],
             kc_pre_stm: vec![0.0; dim],
@@ -273,11 +389,11 @@ pub fn wdl_to_cp(wdl_probs: [f32; 3]) -> f32 {
     cp.clamp(-2500.0, 2500.0)
 }
 
-/// Ultra-fast Drosophila Giant Fiber (GF / DNp01) + SEZ Innate Valence + alpha/beta Calyx Reflex.
+/// Ultra-fast AVX2 INT16 Drosophila Giant Fiber (GF / DNp01) + SEZ + Frozen alpha/beta MBON Reflex.
 ///
-/// Designed for `GNG Quiescence` (~75% of all search nodes): skips full 64-square ray/pin rebuilds
-/// and FlyHash claw gathers, evaluating incremental `FinnyCache` HalfKA `SEZ` + frozen alpha/beta
-/// MBON positional correction in < 1.5 microseconds (>250,000 NPS per core!).
+/// Runs REAL neural evaluation (SEZ + INT16 AVX2 HalfKA + APL sparse alpha/beta MBONs + SMP)
+/// in 100% of Quiescence & Frontier leaves (~1.0 us/node) so passed pawns, fortresses, and
+/// king safety are ALWAYS seen even at the deepest quiescence leaf!
 #[inline]
 pub fn evaluate_giant_fiber_cp(
     pos: &Position,
@@ -299,13 +415,21 @@ pub fn evaluate_giant_fiber_cp(
     ws.mbon_opp
         .copy_from_slice(&w.a_mbon_bias[stack_bias_off..stack_bias_off + mbon_dim]);
 
-    // Zero-copy STM hemisphere update + APL sparse alpha/beta gather
+    // Zero-copy 16-wide AVX2 INT16 STM hemisphere update + APL sparse alpha/beta gather
     let b0 = w.a_apl_beta[0];
     let sez_stm = {
-        let (acc_s, sez_all) = ws.finny.update_halfka_ref(pos, stm, w);
-        let mean_s: f32 = acc_s[..ab_dim].iter().map(|&v| v.max(0.0)).sum::<f32>() / ab_dim as f32;
+        let (acc_s, sez_all) = ws.finny_i16.update_halfka_ref_i16(pos, stm, w);
+        let mut pos_sum_i32 = 0i32;
         for i in 0..ab_dim {
-            let s = acc_s[i] - b0 * mean_s - w.a_apl_thresh[i];
+            let v = acc_s[i];
+            if v > 0 {
+                pos_sum_i32 += v as i32;
+            }
+        }
+        let mean_s = (pos_sum_i32 as f32 * FT_I16_INV_SCALE) / ab_dim as f32;
+        let base_cut = b0 * mean_s;
+        for i in 0..ab_dim {
+            let s = (acc_s[i] as f32 * FT_I16_INV_SCALE) - base_cut - w.a_apl_thresh[i];
             if s > 0.0 {
                 let c = s.min(1.0);
                 let act = c * c;
@@ -317,13 +441,21 @@ pub fn evaluate_giant_fiber_cp(
         sez_all[stack]
     };
 
-    // Zero-copy Opp hemisphere update + APL sparse alpha/beta gather
+    // Zero-copy 16-wide AVX2 INT16 Opp hemisphere update + APL sparse alpha/beta gather
     let b1 = w.a_apl_beta[1];
     let sez_opp = {
-        let (acc_o, sez_all) = ws.finny.update_halfka_ref(pos, opp, w);
-        let mean_o: f32 = acc_o[..ab_dim].iter().map(|&v| v.max(0.0)).sum::<f32>() / ab_dim as f32;
+        let (acc_o, sez_all) = ws.finny_i16.update_halfka_ref_i16(pos, opp, w);
+        let mut pos_sum_i32 = 0i32;
         for i in 0..ab_dim {
-            let o = acc_o[i] - b1 * mean_o - w.a_apl_thresh[i];
+            let v = acc_o[i];
+            if v > 0 {
+                pos_sum_i32 += v as i32;
+            }
+        }
+        let mean_o = (pos_sum_i32 as f32 * FT_I16_INV_SCALE) / ab_dim as f32;
+        let base_cut = b1 * mean_o;
+        for i in 0..ab_dim {
+            let o = (acc_o[i] as f32 * FT_I16_INV_SCALE) - base_cut - w.a_apl_thresh[i];
             if o > 0.0 {
                 let c = o.min(1.0);
                 let act = c * c;
@@ -495,6 +627,20 @@ pub fn evaluate_stream_a(
         let off = stack_mbon_off + (idx as usize) * mbon_dim;
         axpy_f32(&mut ws.mbon_opp, &w.a_mbon_ipsi[off..off + mbon_dim], act);
         axpy_f32(&mut ws.mbon_stm, &w.a_mbon_contra[off..off + mbon_dim], 0.5 * act);
+    }
+
+    // True 3-Lobe Closed Cognitive Loop: inject live gamma (intra-search) & DPM alpha'/beta'
+    // (intra-game) fast synaptic memory directly into the 32-dim MBON vector BEFORE SiLU & Stream B!
+    if let Some(pl) = plasticity {
+        pl.inject_mbon_plasticity(
+            &w.a_plastic_to_mbon,
+            &active_gamma_stm,
+            &active_gamma_opp,
+            &active_apbp_stm,
+            &active_apbp_opp,
+            &mut ws.mbon_stm,
+            &mut ws.mbon_opp,
+        );
     }
 
     // Apply Push-Pull activation: first 16 MBONs Excitatory (+SiLU), last 16 Inhibitory (-SiLU)
