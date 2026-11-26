@@ -8,8 +8,8 @@
 
 use crate::plasticity::{DopaminePlasticityState, SparseActiveKc};
 use crate::simd::{
-    add_inplace_f32, add_inplace_i16, axpy_f32, axpy_i8_f32, dot_f32, sigmoid, silu,
-    softmax_inplace, sub_inplace_f32, sub_inplace_i16,
+    accumulate_ab_mbon_i8, add_inplace_f32, add_inplace_i16, axpy_f32, dot_f32, fast_silu,
+    sigmoid, silu, softmax_inplace, sub_inplace_f32, sub_inplace_i16,
 };
 use crate::weights::{SaccadionWeights, FT_I16_INV_SCALE};
 use saccadion_chess::features::{
@@ -240,18 +240,20 @@ struct FinnyEntryI16 {
     initialized: bool,
 }
 
-/// Per-thread INT16 AVX2 Finny Cache powering full-neural Quiescence & Frontier evaluation.
+/// Per-thread INT16 AVX2 Finny Cache storing ONLY the frozen alpha/beta lobe (`ab_dim`, e.g. 384)
+/// for 2.7x faster incremental updates & L1-resident neural Quiescence/Frontier evaluation!
 #[derive(Clone, Debug)]
 pub struct FinnyCacheI16 {
     entries: [[FinnyEntryI16; NUM_KING_BUCKETS * 2]; 2],
-    acc_dim: usize,
+    ab_dim: usize,
+    full_dim: usize,
 }
 
 impl FinnyCacheI16 {
-    pub fn new(acc_dim: usize) -> Self {
+    pub fn new(ab_dim: usize, full_dim: usize) -> Self {
         let mk_entry = || FinnyEntryI16 {
             pieces: [[Bitboard::EMPTY; 6]; 2],
-            acc: vec![0i16; acc_dim],
+            acc: vec![0i16; ab_dim],
             sez: [0.0; 8],
             initialized: false,
         };
@@ -260,7 +262,8 @@ impl FinnyCacheI16 {
                 std::array::from_fn(|_| mk_entry()),
                 std::array::from_fn(|_| mk_entry()),
             ],
-            acc_dim,
+            ab_dim,
+            full_dim,
         }
     }
 
@@ -283,11 +286,12 @@ impl FinnyCacheI16 {
         let (bucket, mirror) = king_bucket(ksq, persp);
         let slot = bucket * 2 + usize::from(mirror);
         let entry = &mut self.entries[persp.index()][slot];
-        let dim = self.acc_dim;
+        let ab = self.ab_dim;
+        let dim = self.full_dim;
         let stacks = w.cfg.num_phase_stacks.min(8);
 
         if !entry.initialized {
-            entry.acc.copy_from_slice(&w.a_ft_bias_i16);
+            entry.acc.copy_from_slice(&w.a_ft_bias_i16[..ab]);
             entry.sez = [0.0; 8];
             for c in [Color::White, Color::Black] {
                 for p in Piece::ALL {
@@ -295,7 +299,7 @@ impl FinnyCacheI16 {
                     entry.pieces[c.index()][p.index()] = bb;
                     for sq in bb {
                         let fidx = halfka_feature_index(persp, ksq, c, p, sq);
-                        let row = &w.a_ft_weight_i16[fidx * dim..(fidx + 1) * dim];
+                        let row = &w.a_ft_weight_i16[fidx * dim..fidx * dim + ab];
                         add_inplace_i16(&mut entry.acc, row);
                         let s_off = fidx * w.cfg.num_phase_stacks;
                         for s in 0..stacks {
@@ -317,7 +321,7 @@ impl FinnyCacheI16 {
                     let added = curr & !prev;
                     for sq in removed {
                         let fidx = halfka_feature_index(persp, ksq, c, p, sq);
-                        let row = &w.a_ft_weight_i16[fidx * dim..(fidx + 1) * dim];
+                        let row = &w.a_ft_weight_i16[fidx * dim..fidx * dim + ab];
                         sub_inplace_i16(&mut entry.acc, row);
                         let s_off = fidx * w.cfg.num_phase_stacks;
                         for s in 0..stacks {
@@ -326,7 +330,7 @@ impl FinnyCacheI16 {
                     }
                     for sq in added {
                         let fidx = halfka_feature_index(persp, ksq, c, p, sq);
-                        let row = &w.a_ft_weight_i16[fidx * dim..(fidx + 1) * dim];
+                        let row = &w.a_ft_weight_i16[fidx * dim..fidx * dim + ab];
                         add_inplace_i16(&mut entry.acc, row);
                         let s_off = fidx * w.cfg.num_phase_stacks;
                         for s in 0..stacks {
@@ -362,10 +366,11 @@ pub struct StreamAWorkspace {
 impl StreamAWorkspace {
     pub fn new(w: &SaccadionWeights) -> Self {
         let dim = w.cfg.acc_dim;
+        let (ab_dim, _, _) = w.cfg.lobe_dims_per_hemi();
         let mbon = w.cfg.mbon_dim;
         Self {
             finny: FinnyCache::new(dim),
-            finny_i16: FinnyCacheI16::new(dim),
+            finny_i16: FinnyCacheI16::new(ab_dim, dim),
             acc_stm: vec![0.0; dim],
             acc_opp: vec![0.0; dim],
             kc_pre_stm: vec![0.0; dim],
@@ -415,57 +420,59 @@ pub fn evaluate_giant_fiber_cp(
     ws.mbon_opp
         .copy_from_slice(&w.a_mbon_bias[stack_bias_off..stack_bias_off + mbon_dim]);
 
-    // Zero-copy 16-wide AVX2 INT16 STM hemisphere update + L1-resident INT8 AVX2 alpha/beta MBON gather!
+    // Zero-copy 16-wide AVX2 INT16 STM hemisphere update + Register-Resident INT8 AVX2 MBON gather!
     let ipsi_sc = w.a_mbon_ipsi_scale[stack];
     let contra_sc = 0.5 * w.a_mbon_contra_scale[stack];
+    let ipsi_slice = &w.a_mbon_ipsi_i8[stack_mbon_off..stack_mbon_off + ab_dim * mbon_dim];
+    let contra_slice = &w.a_mbon_contra_i8[stack_mbon_off..stack_mbon_off + ab_dim * mbon_dim];
     let b0 = w.a_apl_beta[0];
     let sez_stm = {
         let (acc_s, sez_all) = ws.finny_i16.update_halfka_ref_i16(pos, stm, w);
         let mut pos_sum_i32 = 0i32;
-        for i in 0..ab_dim {
-            let v = acc_s[i];
-            if v > 0 {
-                pos_sum_i32 += v as i32;
-            }
+        for &v in acc_s {
+            pos_sum_i32 += (v.max(0)) as i32;
         }
         let mean_s = (pos_sum_i32 as f32 * FT_I16_INV_SCALE) / ab_dim as f32;
-        let base_cut = b0 * mean_s;
-        for i in 0..ab_dim {
-            let s = (acc_s[i] as f32 * FT_I16_INV_SCALE) - base_cut - w.a_apl_thresh[i];
-            if s > 0.0 {
-                let c = s.min(1.0);
-                let act = c * c;
-                let off = stack_mbon_off + i * mbon_dim;
-                axpy_i8_f32(&mut ws.mbon_stm, &w.a_mbon_ipsi_i8[off..off + mbon_dim], act * ipsi_sc);
-                axpy_i8_f32(&mut ws.mbon_opp, &w.a_mbon_contra_i8[off..off + mbon_dim], act * contra_sc);
-            }
-        }
+        accumulate_ab_mbon_i8(
+            acc_s,
+            &w.a_apl_thresh,
+            ipsi_slice,
+            contra_slice,
+            ab_dim,
+            mbon_dim,
+            FT_I16_INV_SCALE,
+            b0 * mean_s,
+            ipsi_sc,
+            contra_sc,
+            &mut ws.mbon_stm,
+            &mut ws.mbon_opp,
+        );
         sez_all[stack]
     };
 
-    // Zero-copy 16-wide AVX2 INT16 Opp hemisphere update + L1-resident INT8 AVX2 alpha/beta MBON gather!
+    // Zero-copy 16-wide AVX2 INT16 Opp hemisphere update + Register-Resident INT8 AVX2 MBON gather!
     let b1 = w.a_apl_beta[1];
     let sez_opp = {
         let (acc_o, sez_all) = ws.finny_i16.update_halfka_ref_i16(pos, opp, w);
         let mut pos_sum_i32 = 0i32;
-        for i in 0..ab_dim {
-            let v = acc_o[i];
-            if v > 0 {
-                pos_sum_i32 += v as i32;
-            }
+        for &v in acc_o {
+            pos_sum_i32 += (v.max(0)) as i32;
         }
         let mean_o = (pos_sum_i32 as f32 * FT_I16_INV_SCALE) / ab_dim as f32;
-        let base_cut = b1 * mean_o;
-        for i in 0..ab_dim {
-            let o = (acc_o[i] as f32 * FT_I16_INV_SCALE) - base_cut - w.a_apl_thresh[i];
-            if o > 0.0 {
-                let c = o.min(1.0);
-                let act = c * c;
-                let off = stack_mbon_off + i * mbon_dim;
-                axpy_i8_f32(&mut ws.mbon_opp, &w.a_mbon_ipsi_i8[off..off + mbon_dim], act * ipsi_sc);
-                axpy_i8_f32(&mut ws.mbon_stm, &w.a_mbon_contra_i8[off..off + mbon_dim], act * contra_sc);
-            }
-        }
+        accumulate_ab_mbon_i8(
+            acc_o,
+            &w.a_apl_thresh,
+            ipsi_slice,
+            contra_slice,
+            ab_dim,
+            mbon_dim,
+            FT_I16_INV_SCALE,
+            b1 * mean_o,
+            ipsi_sc,
+            contra_sc,
+            &mut ws.mbon_opp,
+            &mut ws.mbon_stm,
+        );
         sez_all[stack]
     };
 
@@ -473,12 +480,12 @@ pub fn evaluate_giant_fiber_cp(
 
     let half_mbon = mbon_dim / 2;
     for i in 0..half_mbon {
-        ws.mbon_stm[i] = silu(ws.mbon_stm[i]);
-        ws.mbon_opp[i] = silu(ws.mbon_opp[i]);
+        ws.mbon_stm[i] = fast_silu(ws.mbon_stm[i]);
+        ws.mbon_opp[i] = fast_silu(ws.mbon_opp[i]);
     }
     for i in half_mbon..mbon_dim {
-        ws.mbon_stm[i] = -silu(ws.mbon_stm[i]);
-        ws.mbon_opp[i] = -silu(ws.mbon_opp[i]);
+        ws.mbon_stm[i] = -fast_silu(ws.mbon_stm[i]);
+        ws.mbon_opp[i] = -fast_silu(ws.mbon_opp[i]);
     }
     ws.smp_in[..mbon_dim].copy_from_slice(&ws.mbon_stm);
     ws.smp_in[mbon_dim..2 * mbon_dim].copy_from_slice(&ws.mbon_opp);

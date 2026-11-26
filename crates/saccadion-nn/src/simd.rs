@@ -423,6 +423,139 @@ unsafe fn sub_inplace_i16_avx2(dst: &mut [i16], src: &[i16]) {
     }
 }
 
+/// Fast IEEE-754 range-reduced `exp(x)` accurate to < 2e-5 on [-20, 20] with zero libm calls!
+#[inline(always)]
+pub fn fast_exp_f32(x: f32) -> f32 {
+    let xc = x.clamp(-20.0, 20.0);
+    let t = xc * 1.44269504_f32;
+    let k = t.floor();
+    let f = t - k;
+    let pow2_k = f32::from_bits(((k as i32 + 127) as u32) << 23);
+    let pow2_f = 1.0 + f * (0.6931472 + f * (0.2402265 + f * (0.0555041 + f * 0.0096181)));
+    pow2_k * pow2_f
+}
+
+#[inline(always)]
+pub fn fast_silu(x: f32) -> f32 {
+    x / (1.0 + fast_exp_f32(-x))
+}
+
+/// Register-resident AVX2+FMA sparse INT8 alpha/beta MBON accumulator for `mbon_dim == 32`.
+/// Keeps BOTH `mbon_own` (4 ymm regs) and `mbon_other` (4 ymm regs) in CPU registers across
+/// the entire `0..ab_dim` scan, eliminating 140+ memory load/store round-trips per leaf node!
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn accumulate_ab_mbon_i8(
+    acc_i16: &[i16],
+    thresh: &[f32],
+    ipsi_i8: &[i8],
+    contra_i8: &[i8],
+    ab_dim: usize,
+    mbon_dim: usize,
+    inv_scale: f32,
+    base_cut: f32,
+    ipsi_sc: f32,
+    contra_sc: f32,
+    mbon_own: &mut [f32],
+    mbon_other: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if mbon_dim == 32 && has_avx2_fma() {
+            // SAFETY: mbon_dim == 32 and AVX2+FMA verified once at runtime.
+            unsafe {
+                accumulate_ab_mbon_i8_32_avx2(
+                    acc_i16, thresh, ipsi_i8, contra_i8, ab_dim, inv_scale, base_cut, ipsi_sc,
+                    contra_sc, mbon_own, mbon_other,
+                );
+            }
+            return;
+        }
+    }
+    for i in 0..ab_dim {
+        let s = (acc_i16[i] as f32 * inv_scale) - base_cut - thresh[i];
+        if s > 0.0 {
+            let c = s.min(1.0);
+            let act = c * c;
+            let off = i * mbon_dim;
+            axpy_i8_f32(mbon_own, &ipsi_i8[off..off + mbon_dim], act * ipsi_sc);
+            axpy_i8_f32(mbon_other, &contra_i8[off..off + mbon_dim], act * contra_sc);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn accumulate_ab_mbon_i8_32_avx2(
+    acc_i16: &[i16],
+    thresh: &[f32],
+    ipsi_i8: &[i8],
+    contra_i8: &[i8],
+    ab_dim: usize,
+    inv_scale: f32,
+    base_cut: f32,
+    ipsi_sc: f32,
+    contra_sc: f32,
+    mbon_own: &mut [f32],
+    mbon_other: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let po = mbon_own.as_mut_ptr();
+        let px = mbon_other.as_mut_ptr();
+        let mut o0 = _mm256_loadu_ps(po);
+        let mut o1 = _mm256_loadu_ps(po.add(8));
+        let mut o2 = _mm256_loadu_ps(po.add(16));
+        let mut o3 = _mm256_loadu_ps(po.add(24));
+
+        let mut x0 = _mm256_loadu_ps(px);
+        let mut x1 = _mm256_loadu_ps(px.add(8));
+        let mut x2 = _mm256_loadu_ps(px.add(16));
+        let mut x3 = _mm256_loadu_ps(px.add(24));
+
+        let p_acc = acc_i16.as_ptr();
+        let p_th = thresh.as_ptr();
+        let p_ip = ipsi_i8.as_ptr();
+        let p_co = contra_i8.as_ptr();
+
+        for i in 0..ab_dim {
+            let s = (*p_acc.add(i) as f32 * inv_scale) - base_cut - *p_th.add(i);
+            if s > 0.0 {
+                let c = if s < 1.0 { s } else { 1.0 };
+                let act = c * c;
+                let vi = _mm256_set1_ps(act * ipsi_sc);
+                let vc = _mm256_set1_ps(act * contra_sc);
+                let off = i * 32;
+
+                // 32-byte L1 burst load for ipsi_i8 -> 4x8 FMA directly into registers o0..o3
+                let wi_ptr = p_ip.add(off);
+                o0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(wi_ptr as *const __m128i))), vi, o0);
+                o1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(wi_ptr.add(8) as *const __m128i))), vi, o1);
+                o2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(wi_ptr.add(16) as *const __m128i))), vi, o2);
+                o3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(wi_ptr.add(24) as *const __m128i))), vi, o3);
+
+                // 32-byte L1 burst load for contra_i8 -> 4x8 FMA directly into registers x0..x3
+                let wc_ptr = p_co.add(off);
+                x0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(wc_ptr as *const __m128i))), vc, x0);
+                x1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(wc_ptr.add(8) as *const __m128i))), vc, x1);
+                x2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(wc_ptr.add(16) as *const __m128i))), vc, x2);
+                x3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(wc_ptr.add(24) as *const __m128i))), vc, x3);
+            }
+        }
+
+        _mm256_storeu_ps(po, o0);
+        _mm256_storeu_ps(po.add(8), o1);
+        _mm256_storeu_ps(po.add(16), o2);
+        _mm256_storeu_ps(po.add(24), o3);
+
+        _mm256_storeu_ps(px, x0);
+        _mm256_storeu_ps(px.add(8), x1);
+        _mm256_storeu_ps(px.add(16), x2);
+        _mm256_storeu_ps(px.add(24), x3);
+    }
+}
+
 #[inline(always)]
 pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())

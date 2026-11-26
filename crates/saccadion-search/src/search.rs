@@ -269,13 +269,15 @@ impl DnpWorker {
         // 2. Biological 3-Tier Evaluation Hierarchy:
         //    - Tier 1 (Shallow Non-PV Frontier depth <= 2): Giant Fiber (SEZ + INT8 AVX2 alpha/beta MBON)
         //    - Tier 2 (PV or depth >= 3): Full Stream A (FullRays + LC4 + FlyHash + Lateral Horn + Dopamine)
-        let cached_strat_hit = if self.cfg.use_stream_b && (is_pv || depth >= 3) {
+        let cached_strat_hit = if self.cfg.use_stream_b && (is_pv || depth >= 5) {
             self.strategic_tt.probe(pos.hash).cloned()
         } else {
             None
         };
 
-        let use_fast_frontier = !is_pv && depth <= 2 && cached_strat_hit.is_none();
+        // Tier 1 (All non-PV nodes depth <= 4): Register-Resident INT16+INT8 AVX2 Neural Giant Fiber!
+        // Tier 2 (PV or depth >= 5): Full Stream A (FullRays + LC4 + Lateral Horn + 3-Lobe Dopamine)
+        let use_fast_frontier = !is_pv && depth <= 4 && cached_strat_hit.is_none();
         let (raw_static_eval, out_a_opt, lh_tactical_alert, lh_deep_alert, efference_surprise) = if use_fast_frontier {
             let gf_cp = evaluate_giant_fiber_cp(pos, &self.weights, &mut self.ws_a);
             (gf_cp, None, false, false, false)
@@ -374,17 +376,17 @@ impl DnpWorker {
             return if in_check { -MATE_SCORE + ply as i32 } else { 0 };
         }
 
-        // 5. Selective Stream B Deep Strategic Brain (wakes up on PV, high-depth crossroads,
-        //    Lateral Horn alerts, or Noduli surprises — throttled cleanly in ultra-blitz!)
-        let allow_subtree_sb = self.cfg.time_limit_ms == 0 || self.cfg.time_limit_ms > 280;
+        // 5. Selective Stream B Deep Strategic Brain (wakes up on deep strategic crossroads,
+        //    PV depth >= 7, or Lateral Horn alerts — keeps tactical tree blazing fast!)
+        let allow_subtree_sb = self.cfg.time_limit_ms == 0 || self.cfg.time_limit_ms > 500;
         let need_stream_b = self.cfg.use_stream_b
             && allow_subtree_sb
             && !self.is_helper
             && excluded_move.is_null()
             && out_a_opt.is_some()
-            && (depth >= self.cfg.cx_min_depth
-                || (is_pv && depth >= 5)
-                || ((efference_surprise || lh_deep_alert) && depth >= 4));
+            && (depth >= self.cfg.cx_min_depth + 2
+                || (is_pv && depth >= 7)
+                || ((efference_surprise || lh_deep_alert) && depth >= 6));
 
         let mut local_strat: Option<StrategicEntry> = cached_strat_hit;
         if local_strat.is_some() {
@@ -422,13 +424,14 @@ impl DnpWorker {
             depth += 1;
         }
 
-        // 6. Move Ordering: TT > Good Captures (SEE>=0) > PFL3 Goal-Aligned > Killers > Countermove > History > Bad Captures
+        // 6. Zero-Allocation Stack Move Scoring + Lazy Best-Move Selection (O(N) on move-0 beta cutoffs!)
         let counter_mv = if !prev_move.is_null() {
             self.countermoves[prev_move.from_sq().index()][prev_move.to_sq().index()]
         } else {
             Move::NULL
         };
-        let mut scored_moves: Vec<(Move, i32, usize, f32)> = Vec::with_capacity(moves.len());
+        let mut scored_moves: [(Move, i32, usize, f32); 256] = [(Move::NULL, 0, usize::MAX, 0.0); 256];
+        let mut n_moves = 0usize;
         let stm_idx = pos.side_to_move.index();
         for &mv in moves.as_slice() {
             if mv == excluded_move {
@@ -470,12 +473,12 @@ impl DnpWorker {
             } else {
                 priority += self.history[stm_idx][mv.from_sq().index()][mv.to_sq().index()];
             }
-            scored_moves.push((mv, priority, pfl3_rank, noduli_delta));
+            scored_moves[n_moves] = (mv, priority, pfl3_rank, noduli_delta);
+            n_moves += 1;
         }
-        if scored_moves.is_empty() {
+        if n_moves == 0 {
             return alpha;
         }
-        scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
         let child_cent_mask: Option<&[f32]> = local_strat
             .as_ref()
@@ -485,11 +488,29 @@ impl DnpWorker {
         let orig_alpha = alpha;
         let mut best_move = scored_moves[0].0;
         let mut best_score = -INF;
-        let mut child_pv = Vec::with_capacity(depth as usize);
+        // Zero heap allocation on non-PV nodes!
+        let mut child_pv = if is_pv {
+            Vec::with_capacity(depth as usize)
+        } else {
+            Vec::new()
+        };
         let mut quiets_tried = [Move::NULL; 64];
         let mut n_quiets_tried = 0usize;
 
-        for (move_idx, &(mv, _, pfl3_rank, noduli_delta)) in scored_moves.iter().enumerate() {
+        for move_idx in 0..n_moves {
+            // Lazy partial selection: find the highest-priority remaining move in O(N)
+            let mut best_i = move_idx;
+            let mut best_p = scored_moves[move_idx].1;
+            for j in (move_idx + 1)..n_moves {
+                if scored_moves[j].1 > best_p {
+                    best_p = scored_moves[j].1;
+                    best_i = j;
+                }
+            }
+            if best_i != move_idx {
+                scored_moves.swap(move_idx, best_i);
+            }
+            let (mv, _, pfl3_rank, noduli_delta) = scored_moves[move_idx];
             let is_quiet = !mv.is_capture() && !mv.is_promotion();
 
             // Late Move Pruning (LMP), Futility Pruning, & Main-Search SEE Pruning

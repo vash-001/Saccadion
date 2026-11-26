@@ -515,6 +515,7 @@ class StockfishSparringArena:
         for cand in [
             repo_root / "target" / "release" / "saccadion",
             repo_root / "target" / "release" / "saccadion.exe",
+            Path("/content/drive/MyDrive/Saccadion_TPU/bin_v10/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v9/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v8/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v7/saccadion"),

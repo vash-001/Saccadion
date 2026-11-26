@@ -636,6 +636,7 @@ def _find_rust_data_binary() -> Optional[Path]:
     for cand in [
         repo_root / "target" / "release" / "saccadion-data",
         repo_root / "target" / "release" / "saccadion-data.exe",
+        Path("/content/drive/MyDrive/Saccadion_TPU/bin_v10/saccadion-data"),
         Path("/content/drive/MyDrive/Saccadion_TPU/bin_v9/saccadion-data"),
         Path("/content/drive/MyDrive/Saccadion_TPU/bin_v8/saccadion-data"),
         Path("/content/drive/MyDrive/Saccadion_TPU/bin_v7/saccadion-data"),
