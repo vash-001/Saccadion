@@ -415,11 +415,8 @@ def train_saccadion_smart(
 
     train_shards = sorted(shard_dir.glob("train_random_*.sacc"))
     if not train_shards:
-        train_shards = sorted(p for p in shard_dir.glob("*.sacc") if "val" not in p.name and "traj" not in p.name)
-    # Automatically include previously harvested anti-Stockfish hard sparring positions!
+        train_shards = sorted(p for p in shard_dir.glob("*.sacc") if "val" not in p.name and "traj" not in p.name and "sparring" not in p.name)
     sparring_shard = shard_dir / "sparring_hard.sacc"
-    if sparring_shard.exists() and sparring_shard not in train_shards:
-        train_shards.append(sparring_shard)
 
     val_game_shards = sorted(p for p in shard_dir.glob("val_*.sacc") if "puzzles" not in p.name)
     val_puzzle_shards = sorted(shard_dir.glob("val_puzzles*.sacc"))
@@ -783,30 +780,8 @@ def train_saccadion_smart(
                     save_checkpoint(ckpt_file, host_p, host_o, epoch - 1, global_step, best_val_loss, history)
                     last_ckpt_time = time.time()
 
-            # Closed-Loop Online Anti-Blunder DAgger Replay:
-            # Immediately train on newly harvested refutations from our parallel Multi-Engine Arena!
+            # Unwrap single-host copy for clean held-out Validation & .saccnet export
             replay_batches_run = 0
-            if epoch >= 2 and sparring_shard.exists() and sparring_shard.stat().st_size > 16 + 64 * 128:
-                try:
-                    sp_ds = SaccShardDataset([sparring_shard], cache_dir=None, split_name="sparring")
-                    if len(sp_ds) >= min(eff_bsz, 64):
-                        r_bsz = min(eff_bsz, max(n_dev, (len(sp_ds) // n_dev) * n_dev))
-                        for r_i, rbatch_np in enumerate(sp_ds.iter_batches(r_bsz, seed=epoch * 131)):
-                            jax_rng, step_key = jax.random.split(jax_rng)
-                            if use_pmap:
-                                b_in = _shard_batch_for_pmap(rbatch_np, n_dev)
-                                dev_keys = jax.random.split(step_key, n_dev)
-                                params_dev, opt_dev, _ = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight, dev_keys)
-                            else:
-                                b_in = {k: jnp.asarray(v) for k, v in rbatch_np.items()}
-                                params_dev, opt_dev, _ = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight, step_key)
-                            replay_batches_run += 1
-                            if r_i + 1 >= 6:
-                                break
-                except Exception:
-                    pass
-
-            # Unwrap single-host copy for Validation & .saccnet export
             host_params = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
             host_opt = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
 

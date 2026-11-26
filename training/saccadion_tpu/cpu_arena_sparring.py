@@ -214,9 +214,11 @@ def discover_and_install_multi_engines() -> Tuple[List[EngineSpec], Optional[Pat
             ("Stockfish-1320 (Lv0)", 1320),
             ("Stockfish-1550 (Lv3)", 1550),
             ("Stockfish-1850 (Lv6)", 1850),
-            ("Stockfish-2200 (Lv10)", 2200),
-            ("Stockfish-2600 (Lv15)", 2600),
-            ("Stockfish-3000 (Lv20)", 3000),
+            ("Stockfish-2050 (Lv8)", 2050),
+            ("Stockfish-2250 (Lv11)", 2250),
+            ("Stockfish-2550 (Lv15)", 2550),
+            ("Stockfish-2850 (Lv18)", 2850),
+            ("Stockfish-3050 (Lv20)", 3050),
             ("Stockfish-3190 (Max)", 3190),
         ]:
             gauntlet.append(
@@ -471,11 +473,11 @@ class StockfishSparringArena:
 
         n_cpu = os.cpu_count() or 2
         if num_workers is None:
-            # Auto-scale across idle vCPUs: 1 on 2-4 cores, up to 6 simultaneous matches on Colab TPU VMs!
-            self.num_workers = max(1, min(6, (n_cpu - 2) // 3)) if n_cpu >= 6 else 1
+            # Cap at 3 parallel boards (~9 cores) so 15+ vCPUs stay 100% free for peak TPU feeding!
+            self.num_workers = max(1, min(3, (n_cpu - 4) // 4)) if n_cpu >= 8 else 1
         else:
-            self.num_workers = max(1, min(8, num_workers))
-        self.sacc_threads_per_worker = 2 if n_cpu >= self.num_workers * 3 + 2 else 1
+            self.num_workers = max(1, min(6, num_workers))
+        self.sacc_threads_per_worker = 2 if n_cpu >= self.num_workers * 3 + 6 else 1
 
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
@@ -485,6 +487,7 @@ class StockfishSparringArena:
         self._results: List[Tuple[int, float]] = []
         self._harvest_records: List[np.ndarray] = []
         self._game_counter = 0
+        self._latest_weights_mtime = 0.0
         self._gauntlet: List[EngineSpec] = []
         self._sf_bin: Optional[Path] = None
 
@@ -612,22 +615,21 @@ class StockfishSparringArena:
             pass
 
     def _pick_opponent(self, worker_id: int, local_game: int, rng: random.Random) -> EngineSpec:
-        """Selects an opponent near Saccadion's live Elo while rotating across ALL engine families!"""
+        """Selects an opponent strictly within Saccadion's Elo band while rotating engine families!"""
         with self._lock:
-            cur_elo = self._status.real_elo if self._status.games_played >= 4 else 1650.0
+            cur_elo = self._status.real_elo if len(self._results) >= 4 else 1600.0
         non_base = [e for e in self._gauntlet if e.cmd is not None]
         pool = non_base if non_base else self._gauntlet
-        # Matchmaking band: [cur_elo - 280, cur_elo + 450] so Saccadion always gets informative matches
-        band = [e for e in pool if (cur_elo - 280.0) <= e.elo <= (cur_elo + 450.0)]
+        # Tight, informative matchmaking band: [cur_elo - 250, cur_elo + 320]
+        band = [e for e in pool if (cur_elo - 250.0) <= e.elo <= (cur_elo + 320.0)]
         if not band:
-            band = sorted(pool, key=lambda e: abs(e.elo - cur_elo))[:3]
+            band = sorted(pool, key=lambda e: abs(e.elo - cur_elo))[:2]
 
-        # Prioritize diverse non-Stockfish engines on alternating workers so every family gets played!
-        non_sf = [e for e in pool if not e.is_stockfish and e.cmd is not None]
-        if non_sf and ((worker_id + local_game) % 2 == 1) and cur_elo >= 1450.0:
-            near_other = [e for e in non_sf if abs(e.elo - cur_elo) <= 750.0]
-            if near_other:
-                return near_other[(worker_id + local_game) % len(near_other)]
+        # Only bring in strong non-Stockfish engines (GNUChess 2300, Fruit 2680, Toga2 2800)
+        # once Saccadion is within 320 Elo of them — avoids lopsided 0-167 slaughters!
+        non_sf = [e for e in band if not e.is_stockfish and e.cmd is not None]
+        if non_sf and ((worker_id + local_game) % 2 == 1):
+            return non_sf[(worker_id + local_game) % len(non_sf)]
         return rng.choice(band)
 
     def _bootstrap_and_run(self) -> None:
@@ -697,9 +699,6 @@ class StockfishSparringArena:
         local_game = 0
 
         try:
-            if self._sf_bin is not None:
-                oracle_proc = _UciProcess([str(self._sf_bin)], {"Threads": "1", "Hash": "16"})
-
             while not self._stop_evt.is_set():
                 mtime = self.weights_path.stat().st_mtime if self.weights_path.exists() else 0.0
                 if sacc_proc is None or mtime > last_mtime:
@@ -711,6 +710,12 @@ class StockfishSparringArena:
                     )
                     sacc_proc.set_option("WeightsPath", str(self.weights_path))
                     last_mtime = mtime
+                    # Trim stale older-epoch Elo history when newer best weights arrive
+                    with self._lock:
+                        if mtime > self._latest_weights_mtime:
+                            self._latest_weights_mtime = mtime
+                            if len(self._results) > 16:
+                                self._results = self._results[-16:]
 
                 spec = self._pick_opponent(worker_id, local_game, rng)
                 opp_proc: Optional[_UciProcess] = None
@@ -782,27 +787,16 @@ class StockfishSparringArena:
                     sacc_mat = w_mat if sacc_is_white else -w_mat
                     score = 1.0 if sacc_mat >= 220 else (0.0 if sacc_mat <= -220 else 0.5)
 
-                # Harvest anti-engine hard refutations from EVERY loss or draw against ANY engine!
+                # Keep Arena lightweight & zero-interference: record exact multi-engine Elo without
+                # burning extra CPU cores on noisy 35ms oracle harvesting.
                 new_recs: List[np.ndarray] = []
-                if score <= 0.5 and oracle_proc is not None and sacc_positions:
-                    oracle_proc.set_option("UCI_LimitStrength", "false")
-                    sample_fens = rng.sample(sacc_positions, min(5, len(sacc_positions)))
-                    for fen_s, _ in sample_fens:
-                        if self._stop_evt.is_set():
-                            break
-                        b_h = chess.Board(fen_s)
-                        best_ref, ref_cp = oracle_proc.go(fen_s, movetime_ms=35)
-                        if best_ref:
-                            rec = self._pack_harvest_record(b_h, best_ref, ref_cp or 0)
-                            if rec is not None:
-                                new_recs.append(rec)
 
                 res_txt = "WIN" if score == 1.0 else ("LOSS" if score == 0.0 else "DRAW")
                 with self._lock:
                     self._game_counter += 1
                     gnum = self._game_counter
                     self._results.append((spec.elo, score))
-                    real_elo, elo_ci = estimate_mle_elo(self._results[-120:])
+                    real_elo, elo_ci = estimate_mle_elo(self._results[-60:])
                     self._status.games_played += 1
                     if score == 1.0:
                         self._status.wins += 1
