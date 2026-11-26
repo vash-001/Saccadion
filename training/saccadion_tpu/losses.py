@@ -24,9 +24,41 @@ def soft_kl_loss(logits: jnp.ndarray, target_probs: jnp.ndarray) -> jnp.ndarray:
     return jnp.mean(jnp.sum(safe_t * (jnp.log(safe_t) - log_p), axis=-1))
 
 
+def weighted_soft_kl_loss(
+    logits: jnp.ndarray, target_probs: jnp.ndarray, weights: jnp.ndarray
+) -> jnp.ndarray:
+    log_p = jax.nn.log_softmax(logits, axis=-1)
+    safe_t = jnp.clip(target_probs, 1e-6, 1.0)
+    per_b = jnp.sum(safe_t * (jnp.log(safe_t) - log_p), axis=-1)
+    return jnp.sum(per_b * weights) / jnp.maximum(jnp.sum(weights), 1.0)
+
+
 def huber_loss(pred: jnp.ndarray, target: jnp.ndarray, delta: float = 0.25) -> jnp.ndarray:
     err = jnp.abs(pred - target)
     return jnp.mean(jnp.where(err <= delta, 0.5 * err * err, delta * (err - 0.5 * delta)))
+
+
+def weighted_huber_loss(
+    pred: jnp.ndarray, target: jnp.ndarray, weights: jnp.ndarray, delta: float = 0.5
+) -> jnp.ndarray:
+    err = jnp.abs(pred - target)
+    per_b = jnp.where(err <= delta, 0.5 * err * err, delta * (err - 0.5 * delta))
+    return jnp.sum(per_b * weights) / jnp.maximum(jnp.sum(weights), 1.0)
+
+
+def compute_quiet_mask(batch: Dict[str, jnp.ndarray]) -> jnp.ndarray:
+    """Identifies truly quiet positional states (!in_check & !best_capture & !best_promo & !puzzle)
+    directly on TPU so static leaf evaluators (Giant Fiber + Stream A) achieve < 50 cp precision!"""
+    bsz = batch["board_feats"].shape[0]
+    row = jnp.arange(bsz)
+    best_mv = batch["top4_moves"][:, 0]
+    u_sq = (best_mv >> 6) & 63
+    v_sq = best_mv & 63
+    in_check = batch["lh_feat"][:, 0] > 0.25
+    is_cap = jnp.sum(batch["board_feats"][row, v_sq, 6:12], axis=-1) > 0.5
+    is_promo = (batch["board_feats"][row, u_sq, 0] > 0.5) & ((v_sq >> 3) == 7)
+    is_puzzle = (batch["causal_mask"] > 0.5) if "causal_mask" in batch else jnp.zeros((bsz,), dtype=jnp.bool_)
+    return (~in_check) & (~is_cap) & (~is_promo) & (~is_puzzle)
 
 
 def sparse_topk_policy_loss(
@@ -287,25 +319,59 @@ def compute_multitask_loss(
     apl_weight: float = 0.05,
     jepa_target_latent: jnp.ndarray | None = None,
     params: Dict[str, jnp.ndarray] | None = None,
+    out_a_unmasked: Dict[str, jnp.ndarray] | None = None,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
-    """Computes full weighted 14-sensor causal, dynamic-imbalance, & blunder/brilliant loss."""
+    """Computes full weighted 15-sensor Neuro-Apex loss (Quiet-Masked Giant Fiber + Dual Stream A/B)."""
     wdl_t = batch["wdl_target"]
+    is_quiet = compute_quiet_mask(batch)
+    quiet_f = is_quiet.astype(jnp.float32)
+    leaf_val_w = jnp.where(is_quiet, 1.0, 0.12)
+    deep_val_w = jnp.where(is_quiet, 1.0, 0.35)
 
-    # 1. Deep Supervision across all Central Complex deliberation ticks + Stream A + B->A Distill
-    #    + Direct Centipawn Smooth-L1 Loss (non-saturating material & positional calibration up to +/-2500 cp!)
+    # 1. Deep Supervision across all Central Complex deliberation ticks + Dual Stream A (unmasked + steered!)
+    #    + Saccadion-7 Dedicated End-to-End Giant Fiber (GF/DNp01) with Quiet-Position Value Masking!
     ticks = out_b["per_tick_wdl"]
     n_t = len(ticks)
     w_sum = sum(range(1, n_t + 1))
-    loss_wdl_b = sum(((i + 1) / w_sum) * soft_kl_loss(t_log, wdl_t) for i, t_log in enumerate(ticks))
-    loss_wdl_a = soft_kl_loss(out_a["wdl_logits"], wdl_t)
+    loss_wdl_b = sum(
+        ((i + 1) / w_sum) * weighted_soft_kl_loss(t_log, wdl_t, deep_val_w) for i, t_log in enumerate(ticks)
+    )
     probs_b_sg = jax.lax.stop_gradient(jax.nn.softmax(out_b["wdl_logits"], axis=-1))
-    loss_b_to_a = soft_kl_loss(out_a["wdl_logits"], probs_b_sg)
-
     target_exp = jnp.clip(wdl_t[:, 0] - wdl_t[:, 2], -0.995, 0.995)
     target_cp_scaled = jnp.arctanh(target_exp)  # target_cp / 400.0
-    loss_cp_a = huber_loss(out_a["pred_cp"] / 400.0, target_cp_scaled, delta=0.5)
-    loss_cp_b = huber_loss(out_b["pred_cp"] / 400.0, target_cp_scaled, delta=0.5)
-    loss_wdl = loss_wdl_b + loss_wdl_a + 0.30 * loss_b_to_a + 0.45 * (loss_cp_a + loss_cp_b)
+
+    # Supervise Stream A BOTH with cent_mask (steered) AND without cent_mask (direct Rust inference!)
+    loss_wdl_a_s = weighted_soft_kl_loss(out_a["wdl_logits"], wdl_t, leaf_val_w)
+    loss_b_to_a_s = weighted_soft_kl_loss(out_a["wdl_logits"], probs_b_sg, leaf_val_w)
+    loss_cp_a_s = weighted_huber_loss(out_a["pred_cp"] / 400.0, target_cp_scaled, leaf_val_w, delta=0.5)
+    if out_a_unmasked is not None:
+        loss_wdl_a_u = weighted_soft_kl_loss(out_a_unmasked["wdl_logits"], wdl_t, leaf_val_w)
+        loss_b_to_a_u = weighted_soft_kl_loss(out_a_unmasked["wdl_logits"], probs_b_sg, leaf_val_w)
+        loss_cp_a_u = weighted_huber_loss(out_a_unmasked["pred_cp"] / 400.0, target_cp_scaled, leaf_val_w, delta=0.5)
+        loss_wdl_a = 0.5 * (loss_wdl_a_s + loss_wdl_a_u)
+        loss_b_to_a = 0.5 * (loss_b_to_a_s + loss_b_to_a_u)
+        loss_cp_a = 0.5 * (loss_cp_a_s + loss_cp_a_u)
+    else:
+        loss_wdl_a = loss_wdl_a_s
+        loss_b_to_a = loss_b_to_a_s
+        loss_cp_a = loss_cp_a_s
+
+    loss_cp_b = weighted_huber_loss(out_b["pred_cp"] / 400.0, target_cp_scaled, deep_val_w, delta=0.5)
+
+    # 1b. Dedicated Dendritic Coincidence Giant Fiber (GF / DNp01) Supervision + Stream B -> GF Distillation!
+    gf_cp = out_a_unmasked["gf_cp"] if out_a_unmasked is not None else out_a["gf_cp"]
+    target_win_exp = jnp.clip(wdl_t[:, 0] + 0.5 * wdl_t[:, 1], 1e-5, 1.0 - 1e-5)
+    gf_logit = gf_cp / 280.0
+    gf_bce = -(target_win_exp * jax.nn.log_sigmoid(gf_logit) + (1.0 - target_win_exp) * jax.nn.log_sigmoid(-gf_logit))
+    loss_gf_wdl = jnp.sum(gf_bce * leaf_val_w) / jnp.maximum(jnp.sum(leaf_val_w), 1.0)
+    loss_gf_cp = weighted_huber_loss(gf_cp / 400.0, target_cp_scaled, leaf_val_w, delta=0.5)
+    loss_b_to_gf = weighted_huber_loss(
+        gf_cp / 400.0, jax.lax.stop_gradient(out_b["pred_cp"]) / 400.0, leaf_val_w, delta=0.5
+    )
+    loss_gf = 1.40 * loss_gf_wdl + 0.60 * loss_gf_cp + 0.45 * loss_b_to_gf
+    gf_quiet_mae = jnp.sum(jnp.abs(gf_cp - 400.0 * target_cp_scaled) * quiet_f) / jnp.maximum(jnp.sum(quiet_f), 1.0)
+
+    loss_wdl = loss_wdl_b + loss_wdl_a + 0.30 * loss_b_to_a + 0.45 * (loss_cp_a + loss_cp_b) + 0.85 * loss_gf
 
     # 2. Sparse Top-4 PFL3 Policy Loss with 2.2x PAM Brilliant Move (`!!`) Boost!
     is_bril = batch.get("is_brilliant")
@@ -410,6 +476,8 @@ def compute_multitask_loss(
         "total": total,
         "wdl_b": loss_wdl_b,
         "wdl_a": loss_wdl_a,
+        "gf_loss": loss_gf,
+        "gf_quiet_mae": gf_quiet_mae,
         "policy": loss_policy,
         "pressure": loss_pressure,
         "lh": loss_lh,

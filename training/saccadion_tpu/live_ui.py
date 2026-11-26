@@ -122,6 +122,7 @@ class LiveTrainingHUD:
         self._in_notebook = self._detect_notebook()
         self.step_loss_ring: List[float] = []
         self.step_kc_ring: List[float] = []
+        self._ema_loss: Optional[float] = None
 
     @staticmethod
     def _detect_notebook() -> bool:
@@ -185,8 +186,9 @@ class LiveTrainingHUD:
 
         opp_name = str(arena.get("opponent_name", "Warming up"))
         wdl_arena = f"{arena.get('wins', 0)}W - {arena.get('draws', 0)}D - {arena.get('losses', 0)}L"
-        harvested = int(arena.get("harvested_positions", 0))
-        last_game = str(arena.get("last_result", "Waiting for Epoch-1 .saccnet..."))
+        per_eng = arena.get("per_engine_wdl", {}) or {}
+        eng_tags = " | ".join(f"{k[:4]}:{v[0]}-{v[1]}-{v[2]}" for k, v in sorted(per_eng.items()))
+        last_game = eng_tags if eng_tags else str(arena.get("last_result", "Waiting for Epoch-1 .saccnet..."))
 
         eta_m, eta_s = divmod(int(max(0, eta_sec)), 60)
         eta_h, eta_m = divmod(eta_m, 60)
@@ -274,7 +276,7 @@ class LiveTrainingHUD:
 padding:14px;border-radius:12px;border:1px solid #1e293b;max-width:1240px;">
   <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
     <div>
-      <span style="font-size:16px;font-weight:700;color:#38bdf8;">SACCADION-2 CAUSAL</span>
+      <span style="font-size:16px;font-weight:700;color:#38bdf8;">SACCADION-7 NEURO-APEX</span>
       <span style="color:#64748b;"> | </span>
       <span style="color:#a78bfa;font-weight:600;">{html.escape(stage_name)}</span>
       <span style="color:#64748b;"> | </span>
@@ -328,9 +330,9 @@ padding:14px;border-radius:12px;border:1px solid #1e293b;max-width:1240px;">
       <div style="font-size:11px;color:#94a3b8;">PAM {pam_str} | D1R2 {d1r2_str} | SOC {soc_str} | Orth {orth_str}</div>
     </div>
     <div style="background:#0f172a;padding:9px;border-radius:8px;border:1px solid #1e293b;">
-      <div style="font-size:10px;color:#64748b;">CPU STOCKFISH ARENA</div>
+      <div style="font-size:10px;color:#64748b;">MULTI-ENGINE ARENA</div>
       <div style="font-size:13px;font-weight:700;color:#fbbf24;">{html.escape(opp_name)}</div>
-      <div style="font-size:11px;color:#94a3b8;">{wdl_arena} | AntiSF+{harvested} | {html.escape(last_game[:28])}</div>
+      <div style="font-size:11px;color:#94a3b8;">{wdl_arena} | {html.escape(last_game[:44])}</div>
     </div>
   </div>
 
@@ -370,7 +372,8 @@ padding:14px;border-radius:12px;border:1px solid #1e293b;max-width:1240px;">
         arena_status: Optional[Dict[str, Any]] = None,
         force: bool = False,
     ) -> None:
-        self.step_loss_ring.append(step_loss)
+        self._ema_loss = step_loss if self._ema_loss is None else (0.92 * self._ema_loss + 0.08 * step_loss)
+        self.step_loss_ring.append(self._ema_loss)
         self.step_kc_ring.append(step_kc_pct)
         if len(self.step_loss_ring) > 300:
             self.step_loss_ring = self.step_loss_ring[-200:]

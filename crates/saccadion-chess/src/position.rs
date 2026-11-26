@@ -29,6 +29,7 @@ pub struct UndoState {
     pub halfmove_clock: u16,
     pub hash: u64,
     pub pawn_hash: u64,
+    pub non_pawn_hash: [u64; 2],
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +45,7 @@ pub struct Position {
     pub fullmove_number: u16,
     pub hash: u64,
     pub pawn_hash: u64,
+    pub non_pawn_hash: [u64; 2],
     pub history: Vec<u64>,
 }
 
@@ -67,6 +69,7 @@ impl Position {
             fullmove_number: 1,
             hash: 0,
             pawn_hash: 0,
+            non_pawn_hash: [0, 0],
             history: Vec::with_capacity(256),
         }
     }
@@ -293,6 +296,7 @@ impl Position {
         let z = zobrist::tables();
         let mut h = 0u64;
         let mut ph = 0u64;
+        let mut nph = [0u64; 2];
         for c in [Color::White, Color::Black] {
             for p in Piece::ALL {
                 for sq in self.piece_bb(c, p) {
@@ -300,6 +304,8 @@ impl Position {
                     h ^= key;
                     if p == Piece::Pawn {
                         ph ^= key;
+                    } else {
+                        nph[c.index()] ^= key;
                     }
                 }
             }
@@ -313,6 +319,7 @@ impl Position {
         }
         self.hash = h;
         self.pawn_hash = ph;
+        self.non_pawn_hash = nph;
     }
 
     #[inline(always)]
@@ -432,6 +439,7 @@ impl Position {
             halfmove_clock: self.halfmove_clock,
             hash: self.hash,
             pawn_hash: self.pawn_hash,
+            non_pawn_hash: self.non_pawn_hash,
         };
 
         self.history.push(self.hash);
@@ -459,6 +467,8 @@ impl Position {
             self.hash ^= k;
             if cap == Piece::Pawn {
                 self.pawn_hash ^= k;
+            } else {
+                self.non_pawn_hash[them.index()] ^= k;
             }
         }
 
@@ -470,6 +480,7 @@ impl Position {
             let tk = z.piece[us.index()][promo.index()][to.index()];
             self.hash ^= fk ^ tk;
             self.pawn_hash ^= fk;
+            self.non_pawn_hash[us.index()] ^= tk;
         } else {
             self.move_piece(us, moving_piece, from, to);
             let fk = z.piece[us.index()][moving_piece.index()][from.index()];
@@ -477,6 +488,8 @@ impl Position {
             self.hash ^= fk ^ tk;
             if moving_piece == Piece::Pawn {
                 self.pawn_hash ^= fk ^ tk;
+            } else {
+                self.non_pawn_hash[us.index()] ^= fk ^ tk;
             }
         }
 
@@ -489,8 +502,10 @@ impl Position {
                 (Color::Black, _) => (Square::new(56), Square::new(59)),
             };
             self.move_piece(us, Piece::Rook, r_from, r_to);
-            self.hash ^= z.piece[us.index()][Piece::Rook.index()][r_from.index()]
+            let rk = z.piece[us.index()][Piece::Rook.index()][r_from.index()]
                 ^ z.piece[us.index()][Piece::Rook.index()][r_to.index()];
+            self.hash ^= rk;
+            self.non_pawn_hash[us.index()] ^= rk;
         } else if mv.is_double_push() {
             let ep_sq = Square::new((from.0 + to.0) / 2);
             self.ep_square = Some(ep_sq);
@@ -560,6 +575,7 @@ impl Position {
         self.halfmove_clock = undo.halfmove_clock;
         self.hash = undo.hash;
         self.pawn_hash = undo.pawn_hash;
+        self.non_pawn_hash = undo.non_pawn_hash;
         self.history.pop();
     }
 
@@ -572,6 +588,7 @@ impl Position {
             halfmove_clock: self.halfmove_clock,
             hash: self.hash,
             pawn_hash: self.pawn_hash,
+            non_pawn_hash: self.non_pawn_hash,
         };
         self.history.push(self.hash);
         if let Some(ep) = self.ep_square {
@@ -590,6 +607,7 @@ impl Position {
         self.halfmove_clock = undo.halfmove_clock;
         self.hash = undo.hash;
         self.pawn_hash = undo.pawn_hash;
+        self.non_pawn_hash = undo.non_pawn_hash;
         self.history.pop();
     }
 

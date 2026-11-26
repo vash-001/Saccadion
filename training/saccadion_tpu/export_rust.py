@@ -109,6 +109,8 @@ SACCNET_TENSOR_ORDER = [
     "b_wm_w1",
     "b_wm_b1",
     "b_wm_w2",
+    "a_gf_w",
+    "a_gf_b",
 ]
 
 
@@ -154,7 +156,7 @@ def init_numpy_params(cfg: SaccadionConfig, seed: int = 1234) -> Dict[str, np.nd
     rng = np.random.default_rng(seed)
     u = lambda shape, scale: rng.uniform(-scale, scale, size=shape).astype(np.float32)
 
-    _, gamma_dim, _ = cfg.lobe_dims_per_hemi()
+    ab_dim, gamma_dim, _ = cfg.lobe_dims_per_hemi()
     plastic_dim = cfg.plastic_dim_per_hemi()
     d, cx, mbon, stacks = cfg.stream_b_dim, cfg.cx_dim, cfg.mbon_dim, cfg.num_phase_stacks
     smp_in = 2 * mbon + 4
@@ -245,6 +247,8 @@ def init_numpy_params(cfg: SaccadionConfig, seed: int = 1234) -> Dict[str, np.nd
         "b_wm_w1": u((d + cx, d + 2 * cx), s_d),
         "b_wm_b1": np.zeros((d + cx,), dtype=np.float32),
         "b_wm_w2": u((d + cx, d + cx), s_d * 0.5),
+        "a_gf_w": u((stacks, ab_dim), (1.0 / ab_dim) ** 0.5 * 0.1),
+        "a_gf_b": np.zeros((stacks,), dtype=np.float32),
     }
 
 
@@ -298,9 +302,21 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
     rec["meta_flags"] = (0x0F << 1) | (7 << 17)
     sp_s, sp_o, board, graph_adj, lh_feat, phase = decode_record_features(rec, max_sparse=96)
 
-    # Stream A reference forward pass (NumPy mirror of model.py + SEZ innate valence)
-    ab_dim, _, _ = cfg.lobe_dims_per_hemi()
+    # Stream A & Dedicated Giant Fiber reference forward pass (NumPy mirror of model.py)
+    from .config import HALFKA_DIM
+    ab_dim, gamma_dim, _ = cfg.lobe_dims_per_hemi()
     claws = build_flyhash_claws(cfg)
+    hk_s = sp_s[(sp_s >= 0) & (sp_s < HALFKA_DIM)]
+    hk_o = sp_o[(sp_o >= 0) & (sp_o < HALFKA_DIM)]
+    gf_acc_s = np.sum(params["a_ft_weight"][hk_s, :ab_dim], axis=0) + params["a_ft_bias"][:ab_dim]
+    gf_acc_o = np.sum(params["a_ft_weight"][hk_o, :ab_dim], axis=0) + params["a_ft_bias"][:ab_dim]
+    gf_sez_cp = (float(np.sum(params["a_sez_weight"][hk_s, phase])) - float(np.sum(params["a_sez_weight"][hk_o, phase]))) * 50.0
+    half_ab = ab_dim // 2
+    cs = np.clip(gf_acc_s, 0.0, 1.0)
+    co = np.clip(gf_acc_o, 0.0, 1.0)
+    gf_feat = np.concatenate([cs[:half_ab] * cs[half_ab:], co[:half_ab] * co[half_ab:]])
+    gf_cp_py = float(np.clip(gf_sez_cp + (float(np.dot(gf_feat, params["a_gf_w"][phase])) + float(params["a_gf_b"][phase])) * 400.0, -2500.0, 2500.0))
+
     acc_s = np.sum(params["a_ft_weight"][sp_s[sp_s >= 0]], axis=0) + params["a_ft_bias"]
     acc_o = np.sum(params["a_ft_weight"][sp_o[sp_o >= 0]], axis=0) + params["a_ft_bias"]
     sez_s = float(np.sum(params["a_sez_weight"][sp_s[sp_s >= 0], phase]))
@@ -433,16 +449,21 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
     line = res.stdout.strip()
     print("Rust output:", line)
     kv = dict(tok.split("=") for tok in line.split()[1:])
+    rust_gf_fp32 = float(kv["gf_fp32"])
+    rust_gf_i16 = int(kv["gf_i16"])
     rust_a_cp = float(kv["stream_a_slow_cp"])
     rust_b_cp = float(kv["stream_b_deep_cp"])
     rust_pfl2 = float(kv["pfl2"])
     rust_press = np.array([float(x) for x in kv["press"].split(",")], dtype=np.float32)
 
+    print(f"Giant Fiber FP32: Python={gf_cp_py:.6f} | Rust={rust_gf_fp32:.6f} | diff={abs(gf_cp_py - rust_gf_fp32):.2e} | INT16={rust_gf_i16}")
     print(f"Stream A slow_cp: Python={slow_cp_py:.6f} | Rust={rust_a_cp:.6f} | diff={abs(slow_cp_py - rust_a_cp):.2e}")
     print(f"Stream B deep_cp: Python={deep_cp_py:.6f} | Rust={rust_b_cp:.6f} | diff={abs(deep_cp_py - rust_b_cp):.2e}")
     print(f"Stream B PFL2   : Python={pfl2_py:.6f} | Rust={rust_pfl2:.6f} | diff={abs(pfl2_py - rust_pfl2):.2e}")
     print(f"Pressure maxdiff: {np.max(np.abs(press_py - rust_press)):.2e}")
 
+    assert abs(gf_cp_py - rust_gf_fp32) < 1e-4, "Giant Fiber FP32 parity mismatch"
+    assert abs(gf_cp_py - rust_gf_i16) < 3.0, "Giant Fiber INT16 parity mismatch"
     assert abs(slow_cp_py - rust_a_cp) < 1e-4, "Stream A cp parity mismatch"
     assert abs(deep_cp_py - rust_b_cp) < 1e-4, "Stream B cp parity mismatch"
     assert abs(pfl2_py - rust_pfl2) < 1e-5, "PFL2 parity mismatch"

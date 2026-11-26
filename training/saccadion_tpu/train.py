@@ -144,7 +144,7 @@ def build_muon_adamw_optimizer(
             labels[k] = "sez"
         elif k == "a_ft_weight":
             labels[k] = "sparse_ft"
-        elif v.ndim < 2 or "ln" in k or "bias" in k or "meta_" in k or "_rel" in k or "plastic_to_mbon" in k:
+        elif v.ndim < 2 or "ln" in k or "bias" in k or "meta_" in k or "_rel" in k or "plastic_to_mbon" in k or k.startswith("a_gf_"):
             labels[k] = "adamw"
         else:
             labels[k] = "muon"
@@ -257,7 +257,7 @@ def _save_metrics_and_dashboard(history: List[Dict[str, Any]], ckpt_dir: Path) -
 
         epochs = [r.get("epoch", i + 1) for i, r in enumerate(history)]
         fig, axes = plt.subplots(2, 3, figsize=(16, 9))
-        fig.suptitle("Saccadion-6 (FlyWire-GNN+INT8+WorldModel) Smart TPU Telemetry", fontsize=14, fontweight="bold")
+        fig.suptitle("Saccadion-7 NEURO-APEX (Dendritic-GF+FlyWire-GNN+WorldModel) TPU Telemetry", fontsize=14, fontweight="bold")
 
         # Panel 1: Total Train vs Val Loss
         ax = axes[0, 0]
@@ -370,7 +370,7 @@ def _print_epoch_banner(row: Dict[str, Any], is_best: bool) -> None:
     )
     print(
         f"  CHESS   : Move Top-1={row['val_top1_acc']:5.2f}% | Move Top-3={row['val_top3_acc']:5.2f}% | "
-        f"WDL Acc={row['val_wdl_acc']:5.2f}% | Eval MAE={row['val_cp_mae']:6.1f} cp"
+        f"WDL Acc={row['val_wdl_acc']:5.2f}% | Eval MAE={row['val_cp_mae']:6.1f} cp | GF Quiet MAE={row.get('val_gf_quiet_mae', 0.0):5.1f} cp"
     )
     print(
         f"  ELO     : {real_elo_s} | Proxy Net ~{row['est_raw_elo']:.0f} | +Rust PVS ~{row['est_search_elo']:.0f}"
@@ -447,7 +447,7 @@ def train_saccadion_smart(
     total_steps = steps_per_epoch * epochs
     dev_label = f"{n_dev}x {jax.devices()[0].platform.upper()}"
 
-    print(f"=== SACCADION-6 (FLYWIRE-GNN+INT8+LIVE-WORLD-MODEL) SMART TPU TRAINER ===")
+    print(f"=== SACCADION-7 NEURO-APEX (DENDRITIC-GF+FLYWIRE-GNN+3500-PVS) SMART TPU TRAINER ===")
     print(f"Devices      : {dev_label} (pmap={use_pmap})")
     print(f"Model Tier   : tier_id={cfg.tier_id} (acc_dim={cfg.acc_dim}, D={cfg.stream_b_dim}, CX={cfg.cx_dim}, T_max={cfg.cx_max_ticks})")
     print(f"Dataset      : train={len(train_ds):,} pos | val={len(val_ds):,} pos | traj={len(traj_ds)//12:,} windows")
@@ -535,7 +535,7 @@ def train_saccadion_smart(
                 cent_mask=out_b["cent_kc_mask"], qat=qat, dropout_key=k2, kc_drop_rate=0.08,
             )
             return compute_multitask_loss(
-                out_a_steered, out_b, batch, apl_target_active=apl_target, apl_weight=apl_w, params=cur_p
+                out_a_steered, out_b, batch, apl_target_active=apl_target, apl_weight=apl_w, params=cur_p, out_a_unmasked=out_a
             )
 
         if use_pmap:
@@ -583,7 +583,7 @@ def train_saccadion_smart(
                 cent_mask=out_b["cent_kc_mask"], qat=qat,
             )
             _, m = compute_multitask_loss(
-                out_a_s, out_b, batch, apl_target_active=apl_target, apl_weight=apl_w, params=p
+                out_a_s, out_b, batch, apl_target_active=apl_target, apl_weight=apl_w, params=p, out_a_unmasked=out_a
             )
             # Chess accuracy & calibration telemetry
             pol = out_b["policy_logits"]
@@ -724,7 +724,9 @@ def train_saccadion_smart(
 
             ep_losses: List[float] = []
             pos_seen = 0
-            ema_step_ms = 25.0
+            ema_step_ms = 45.0
+            t_loop_start: Optional[float] = None
+            pos_after_jit = 0
             aug_rng = np.random.default_rng(epoch * 7919 + 13)
             jax_rng = jax.random.PRNGKey(epoch * 4241 + 7)
 
@@ -746,16 +748,26 @@ def train_saccadion_smart(
                     kc_val = float(m["active_kc_ratio"])
 
                 step_ms = (time.time() - t_s0) * 1000.0
-                ema_step_ms = 0.85 * ema_step_ms + 0.15 * step_ms
+                if step_idx == 1:
+                    # Exclude one-time XLA JIT recompile & Stage-2 Meta-Dopamine from live pos/s & ETA!
+                    t_loop_start = time.time()
+                else:
+                    ema_step_ms = 0.88 * ema_step_ms + 0.12 * step_ms
+                    pos_after_jit += eff_bsz
                 ep_losses.append(loss_val)
                 global_step += 1
                 pos_seen += eff_bsz
 
-                # Smooth 20 Hz Live Cockpit update (zero flicker, throttled to <= 20 fps!)
-                elapsed_ep = max(1e-3, time.time() - t_ep0)
-                cur_pos_s = pos_seen / elapsed_ep
+                # Smooth 20 Hz Live Cockpit update with accurate post-JIT throughput & ETA!
+                if t_loop_start is not None and pos_after_jit > 0:
+                    elapsed_loop = max(1e-3, time.time() - t_loop_start)
+                    cur_pos_s = pos_after_jit / elapsed_loop
+                    sec_per_step = elapsed_loop / max(1, step_idx - 1)
+                else:
+                    cur_pos_s = eff_bsz / max(1e-3, step_ms / 1000.0)
+                    sec_per_step = max(1e-3, ema_step_ms / 1000.0)
                 rem_steps = (epochs - epoch) * steps_per_epoch + (steps_per_epoch - step_idx)
-                eta_sec = rem_steps * (elapsed_ep / step_idx)
+                eta_sec = rem_steps * sec_per_step
                 hud.update(
                     epoch=epoch,
                     total_epochs=epochs,
@@ -789,7 +801,7 @@ def train_saccadion_smart(
             val_acc: Dict[str, List[float]] = {
                 k: []
                 for k in [
-                    "total", "wdl_b", "wdl_a", "policy", "pressure", "lh", "orth",
+                    "total", "wdl_b", "wdl_a", "gf_loss", "gf_quiet_mae", "policy", "pressure", "lh", "orth",
                     "noduli", "noduli_margin", "causal", "causal_f1", "vnc2", "imbalance",
                     "active_kc_ratio", "top1_acc", "top3_acc", "wdl_acc", "cp_mae",
                     "shunt_gain", "lob_focus", "mbon_ei_ratio", "lh_veto_mean",
@@ -872,6 +884,7 @@ def train_saccadion_smart(
                 "val_top3_acc": v_mean["top3_acc"],
                 "val_wdl_acc": v_mean["wdl_acc"],
                 "val_cp_mae": v_mean["cp_mae"],
+                "val_gf_quiet_mae": v_mean["gf_quiet_mae"],
                 "est_raw_elo": est_raw_elo,
                 "est_search_elo": est_search_elo,
                 "real_arena_elo": float(a_st.get("real_elo", 0.0)),

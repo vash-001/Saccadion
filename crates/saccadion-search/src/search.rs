@@ -22,6 +22,9 @@ use std::time::{Duration, Instant};
 
 const MAX_PLY: usize = 128;
 const INF: i32 = 32_000;
+const DPM_CORR_SIZE: usize = 16_384;
+const DPM_CORR_MASK: usize = DPM_CORR_SIZE - 1;
+const CONT_DIM: usize = 12 * 64; // 768 (piece_color_idx * 64 + to_sq)
 
 #[derive(Clone, Debug)]
 pub struct SearchConfig {
@@ -90,8 +93,16 @@ struct DnpWorker {
     flushed_q_nodes: u64,
     killers: [[Move; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
+    /// 1-ply & 2-ply Continuation History table [768 * 768] (prev_pc_to -> cur_pc_to).
+    cont_hist: Vec<i16>,
+    /// Capture History table [12 piece_colors][64 to_sq][6 victim_pieces].
+    cap_hist: [[[i32; 6]; 64]; 12],
     countermoves: [[Move; 64]; 64],
-    dpm_corr: [i32; 4096],
+    /// Multi-Scale DPM Structural Correction History (Pawn + White Non-Pawn + Black Non-Pawn).
+    dpm_pawn_corr: Vec<[i32; 2]>,
+    dpm_np_w_corr: Vec<[i32; 2]>,
+    dpm_np_b_corr: Vec<[i32; 2]>,
+    moved_pc_to: [u16; MAX_PLY],
     static_evals: [i32; MAX_PLY],
     nodes: u64,
     q_nodes: u64,
@@ -139,8 +150,13 @@ impl DnpWorker {
             flushed_q_nodes: 0,
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
+            cont_hist: vec![0i16; CONT_DIM * CONT_DIM],
+            cap_hist: [[[0; 6]; 64]; 12],
             countermoves: [[Move::NULL; 64]; 64],
-            dpm_corr: [0; 4096],
+            dpm_pawn_corr: vec![[0; 2]; DPM_CORR_SIZE],
+            dpm_np_w_corr: vec![[0; 2]; DPM_CORR_SIZE],
+            dpm_np_b_corr: vec![[0; 2]; DPM_CORR_SIZE],
+            moved_pc_to: [u16::MAX; MAX_PLY],
             static_evals: [0; MAX_PLY],
             nodes: 0,
             q_nodes: 0,
@@ -199,6 +215,67 @@ impl DnpWorker {
         let h = &mut self.history[stm_idx][mv.from_sq().index()][mv.to_sq().index()];
         let clamped = delta.clamp(-16_384, 16_384);
         *h += clamped - ((*h * clamped.abs()) / 16_384);
+    }
+
+    #[inline(always)]
+    fn update_cont_history(&mut self, prev_idx: u16, cur_idx: u16, delta: i32) {
+        if (prev_idx as usize) < CONT_DIM && (cur_idx as usize) < CONT_DIM {
+            let slot = &mut self.cont_hist[prev_idx as usize * CONT_DIM + cur_idx as usize];
+            let v = *slot as i32;
+            let clamped = delta.clamp(-16_384, 16_384);
+            *slot = (v + clamped - (v * clamped.abs()) / 16_384).clamp(-16_384, 16_384) as i16;
+        }
+    }
+
+    #[inline(always)]
+    fn get_cont_history(&self, ply: usize, cur_idx: u16) -> i32 {
+        if (cur_idx as usize) >= CONT_DIM {
+            return 0;
+        }
+        let mut s = 0i32;
+        if ply >= 1 {
+            let p1 = self.moved_pc_to[ply - 1] as usize;
+            if p1 < CONT_DIM {
+                s += self.cont_hist[p1 * CONT_DIM + cur_idx as usize] as i32;
+            }
+        }
+        if ply >= 2 {
+            let p2 = self.moved_pc_to[ply - 2] as usize;
+            if p2 < CONT_DIM {
+                s += self.cont_hist[p2 * CONT_DIM + cur_idx as usize] as i32;
+            }
+        }
+        s
+    }
+
+    #[inline(always)]
+    fn update_cap_history(&mut self, pc12: usize, to_sq: usize, vic_idx: usize, delta: i32) {
+        let h = &mut self.cap_hist[pc12][to_sq][vic_idx];
+        let clamped = delta.clamp(-16_384, 16_384);
+        *h += clamped - ((*h * clamped.abs()) / 16_384);
+    }
+
+    #[inline(always)]
+    fn dpm_correction(&self, pos: &Position) -> i32 {
+        let stm_i = pos.side_to_move.index();
+        let p_c = self.dpm_pawn_corr[(pos.pawn_hash as usize) & DPM_CORR_MASK][stm_i];
+        let nw_c = self.dpm_np_w_corr[(pos.non_pawn_hash[0] as usize) & DPM_CORR_MASK][stm_i];
+        let nb_c = self.dpm_np_b_corr[(pos.non_pawn_hash[1] as usize) & DPM_CORR_MASK][stm_i];
+        ((p_c * 3 + nw_c * 2 + nb_c * 2) / 28).clamp(-160, 160)
+    }
+
+    #[inline(always)]
+    fn update_dpm_correction(&mut self, pos: &Position, depth: i32, err_cp: i32) {
+        let stm_i = pos.side_to_move.index();
+        let w = (depth * depth + 2 * depth + 1).min(128);
+        let target = (err_cp.clamp(-256, 256)) * 4;
+        let upd = |slot: &mut i32| {
+            let v = *slot;
+            *slot = (v + ((target - v) * w) / 256).clamp(-1024, 1024);
+        };
+        upd(&mut self.dpm_pawn_corr[(pos.pawn_hash as usize) & DPM_CORR_MASK][stm_i]);
+        upd(&mut self.dpm_np_w_corr[(pos.non_pawn_hash[0] as usize) & DPM_CORR_MASK][stm_i]);
+        upd(&mut self.dpm_np_b_corr[(pos.non_pawn_hash[1] as usize) & DPM_CORR_MASK][stm_i]);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -315,9 +392,7 @@ impl DnpWorker {
             }
             (se, Some(out_a), lh_alert, lh_deep, eff_surp)
         };
-        let corr_idx = (pos.hash as usize) & 4095;
-        let static_eval = (raw_static_eval + (self.dpm_corr[corr_idx] / 4).clamp(-100, 100))
-            .clamp(-2600, 2600);
+        let static_eval = (raw_static_eval + self.dpm_correction(pos)).clamp(-2600, 2600);
         self.static_evals[ply] = static_eval;
         let improving = !in_check && ply >= 2 && static_eval > self.static_evals[ply - 2];
         let parent_eval_f32 = out_a_opt
@@ -325,10 +400,10 @@ impl DnpWorker {
             .map(|o| o.total_cp)
             .unwrap_or(static_eval as f32);
 
-        // 3. Reverse Futility Pruning (RFP), Razoring, & Null-Move Pruning (NMP) — vetoed by Lateral Horn!
+        // 3. Reverse Futility Pruning (RFP), Razoring, Null-Move Pruning (NMP), & ProbCut — vetoed by Lateral Horn!
         if !is_pv && !in_check && excluded_move.is_null() && !lh_tactical_alert && !efference_surprise {
-            let rfp_margin = if improving { 75 * depth } else { 95 * depth };
-            if depth <= 4 && static_eval - rfp_margin >= beta {
+            let rfp_margin = if improving { 70 * depth } else { 90 * depth };
+            if depth <= 5 && static_eval - rfp_margin >= beta {
                 return static_eval;
             }
             // Razoring: hopeless shallow positions drop straight into Quiescence
@@ -344,6 +419,7 @@ impl DnpWorker {
                 ^ pos.piece_bb(us, saccadion_chess::types::Piece::King);
             if depth >= 3 && static_eval >= beta && non_pawn.non_empty() {
                 let r = 3 + depth / 4 + ((static_eval - beta) / 200).clamp(0, 2);
+                self.moved_pc_to[ply] = u16::MAX;
                 let undo = pos.make_null_move();
                 let mut dummy_pv = Vec::new();
                 let null_score = -self.pvs(
@@ -367,6 +443,49 @@ impl DnpWorker {
                     return beta;
                 }
             }
+            // ProbCut: if a winning capture easily beats `beta + 190` at reduced depth, prune early!
+            if depth >= 5 && beta.abs() < MATE_THRESHOLD - 256 {
+                let pc_beta = (beta + 190).min(MATE_THRESHOLD - 256);
+                let pc_depth = depth - 4;
+                if tt_depth_val < pc_depth || tt_score_val >= pc_beta {
+                    let mut caps = MoveList::new();
+                    generate_legal_tactical(pos, &mut caps);
+                    for &cmv in caps.as_slice() {
+                        if !pos.see_ge(cmv, (pc_beta - static_eval).max(0)) {
+                            continue;
+                        }
+                        self.moved_pc_to[ply] = pos
+                            .piece_at(cmv.from_sq())
+                            .map(|(c, p)| ((c.index() * 6 + p.index()) * 64 + cmv.to_sq().index()) as u16)
+                            .unwrap_or(u16::MAX);
+                        let undo = pos.make_move(cmv);
+                        let mut q_s = -self.quiescence(pos, ply + 1, -pc_beta, -pc_beta + 1);
+                        if q_s >= pc_beta && !self.aborted {
+                            let mut pc_pv = Vec::new();
+                            q_s = -self.pvs(
+                                pos,
+                                pc_depth,
+                                ply + 1,
+                                -pc_beta,
+                                -pc_beta + 1,
+                                false,
+                                cmv,
+                                Move::NULL,
+                                parent_cent_mask,
+                                0.0,
+                                &mut pc_pv,
+                            );
+                        }
+                        pos.unmake_move(cmv, undo);
+                        if self.aborted {
+                            return 0;
+                        }
+                        if q_s >= pc_beta {
+                            return pc_beta;
+                        }
+                    }
+                }
+            }
         }
 
         // 4. Generate legal moves & handle Checkmate / Stalemate
@@ -376,9 +495,10 @@ impl DnpWorker {
             return if in_check { -MATE_SCORE + ply as i32 } else { 0 };
         }
 
-        // 5. Selective Stream B Deep Strategic Brain (wakes up on deep strategic crossroads,
-        //    PV depth >= 7, or Lateral Horn alerts — keeps tactical tree blazing fast!)
-        let allow_subtree_sb = self.cfg.time_limit_ms == 0 || self.cfg.time_limit_ms > 500;
+        // 5. Selective Stream B Deep Strategic Brain (enabled even in fast 150-250ms games with cap!)
+        let allow_subtree_sb = self.cfg.time_limit_ms == 0
+            || self.cfg.time_limit_ms > 500
+            || (self.cfg.time_limit_ms >= 150 && self.stream_b_evals < 4);
         let need_stream_b = self.cfg.use_stream_b
             && allow_subtree_sb
             && !self.is_helper
@@ -430,7 +550,8 @@ impl DnpWorker {
         } else {
             Move::NULL
         };
-        let mut scored_moves: [(Move, i32, usize, f32); 256] = [(Move::NULL, 0, usize::MAX, 0.0); 256];
+        let mut scored_moves: [(Move, i32, usize, f32, u16, u8); 256] =
+            [(Move::NULL, 0, usize::MAX, 0.0, u16::MAX, 0); 256];
         let mut n_moves = 0usize;
         let stm_idx = pos.side_to_move.index();
         for &mv in moves.as_slice() {
@@ -440,6 +561,11 @@ impl DnpWorker {
             let mut priority = 0i32;
             let mut pfl3_rank = usize::MAX;
             let mut noduli_delta = 0.0f32;
+            let mover_piece = pos.piece_at(mv.from_sq()).map(|(_, p)| p);
+            let pc12 = mover_piece.map(|p| stm_idx * 6 + p.index()).unwrap_or(0);
+            let cur_pc_to = (pc12 * 64 + mv.to_sq().index()) as u16;
+            let vic_piece = pos.piece_at(mv.to_sq()).map(|(_, p)| p);
+            let vic_idx = vic_piece.map(|p| p.index()).unwrap_or(0) as u8;
 
             if mv == tt_move {
                 priority += 2_000_000;
@@ -452,16 +578,11 @@ impl DnpWorker {
                 }
             }
             if mv.is_capture() {
-                let vic = pos
-                    .piece_at(mv.to_sq())
-                    .map(|(_, p)| p.cp_value())
-                    .unwrap_or(100);
-                let atk = pos
-                    .piece_at(mv.from_sq())
-                    .map(|(_, p)| p.cp_value())
-                    .unwrap_or(100);
-                let good_cap = vic >= atk || pos.see_ge(mv, 0);
-                priority += if good_cap { 1_000_000 } else { -200_000 } + vic * 10 - atk;
+                let vic = vic_piece.map(|p| p.cp_value()).unwrap_or(100);
+                let atk = mover_piece.map(|p| p.cp_value()).unwrap_or(100);
+                let ch = self.cap_hist[pc12][mv.to_sq().index()][vic_idx as usize];
+                let good_cap = vic >= atk || pos.see_ge(mv, -(ch / 128).clamp(-80, 80));
+                priority += if good_cap { 1_000_000 } else { -200_000 } + vic * 10 - atk + ch / 16;
             } else if mv.is_promotion() {
                 priority += 950_000;
             } else if mv == self.killers[ply][0] {
@@ -471,9 +592,10 @@ impl DnpWorker {
             } else if mv == self.killers[ply][1] {
                 priority += 350_000;
             } else {
-                priority += self.history[stm_idx][mv.from_sq().index()][mv.to_sq().index()];
+                priority += self.history[stm_idx][mv.from_sq().index()][mv.to_sq().index()]
+                    + self.get_cont_history(ply, cur_pc_to);
             }
-            scored_moves[n_moves] = (mv, priority, pfl3_rank, noduli_delta);
+            scored_moves[n_moves] = (mv, priority, pfl3_rank, noduli_delta, cur_pc_to, vic_idx);
             n_moves += 1;
         }
         if n_moves == 0 {
@@ -494,8 +616,10 @@ impl DnpWorker {
         } else {
             Vec::new()
         };
-        let mut quiets_tried = [Move::NULL; 64];
+        let mut quiets_tried = [(Move::NULL, u16::MAX); 64];
         let mut n_quiets_tried = 0usize;
+        let mut caps_tried = [(0u8, 0u8, 0u8); 32];
+        let mut n_caps_tried = 0usize;
 
         for move_idx in 0..n_moves {
             // Lazy partial selection: find the highest-priority remaining move in O(N)
@@ -510,7 +634,7 @@ impl DnpWorker {
             if best_i != move_idx {
                 scored_moves.swap(move_idx, best_i);
             }
-            let (mv, _, pfl3_rank, noduli_delta) = scored_moves[move_idx];
+            let (mv, _, pfl3_rank, noduli_delta, cur_pc_to, vic_idx) = scored_moves[move_idx];
             let is_quiet = !mv.is_capture() && !mv.is_promotion();
 
             // Late Move Pruning (LMP), Futility Pruning, & Main-Search SEE Pruning
@@ -568,17 +692,21 @@ impl DnpWorker {
                     return 0;
                 }
                 if s_score < s_beta {
-                    ext = 1;
+                    ext = if !is_pv && ply < 24 && s_score < s_beta - 25 { 2 } else { 1 };
                 } else if s_beta >= beta {
                     return s_beta;
                 }
             }
 
             if is_quiet && n_quiets_tried < 64 {
-                quiets_tried[n_quiets_tried] = mv;
+                quiets_tried[n_quiets_tried] = (mv, cur_pc_to);
                 n_quiets_tried += 1;
+            } else if mv.is_capture() && n_caps_tried < 32 {
+                caps_tried[n_caps_tried] = ((cur_pc_to / 64) as u8, mv.to_sq().index() as u8, vic_idx);
+                n_caps_tried += 1;
             }
 
+            self.moved_pc_to[ply] = cur_pc_to;
             let undo = pos.make_move(mv);
             let gives_check = pos.in_check();
             let expected_child_eval = if noduli_delta != 0.0 {
@@ -612,8 +740,9 @@ impl DnpWorker {
                     if !improving {
                         r += 1;
                     }
-                    let hist_v = self.history[stm_idx][mv.from_sq().index()][mv.to_sq().index()];
-                    r -= (hist_v / 4096).clamp(-1, 2);
+                    let hist_v = self.history[stm_idx][mv.from_sq().index()][mv.to_sq().index()]
+                        + self.get_cont_history(ply, cur_pc_to);
+                    r -= (hist_v / 5000).clamp(-2, 2);
                     if pfl3_rank < 3 {
                         r = (r - 3).max(0);
                     }
@@ -691,6 +820,7 @@ impl DnpWorker {
                         pv_out.extend_from_slice(&child_pv);
                     }
                     if alpha >= beta {
+                        let bonus = (depth * depth * 16).min(4096);
                         if is_quiet {
                             if self.killers[ply][0] != mv {
                                 self.killers[ply][1] = self.killers[ply][0];
@@ -699,11 +829,27 @@ impl DnpWorker {
                             if !prev_move.is_null() {
                                 self.countermoves[prev_move.from_sq().index()][prev_move.to_sq().index()] = mv;
                             }
-                            let bonus = (depth * depth * 16).min(4096);
                             self.update_history(stm_idx, mv, bonus);
-                            // History malus on earlier failed quiet moves
-                            for &qm in &quiets_tried[..n_quiets_tried.saturating_sub(1)] {
+                            if ply >= 1 {
+                                self.update_cont_history(self.moved_pc_to[ply - 1], cur_pc_to, bonus);
+                            }
+                            if ply >= 2 {
+                                self.update_cont_history(self.moved_pc_to[ply - 2], cur_pc_to, bonus);
+                            }
+                            // History + Continuation malus on earlier failed quiet moves
+                            for &(qm, q_pc_to) in &quiets_tried[..n_quiets_tried.saturating_sub(1)] {
                                 self.update_history(stm_idx, qm, -bonus / 2);
+                                if ply >= 1 {
+                                    self.update_cont_history(self.moved_pc_to[ply - 1], q_pc_to, -bonus / 2);
+                                }
+                                if ply >= 2 {
+                                    self.update_cont_history(self.moved_pc_to[ply - 2], q_pc_to, -bonus / 2);
+                                }
+                            }
+                        } else if mv.is_capture() {
+                            self.update_cap_history((cur_pc_to / 64) as usize, mv.to_sq().index(), vic_idx as usize, bonus);
+                            for &(c_pc, c_to, c_vic) in &caps_tried[..n_caps_tried.saturating_sub(1)] {
+                                self.update_cap_history(c_pc as usize, c_to as usize, c_vic as usize, -bonus / 2);
                             }
                         }
                         break;
@@ -712,11 +858,17 @@ impl DnpWorker {
             }
         }
 
-        // 7. Live Bounded PAM / 12x PPL1 / Dop1R2 Dopamine Update + DPM Eval Correction Memory
-        if excluded_move.is_null() && depth >= 3 && best_score.abs() < MATE_THRESHOLD {
-            let err = (best_score - raw_static_eval).clamp(-300, 300);
-            self.dpm_corr[corr_idx] = ((self.dpm_corr[corr_idx] * 7 + err * 2) / 8).clamp(-400, 400);
-            if self.cfg.use_dopamine {
+        // 7. Live Bounded PAM / 12x PPL1 / Dop1R2 Dopamine Update + Multi-Scale DPM Structural Correction
+        if excluded_move.is_null() && !in_check && depth >= 2 && best_score.abs() < MATE_THRESHOLD {
+            let quiet_best = !best_move.is_capture() && !best_move.is_promotion();
+            let valid_dpm = quiet_best
+                && ((best_score <= orig_alpha && best_score < static_eval)
+                    || (best_score >= beta && best_score > static_eval)
+                    || (best_score > orig_alpha && best_score < beta));
+            if valid_dpm {
+                self.update_dpm_correction(pos, depth, best_score - raw_static_eval);
+            }
+            if depth >= 3 && self.cfg.use_dopamine {
                 if let Some(ref out_a) = out_a_opt {
                     let delta_cp = best_score as f32 - out_a.total_cp;
                     self.plasticity.apply_dopamine_surprise(
@@ -852,6 +1004,11 @@ pub struct SearchEngine {
     pub stop_flag: Arc<AtomicBool>,
     killers: [[Move; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
+    cont_hist: Vec<i16>,
+    cap_hist: [[[i32; 6]; 64]; 12],
+    dpm_pawn_corr: Vec<[i32; 2]>,
+    dpm_np_w_corr: Vec<[i32; 2]>,
+    dpm_np_b_corr: Vec<[i32; 2]>,
 }
 
 impl SearchEngine {
@@ -867,6 +1024,11 @@ impl SearchEngine {
             stop_flag: Arc::new(AtomicBool::new(false)),
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
+            cont_hist: vec![0i16; CONT_DIM * CONT_DIM],
+            cap_hist: [[[0; 6]; 64]; 12],
+            dpm_pawn_corr: vec![[0; 2]; DPM_CORR_SIZE],
+            dpm_np_w_corr: vec![[0; 2]; DPM_CORR_SIZE],
+            dpm_np_b_corr: vec![[0; 2]; DPM_CORR_SIZE],
         }
     }
 
@@ -882,6 +1044,11 @@ impl SearchEngine {
         self.plasticity.reset_game();
         self.killers = [[Move::NULL; 2]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
+        self.cont_hist.fill(0);
+        self.cap_hist = [[[0; 6]; 64]; 12];
+        self.dpm_pawn_corr.fill([0; 2]);
+        self.dpm_np_w_corr.fill([0; 2]);
+        self.dpm_np_b_corr.fill([0; 2]);
     }
 
     /// Runs iterative-deepening Neuro-Guided PVS with Parallel DNp Lazy SMP, Giant Fiber
@@ -986,8 +1153,13 @@ impl SearchEngine {
             flushed_q_nodes: 0,
             killers: self.killers,
             history: self.history,
+            cont_hist: std::mem::take(&mut self.cont_hist),
+            cap_hist: self.cap_hist,
             countermoves: [[Move::NULL; 64]; 64],
-            dpm_corr: [0; 4096],
+            dpm_pawn_corr: std::mem::take(&mut self.dpm_pawn_corr),
+            dpm_np_w_corr: std::mem::take(&mut self.dpm_np_w_corr),
+            dpm_np_b_corr: std::mem::take(&mut self.dpm_np_b_corr),
+            moved_pc_to: [u16::MAX; MAX_PLY],
             static_evals: [0; MAX_PLY],
             nodes: 0,
             q_nodes: 0,
@@ -1051,7 +1223,8 @@ impl SearchEngine {
                 });
             }
 
-            // Main DNp coordinator runs full iterative deepening + aspiration windows + UCI telemetry
+            // Main DNp coordinator runs full iterative deepening + aspiration windows + PFL2 soft-stop
+            let mut stable_iters = 0u32;
             for depth in 1..=cfg.max_depth {
                 let base_delta = (30.0 + 45.0 * root_sharpness) as i32;
                 let (mut alpha, mut beta) = if depth >= 4 && best_score.abs() < MATE_THRESHOLD - 100 {
@@ -1085,6 +1258,11 @@ impl SearchEngine {
                 completed_depth = depth;
                 best_score = score;
                 if let Some(&m) = pv_line.first() {
+                    if m == best_move {
+                        stable_iters += 1;
+                    } else {
+                        stable_iters = 0;
+                    }
                     best_move = m;
                     best_pv = pv_line;
                 }
@@ -1109,6 +1287,15 @@ impl SearchEngine {
                 if best_score.abs() > MATE_THRESHOLD - 64 {
                     break;
                 }
+                // PFL2 Adaptive Time Management: stop early on quiet, rock-stable moves to save clock!
+                if cfg.time_limit_ms >= 300
+                    && depth >= 8
+                    && stable_iters >= 4
+                    && root_sharpness < 0.45
+                    && snap.elapsed_ms * 100 >= cfg.time_limit_ms * 58
+                {
+                    break;
+                }
             }
 
             // Signal all Parallel DNp helper threads to exit cleanly before scope joins
@@ -1121,6 +1308,11 @@ impl SearchEngine {
         self.strategic_tt = main_worker.strategic_tt;
         self.killers = main_worker.killers;
         self.history = main_worker.history;
+        self.cont_hist = main_worker.cont_hist;
+        self.cap_hist = main_worker.cap_hist;
+        self.dpm_pawn_corr = main_worker.dpm_pawn_corr;
+        self.dpm_np_w_corr = main_worker.dpm_np_w_corr;
+        self.dpm_np_b_corr = main_worker.dpm_np_b_corr;
 
         // DPM Consolidation: transfer root backed-up surprise into intra-game alpha'/beta' fast weights
         if cfg.use_dopamine && completed_depth >= 2 && best_score.abs() < MATE_THRESHOLD {

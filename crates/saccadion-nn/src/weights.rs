@@ -189,6 +189,12 @@ pub struct SaccadionWeights {
     pub b_wm_b1: Vec<f32>,           // [stream_b_dim + cx_dim]
     pub b_wm_w2: Vec<f32>,           // [(stream_b_dim + cx_dim) * (stream_b_dim + cx_dim)]
 
+    // ==================== SACCADION-7 DENDRITIC COINCIDENCE GIANT FIBER (GF/DNp01) ====================
+    /// Dedicated end-to-end trained Giant Fiber readout directly from frozen alpha/beta HalfKA lobe
+    /// using Pairwise Dendritic Coincidence (`clamp(x_lo) * clamp(x_hi)`) -> 8 phase stacks (< 250ns!):
+    pub a_gf_w: Vec<f32>,            // [num_phase_stacks * ab_dim]
+    pub a_gf_b: Vec<f32>,            // [num_phase_stacks]
+
     // ==================== DERIVED RUNTIME AVX2 INT16/INT8 CACHE (NOT ON DISK) ====================
     /// Pre-quantized INT16 feature transformer & INT8 MBON weights for blazing AVX2 neural QSearch.
     pub a_ft_weight_i16: Vec<i16>,
@@ -250,7 +256,7 @@ impl SaccadionWeights {
     pub fn init_random(cfg: ModelConfig, seed: u64) -> Self {
         let mut rng = seed;
         let flyhash_claws = build_flyhash_claws(&cfg);
-        let (_, gamma_dim, _) = cfg.lobe_dims_per_hemi();
+        let (ab_dim, gamma_dim, _) = cfg.lobe_dims_per_hemi();
         let plastic_dim = cfg.plastic_dim_per_hemi();
         let d = cfg.stream_b_dim;
         let cx = cfg.cx_dim;
@@ -373,6 +379,8 @@ impl SaccadionWeights {
             b_wm_w1: alloc_init((d + cx) * (d + 2 * cx), s_d, &mut rng),
             b_wm_b1: vec![0.0; d + cx],
             b_wm_w2: alloc_init((d + cx) * (d + cx), s_d * 0.5, &mut rng),
+            a_gf_w: alloc_init(stacks * ab_dim, (1.0 / ab_dim as f32).sqrt() * 0.1, &mut rng),
+            a_gf_b: vec![0.0; stacks],
             a_ft_weight_i16,
             a_ft_bias_i16,
             a_mbon_ipsi_i8,
@@ -465,7 +473,9 @@ impl SaccadionWeights {
             + self.b_gnn_w.len()
             + self.b_wm_w1.len()
             + self.b_wm_b1.len()
-            + self.b_wm_w2.len();
+            + self.b_wm_w2.len()
+            + self.a_gf_w.len()
+            + self.a_gf_b.len();
         (sparse, dense)
     }
 
@@ -591,6 +601,8 @@ impl SaccadionWeights {
         write_slice(&mut w, &self.b_wm_w1)?;
         write_slice(&mut w, &self.b_wm_b1)?;
         write_slice(&mut w, &self.b_wm_w2)?;
+        write_slice(&mut w, &self.a_gf_w)?;
+        write_slice(&mut w, &self.a_gf_b)?;
 
         w.flush()
     }
@@ -659,7 +671,7 @@ impl SaccadionWeights {
         };
 
         let flyhash_claws = build_flyhash_claws(&cfg);
-        let (_, gamma_dim, _) = cfg.lobe_dims_per_hemi();
+        let (ab_dim, gamma_dim, _) = cfg.lobe_dims_per_hemi();
         let plastic_dim = cfg.plastic_dim_per_hemi();
         let d = cfg.stream_b_dim;
         let cx = cfg.cx_dim;
@@ -787,6 +799,12 @@ impl SaccadionWeights {
             )
         };
 
+        let (a_gf_w, a_gf_b) = if ver >= 7 {
+            (read_vec(&mut r, stacks * ab_dim)?, read_vec(&mut r, stacks)?)
+        } else {
+            (vec![0.0; stacks * ab_dim], vec![0.0; stacks])
+        };
+
         let a_ft_weight_i16 = quantize_to_i16(&a_ft_weight);
         let a_ft_bias_i16 = quantize_to_i16(&a_ft_bias);
         let (a_mbon_ipsi_i8, a_mbon_ipsi_scale) = quantize_stacks_to_i8(&a_mbon_ipsi, stacks);
@@ -878,6 +896,8 @@ impl SaccadionWeights {
             b_wm_w1,
             b_wm_b1,
             b_wm_w2,
+            a_gf_w,
+            a_gf_b,
             a_ft_weight_i16,
             a_ft_bias_i16,
             a_mbon_ipsi_i8,

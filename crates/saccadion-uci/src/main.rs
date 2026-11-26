@@ -7,7 +7,7 @@ use saccadion_chess::perft::perft;
 use saccadion_chess::position::Position;
 use saccadion_chess::types::{Color, MoveList};
 use saccadion_nn::config::ModelConfig;
-use saccadion_nn::stream_a::{evaluate_giant_fiber_cp, evaluate_stream_a};
+use saccadion_nn::stream_a::{evaluate_giant_fiber_cp, evaluate_giant_fiber_fp32, evaluate_stream_a};
 use saccadion_nn::stream_b::evaluate_stream_b;
 use saccadion_nn::weights::SaccadionWeights;
 use saccadion_search::{SearchConfig, SearchEngine, MATE_SCORE, MATE_THRESHOLD};
@@ -149,6 +149,8 @@ fn main() {
         let mut legal = MoveList::new();
         generate_legal(&mut pos, &mut legal);
         let mut ws = saccadion_nn::StreamAWorkspace::new(&weights);
+        let gf_fp32 = evaluate_giant_fiber_fp32(&pos, &weights, &mut ws);
+        let gf_i16 = evaluate_giant_fiber_cp(&pos, &weights, &mut ws);
         let out_a = evaluate_stream_a(&pos, &weights, &mut ws, None, None, 1.0);
         let out_b = evaluate_stream_b(
             &pos,
@@ -162,7 +164,9 @@ fn main() {
             false,
         );
         println!(
-            "PARITY stream_a_slow_cp={:.6} stream_a_wdl={:.6},{:.6},{:.6} stream_b_deep_cp={:.6} stream_b_wdl={:.6},{:.6},{:.6} pfl2={:.6} press={:.6},{:.6},{:.6},{:.6},{:.6}",
+            "PARITY gf_fp32={:.6} gf_i16={} stream_a_slow_cp={:.6} stream_a_wdl={:.6},{:.6},{:.6} stream_b_deep_cp={:.6} stream_b_wdl={:.6},{:.6},{:.6} pfl2={:.6} press={:.6},{:.6},{:.6},{:.6},{:.6}",
+            gf_fp32,
+            gf_i16,
             out_a.slow_cp,
             out_a.wdl_probs[0],
             out_a.wdl_probs[1],
@@ -226,7 +230,7 @@ fn main() {
         }
         match tokens[0] {
             "uci" => {
-                println!("id name Saccadion 6.0 (Drosophila Graph-Brain+INT8+WorldModel)");
+                println!("id name Saccadion 7.0 (Drosophila Neuro-Apex+DendriticGF+GraphBrain)");
                 println!("id author Saccadion Research Team");
                 println!("option name Hash type spin default {} min 1 max 4096", hash_mb);
                 println!("option name Threads type spin default {} min 1 max 64", default_threads);

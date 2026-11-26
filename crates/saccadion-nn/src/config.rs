@@ -3,7 +3,7 @@
 use saccadion_chess::features::{LATERAL_HORN_DIM, STREAM_A_SPARSE_DIM, STREAM_B_SQ_FEAT_DIM};
 
 pub const SACCNET_MAGIC: [u8; 8] = *b"SACCNET1";
-pub const SACCNET_VERSION: u32 = 6;
+pub const SACCNET_VERSION: u32 = 7;
 pub const OPTIC_LAYERS: usize = 3;
 /// Low-rank L1-resident synaptic channel width for 3-lobe (gamma / alpha'-beta' -> MBON) plasticity.
 pub const PLASTIC_RANK: usize = 8;

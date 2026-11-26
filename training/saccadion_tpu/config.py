@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import numpy as np
 
 SACCNET_MAGIC = b"SACCNET1"
-SACCNET_VERSION = 6
+SACCNET_VERSION = 7
 OPTIC_LAYERS = 3
 PLASTIC_RANK = 8
 AMACRINE_RANK = 8

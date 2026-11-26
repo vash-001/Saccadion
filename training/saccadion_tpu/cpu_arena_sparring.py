@@ -46,6 +46,7 @@ class EngineSpec:
     cmd: Optional[List[str]]
     uci_options: Dict[str, str] = field(default_factory=dict)
     is_stockfish: bool = False
+    search_depth: Optional[int] = None
 
 
 def estimate_mle_elo(results: List[Tuple[int, float]]) -> Tuple[float, float]:
@@ -237,14 +238,39 @@ def discover_and_install_multi_engines() -> Tuple[List[EngineSpec], Optional[Pat
                 )
             )
 
-    # Probe diverse non-Stockfish UCI engines and add every verified engine to the gauntlet!
+    # Probe diverse non-Stockfish UCI engines and add depth-calibrated + full-strength tiers
+    # so Saccadion battles ALL 5 engine families right from Epoch 1 at matched Elo!
     third_party_defs = [
-        ("GNUChess-UCI", "GNUChess", 2300, ["gnuchess", "/usr/games/gnuchess", "/usr/bin/gnuchess"], ["--uci"], {}),
-        ("Fruit-2.1", "Fruit", 2680, ["fruit", "/usr/games/fruit", "/usr/bin/fruit"], [], {"Hash": "16"}),
-        ("Glaurung-2.2", "Glaurung", 2750, ["glaurung", "/usr/games/glaurung", "/usr/bin/glaurung"], [], {"Threads": "1", "Hash": "16"}),
-        ("Toga-II", "Toga2", 2800, ["toga2", "/usr/games/toga2", "/usr/bin/toga2"], [], {"Hash": "16"}),
+        (
+            "GNUChess",
+            ["gnuchess", "/usr/games/gnuchess", "/usr/bin/gnuchess"],
+            ["--uci"],
+            {},
+            [("GNUChess-d3", 1650, 3), ("GNUChess-d4", 1950, 4), ("GNUChess-Full", 2300, None)],
+        ),
+        (
+            "Fruit",
+            ["fruit", "/usr/games/fruit", "/usr/bin/fruit"],
+            [],
+            {"Hash": "16"},
+            [("Fruit-d3", 1700, 3), ("Fruit-d4", 2000, 4), ("Fruit-d5", 2300, 5), ("Fruit-2.1", 2680, None)],
+        ),
+        (
+            "Glaurung",
+            ["glaurung", "/usr/games/glaurung", "/usr/bin/glaurung"],
+            [],
+            {"Threads": "1", "Hash": "16"},
+            [("Glaurung-d3", 1750, 3), ("Glaurung-d4", 2050, 4), ("Glaurung-d5", 2350, 5), ("Glaurung-2.2", 2750, None)],
+        ),
+        (
+            "Toga2",
+            ["toga2", "/usr/games/toga2", "/usr/bin/toga2"],
+            [],
+            {"Hash": "16"},
+            [("Toga2-d3", 1800, 3), ("Toga2-d4", 2100, 4), ("Toga2-d5", 2400, 5), ("Toga-II", 2800, None)],
+        ),
     ]
-    for name, family, elo, paths, extra_args, opts in third_party_defs:
+    for family, paths, extra_args, opts, tiers in third_party_defs:
         found = None
         for p in paths:
             resolved = shutil.which(p) if "/" not in p else (p if Path(p).exists() else None)
@@ -254,7 +280,17 @@ def discover_and_install_multi_engines() -> Tuple[List[EngineSpec], Optional[Pat
         if found is not None:
             cmd = [found] + extra_args
             if _probe_uci_binary(cmd):
-                gauntlet.append(EngineSpec(name=name, family=family, elo=elo, cmd=cmd, uci_options=opts))
+                for t_name, t_elo, t_depth in tiers:
+                    gauntlet.append(
+                        EngineSpec(
+                            name=t_name,
+                            family=family,
+                            elo=t_elo,
+                            cmd=cmd,
+                            uci_options=opts,
+                            search_depth=t_depth,
+                        )
+                    )
 
     gauntlet.sort(key=lambda e: e.elo)
     return gauntlet, sf_bin
@@ -349,9 +385,12 @@ class _UciProcess:
         self._send("isready")
         self._read_until("readyok")
 
-    def go(self, fen: str, movetime_ms: int = 80) -> Tuple[Optional[str], Optional[int]]:
+    def go(self, fen: str, movetime_ms: int = 80, depth: Optional[int] = None) -> Tuple[Optional[str], Optional[int]]:
         self._send(f"position fen {fen}")
-        self._send(f"go movetime {movetime_ms}")
+        if depth is not None:
+            self._send(f"go depth {depth} movetime {max(movetime_ms, 150)}")
+        else:
+            self._send(f"go movetime {movetime_ms}")
         lines = self._read_until("bestmove", timeout_s=max(5.0, movetime_ms / 1000.0 + 4.0))
         best_mv = None
         last_cp = None
@@ -518,6 +557,7 @@ class StockfishSparringArena:
         for cand in [
             repo_root / "target" / "release" / "saccadion",
             repo_root / "target" / "release" / "saccadion.exe",
+            Path("/content/drive/MyDrive/Saccadion_TPU/bin_v12/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v11/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v10/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v9/saccadion"),
@@ -761,7 +801,7 @@ class StockfishSparringArena:
                     else:
                         if opp_proc is not None:
                             opp_time = max(35, self.movetime_ms // 2) if spec.is_stockfish else max(40, self.movetime_ms // 2)
-                            mv_u, _ = opp_proc.go(board.fen(), movetime_ms=opp_time)
+                            mv_u, _ = opp_proc.go(board.fen(), movetime_ms=opp_time, depth=spec.search_depth)
                         else:
                             mv_u = _baseline_d2_move(board, rng).uci()
 
