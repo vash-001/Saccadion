@@ -44,6 +44,23 @@ fn read_optional_concepts(shard_path: &Path, expected_len: usize) -> Vec<u16> {
     vec![0u16; expected_len]
 }
 
+fn read_optional_contrast(shard_path: &Path, expected_len: usize) -> Vec<u32> {
+    let mut name = shard_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".contrast.u32");
+    let cpath = shard_path.with_file_name(name);
+    if let Ok(mut f) = File::open(&cpath) {
+        let mut buf = vec![0u8; expected_len * 4];
+        if f.read_exact(&mut buf).is_ok() {
+            let mut out = Vec::with_capacity(expected_len);
+            for chunk in buf.chunks_exact(4) {
+                out.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            return out;
+        }
+    }
+    vec![0u32; expected_len]
+}
+
 fn write_raw_slice<T>(path: &Path, data: &[T]) -> std::io::Result<()> {
     let f = File::create(path)?;
     let mut w = BufWriter::with_capacity(1 << 20, f);
@@ -60,14 +77,17 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
 
     let mut all_recs: Vec<SaccRecord> = Vec::new();
     let mut all_concepts: Vec<u16> = Vec::new();
+    let mut all_contrast: Vec<u32> = Vec::new();
     for p in shard_paths {
         let (_is_traj, recs) = read_sacc_shard(p).unwrap_or_else(|e| {
             eprintln!("Failed to read shard {}: {}", p.display(), e);
             std::process::exit(1);
         });
         let concepts = read_optional_concepts(p, recs.len());
+        let contrast = read_optional_contrast(p, recs.len());
         all_recs.extend(recs);
         all_concepts.extend(concepts);
+        all_contrast.extend(contrast);
     }
 
     let n = all_recs.len();
@@ -77,7 +97,7 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
     }
 
     // Global Cross-Shard Fisher-Yates Interleaving when combining multiple training shards
-    // (Games + Diverse Causal Puzzles + Looming/Endgame Survival) -> eliminates Epoch spikes!
+    // (Games + Diverse Causal Puzzles + Blunder/Brilliant Contrastive + Survival) -> zero spikes!
     if shard_paths.len() > 1 && n > 1 {
         let mut rng_s: u64 = 0x5ACC_AD10_5A11_7777;
         for idx in (1..n).rev() {
@@ -89,6 +109,17 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
             let swap_i = (z as usize) % (idx + 1);
             all_recs.swap(idx, swap_i);
             all_concepts.swap(idx, swap_i);
+            all_contrast.swap(idx, swap_i);
+        }
+    }
+    // Orient blunder_move (low 12 bits of contrast u32) to STM perspective identically to top4_moves!
+    for i in 0..n {
+        let c = all_contrast[i];
+        let bmv = (c & 0x0FFF) as u16;
+        if bmv != 0 {
+            let stm = all_recs[i].meta_flags & 1;
+            let oriented = orient_move_u16(bmv, stm) as u32;
+            all_contrast[i] = (c & !0x0FFF) | (oriented & 0x0FFF);
         }
     }
 
@@ -244,9 +275,10 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
     write_raw_slice(&out_cache_dir.join("vol.f32"), &vol).expect("write vol");
     write_raw_slice(&out_cache_dir.join("threat_64.u8"), &threat_64).expect("write threat_64");
     write_raw_slice(&out_cache_dir.join("causal_bits.u16"), &all_concepts).expect("write causal_bits");
+    write_raw_slice(&out_cache_dir.join("contrast.u32"), &all_contrast).expect("write contrast");
 
     let meta_json = format!(
-        "{{\"count\": {}, \"max_sparse\": {}, \"version\": 5, \"num_shards\": {}}}",
+        "{{\"count\": {}, \"max_sparse\": {}, \"version\": 6, \"num_shards\": {}}}",
         n,
         MAX_SPARSE_CACHE,
         shard_paths.len()

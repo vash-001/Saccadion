@@ -878,6 +878,175 @@ def generate_looming_blunder_shard(
     return {"looming_samples": len(arr_out)}
 
 
+def generate_blunder_brilliant_shard(
+    shard_dir: Path, max_samples: int = 60000
+) -> Dict[str, int]:
+    """Generates Before->After Blunder & Brilliant (`!!`) Contrastive Curriculum!
+
+    Creates `train_random_contrastive.sacc` + `.contrast.u32` sidecar encoding:
+      - bits 0..11  : raw blunder_move_u16 (a verified losing move causing >= 250 cp drop)
+      - bit 12      : is_brilliant flag (1 for verified sacrifices / elite quiet breakthroughs!)
+      - bits 16..31 : blunder_drop_cp (clamped 0..2500 cp exact expected collapse after blunder)
+
+    Teaches Saccadion:
+      1. PPL1 Aversive Avoidance: exact move that causes a loss (Before -> After collapse)
+      2. Live hDelta World Model: simulates `do(m_blunder)` collapsing vs `do(m_brilliant)` winning
+      3. PAM Brilliant Boost (2.2x): recognizes & prioritizes winning sacrifices & quiet tactics!
+    """
+    import chess
+
+    base_shards = sorted(
+        p for p in shard_dir.glob("train_random_*.sacc")
+        if "looming" not in p.name and "contrastive" not in p.name
+    )
+    if not base_shards:
+        return {"contrastive_samples": 0}
+
+    code_to_piece = {
+        1: (chess.WHITE, chess.PAWN), 2: (chess.WHITE, chess.KNIGHT),
+        3: (chess.WHITE, chess.BISHOP), 4: (chess.WHITE, chess.ROOK),
+        5: (chess.WHITE, chess.QUEEN), 6: (chess.WHITE, chess.KING),
+        7: (chess.BLACK, chess.PAWN), 8: (chess.BLACK, chess.KNIGHT),
+        9: (chess.BLACK, chess.BISHOP), 10: (chess.BLACK, chess.ROOK),
+        11: (chess.BLACK, chess.QUEEN), 12: (chess.BLACK, chess.KING),
+    }
+    val_cp = {chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330, chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 0}
+    # Brilliant causal concept bitmask: quietMove(0), zugzwang(1), sacrifice(2), clearance(3), interference(4), deflection(5), overloading(6)
+    brilliant_concept_mask = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6)
+
+    def _find_verified_blunder(b: chess.Board, best_mv_u16: int, rng: np.random.Generator) -> Optional[Tuple[int, int]]:
+        """Finds a real legal blunder move (hanging piece / fatal drop >= 250 cp) distinct from best_move."""
+        best_cands = []
+        for mv in b.legal_moves:
+            mv_u = (mv.from_square << 6) | mv.to_square
+            if mv_u == best_mv_u16:
+                continue
+            pc = b.piece_at(mv.from_square)
+            if pc is None or pc.piece_type == chess.KING:
+                continue
+            # Check if moving piece onto an enemy-attacked square loses >= 250 cp net material!
+            if not b.is_attacked_by(not b.turn, mv.to_square):
+                continue
+            vic = b.piece_at(mv.to_square)
+            cap_val = val_cp[vic.piece_type] if vic else 0
+            b.push(mv)
+            if b.is_checkmate():
+                b.pop()
+                continue
+            # Estimate opponent's cheapest recapture on mv.to_square
+            opp_gain = 0
+            if b.is_attacked_by(b.turn, mv.to_square):
+                defended = b.is_attacked_by(not b.turn, mv.to_square)
+                min_atk = 900
+                for sq_a in b.attackers(b.turn, mv.to_square):
+                    pa = b.piece_at(sq_a)
+                    if pa:
+                        min_atk = min(min_atk, val_cp[pa.piece_type])
+                opp_gain = val_cp[pc.piece_type] - (min_atk if defended else 0)
+            b.pop()
+            net_drop = opp_gain - cap_val
+            if net_drop >= 250:
+                best_cands.append((net_drop, mv_u))
+        if not best_cands:
+            return None
+        best_cands.sort(key=lambda x: x[0], reverse=True)
+        drop_cp, bmv_u = best_cands[int(rng.integers(0, min(3, len(best_cands))))]
+        return bmv_u, int(min(2500, drop_cp))
+
+    def _is_material_sacrifice(b: chess.Board, best_mv_u16: int) -> bool:
+        """Detects a Brilliant Sacrifice (`!!`): moving a piece onto an enemy-attacked square
+        where net immediate capture value is negative (>= 150 cp sacrificed), yet it IS best_move!"""
+        u, v = (best_mv_u16 >> 6) & 63, best_mv_u16 & 63
+        pc = b.piece_at(u)
+        if pc is None or pc.piece_type in (chess.PAWN, chess.KING):
+            return False
+        if not b.is_attacked_by(not b.turn, v):
+            return False
+        vic = b.piece_at(v)
+        cap_val = val_cp[vic.piece_type] if vic else 0
+        return (val_cp[pc.piece_type] - cap_val) >= 180
+
+    rng = np.random.default_rng(202607)
+    out_recs: List[np.ndarray] = []
+    out_concepts: List[int] = []
+    out_contrast: List[int] = []
+    n_blunder = 0
+    n_brilliant = 0
+
+    print(f"Generating up to {max_samples:,} Before->After Blunder & Brilliant (`!!`) Contrastive records...")
+    # Prioritize puzzles shard first (rich in real sacrifices & quiet brilliant moves), then games!
+    ordered_shards = sorted(base_shards, key=lambda p: (0 if "puzzle" in p.name else 1, p.name))
+    per_shard = max(3000, (max_samples // max(1, len(ordered_shards))) * 2)
+
+    for sp in ordered_shards:
+        if len(out_recs) >= max_samples:
+            break
+        raw = sp.read_bytes()
+        if len(raw) <= 16:
+            continue
+        arr = np.frombuffer(raw, dtype=SACC_RECORD_DTYPE, offset=16)
+        if len(arr) == 0:
+            continue
+        cpath = sp.with_name(sp.name + ".concepts.u16")
+        concepts = (
+            np.fromfile(cpath, dtype="<u2", count=len(arr))
+            if cpath.exists() and cpath.stat().st_size == len(arr) * 2
+            else np.zeros((len(arr),), dtype=np.uint16)
+        )
+        idxs = rng.choice(len(arr), size=min(len(arr), per_shard), replace=False)
+        for idx in idxs:
+            if len(out_recs) >= max_samples:
+                break
+            ii = int(idx)
+            r = arr[ii]
+            c_bits = int(concepts[ii])
+            b = chess.Board.empty()
+            nib = r["board_nibbles"]
+            for sq in range(64):
+                code = (int(nib[sq >> 1]) >> ((sq & 1) * 4)) & 0xF
+                if code in code_to_piece:
+                    col, pt = code_to_piece[code]
+                    b.set_piece_at(sq, chess.Piece(pt, col))
+            flags = int(r["meta_flags"])
+            b.turn = chess.WHITE if (flags & 1) == 0 else chess.BLACK
+            if not b.is_valid():
+                continue
+
+            bmv_u = int(r["best_move_u16"])
+            if bmv_u == 0:
+                continue
+            is_bril = bool(c_bits & brilliant_concept_mask) or _is_material_sacrifice(b, bmv_u)
+            blunder_info = _find_verified_blunder(b, bmv_u, rng)
+            if blunder_info is None and not is_bril:
+                continue
+
+            bmv_bad, drop_cp = blunder_info if blunder_info is not None else (0, 0)
+            packed = (bmv_bad & 0x0FFF) | ((1 if is_bril else 0) << 12) | ((drop_cp & 0xFFFF) << 16)
+            out_recs.append(r.copy())
+            out_concepts.append(c_bits)
+            out_contrast.append(packed)
+            if bmv_bad != 0:
+                n_blunder += 1
+            if is_bril:
+                n_brilliant += 1
+
+    if not out_recs:
+        return {"contrastive_samples": 0}
+
+    out_path = shard_dir / "train_random_contrastive.sacc"
+    arr_out = np.asarray(out_recs, dtype=SACC_RECORD_DTYPE)
+    with open(out_path, "wb") as f:
+        f.write(struct.pack("<8sII", SACC_SHARD_MAGIC, 0, len(arr_out)))
+        f.write(arr_out.tobytes())
+    np.asarray(out_concepts, dtype="<u2").tofile(out_path.with_name(out_path.name + ".concepts.u16"))
+    np.asarray(out_contrast, dtype="<u4").tofile(out_path.with_name(out_path.name + ".contrast.u32"))
+    print(
+        f"Saved {len(arr_out):,} Blunder/Brilliant Contrastive records "
+        f"(blunders={n_blunder:,}, brilliant={n_brilliant:,}) -> {out_path}"
+    )
+    return {"contrastive_samples": len(arr_out), "blunder_pairs": n_blunder, "brilliant_moves": n_brilliant}
+
+
 def fetch_and_prepare(
     out_dir: Path,
     source: str = "auto",
@@ -952,7 +1121,11 @@ def fetch_and_prepare(
         rust_bin = _find_rust_packer(repo_root)
 
     # Clear old shards before writing fresh split
-    for old in list(shard_dir.glob("*.sacc")) + list(shard_dir.glob("*.concepts.u16")):
+    for old in (
+        list(shard_dir.glob("*.sacc"))
+        + list(shard_dir.glob("*.concepts.u16"))
+        + list(shard_dir.glob("*.contrast.u32"))
+    ):
         old.unlink()
 
     if rust_bin is not None:
@@ -987,6 +1160,9 @@ def fetch_and_prepare(
 
     looming_stats = generate_looming_blunder_shard(shard_dir, max_samples=40000)
     stats.update(looming_stats)
+
+    contrast_stats = generate_blunder_brilliant_shard(shard_dir, max_samples=60000)
+    stats.update(contrast_stats)
 
     manifest = {
         "source": source,

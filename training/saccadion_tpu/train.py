@@ -366,7 +366,7 @@ def _print_epoch_banner(row: Dict[str, Any], is_best: bool) -> None:
     )
     print(
         f"  CAUSAL  : 16-Concept F1={row['val_causal_f1']*100:5.1f}% | NoduliGap={row['val_noduli_margin']:+.3f} | "
-        f"VNC-2Ply={row['val_vnc2']:.4f} | CausalLoss={row['val_causal']:.4f}"
+        f"VNC-2Ply={row['val_vnc2']:.4f} | CausalLoss={row['val_causal']:.4f} | Imb={row.get('val_imbalance', 0.0):.4f}"
     )
     print(
         f"  CHESS   : Move Top-1={row['val_top1_acc']:5.2f}% | Move Top-3={row['val_top3_acc']:5.2f}% | "
@@ -535,7 +535,7 @@ def train_saccadion_smart(
                 cent_mask=out_b["cent_kc_mask"], qat=qat, dropout_key=k2, kc_drop_rate=0.08,
             )
             return compute_multitask_loss(
-                out_a_steered, out_b, batch, apl_target_active=apl_target, apl_weight=apl_w
+                out_a_steered, out_b, batch, apl_target_active=apl_target, apl_weight=apl_w, params=cur_p
             )
 
         if use_pmap:
@@ -583,7 +583,7 @@ def train_saccadion_smart(
                 cent_mask=out_b["cent_kc_mask"], qat=qat,
             )
             _, m = compute_multitask_loss(
-                out_a_s, out_b, batch, apl_target_active=apl_target, apl_weight=apl_w
+                out_a_s, out_b, batch, apl_target_active=apl_target, apl_weight=apl_w, params=p
             )
             # Chess accuracy & calibration telemetry
             pol = out_b["policy_logits"]
@@ -790,7 +790,7 @@ def train_saccadion_smart(
                 k: []
                 for k in [
                     "total", "wdl_b", "wdl_a", "policy", "pressure", "lh", "orth",
-                    "noduli", "noduli_margin", "causal", "causal_f1", "vnc2",
+                    "noduli", "noduli_margin", "causal", "causal_f1", "vnc2", "imbalance",
                     "active_kc_ratio", "top1_acc", "top3_acc", "wdl_acc", "cp_mae",
                     "shunt_gain", "lob_focus", "mbon_ei_ratio", "lh_veto_mean",
                     "rc_hub_norm", "cx_phasor_norm", "cent_focus", "plan_entropy", "pfl2_mean",
@@ -867,6 +867,7 @@ def train_saccadion_smart(
                 "val_causal": v_mean["causal"],
                 "val_causal_f1": v_mean["causal_f1"],
                 "val_vnc2": v_mean["vnc2"],
+                "val_imbalance": v_mean["imbalance"],
                 "val_top1_acc": v_mean["top1_acc"],
                 "val_top3_acc": v_mean["top3_acc"],
                 "val_wdl_acc": v_mean["wdl_acc"],

@@ -34,13 +34,170 @@ def sparse_topk_policy_loss(
     top4_moves: jnp.ndarray,     # [B, 4] int32
     top4_probs: jnp.ndarray,     # [B, 4] float32 (sums to 1.0)
     label_smoothing: float = 0.05,
+    sample_weights: jnp.ndarray | None = None,  # [B] optional PAM Brilliant boost (e.g., 2.2x on sacrifices!)
 ) -> jnp.ndarray:
     log_p = jax.nn.log_softmax(policy_logits, axis=-1)
     gathered = jnp.take_along_axis(log_p, top4_moves, axis=-1)
-    nll = -jnp.mean(jnp.sum(top4_probs * gathered, axis=-1))
-    # Smooth entropy regularizer prevents overconfident logit memorization on 4096 classes
-    smooth = -jnp.mean(log_p)
-    return (1.0 - label_smoothing) * nll + label_smoothing * smooth
+    nll_b = -jnp.sum(top4_probs * gathered, axis=-1)
+    smooth_b = -jnp.mean(log_p, axis=-1)
+    per_b = (1.0 - label_smoothing) * nll_b + label_smoothing * smooth_b
+    if sample_weights is not None:
+        return jnp.sum(per_b * sample_weights) / jnp.maximum(jnp.sum(sample_weights), 1.0)
+    return jnp.mean(per_b)
+
+
+def compute_positional_imbalance_targets(board_feats: jnp.ndarray) -> jnp.ndarray:
+    """Computes 10 Grandmaster Dynamic Piece-Value & Chess-Imbalance targets directly on TPU!
+
+    Teaches Saccadion (zero Rust latency!) that:
+      0. Board openness (open vs closed pawn structure)
+      1. Bishops dominate OPEN boards: (stm_B - opp_B) * openness
+      2. Knights dominate CLOSED boards: (stm_N - opp_N) * (1 - openness)
+      3. Bishop Pair advantage scaled by openness
+      4. Knight Outposts (advanced knights defended by STM & unattacked by Opp)
+      5. Rooks on open files & 7th rank
+      6. Advanced Passed Pawn power
+      7. King Safety & King-Ring attack differential
+      8. Central 16-square space control
+      9. Dynamic context-adjusted piece-value material balance!
+    """
+    stm_p, stm_n, stm_b, stm_r, stm_q = (board_feats[..., i] for i in range(5))
+    opp_p, opp_n, opp_b, opp_r, opp_q = (board_feats[..., i] for i in range(6, 11))
+    stm_atk, opp_atk = board_feats[..., 36], board_feats[..., 37]
+    stm_kr, opp_kr = board_feats[..., 39], board_feats[..., 40]
+    open_f, passed_p = board_feats[..., 41], board_feats[..., 42]
+    file_n, rank_n = board_feats[..., 43], board_feats[..., 44]
+
+    center_16 = (
+        (file_n >= 0.25) & (file_n <= 0.75) & (rank_n >= 0.25) & (rank_n <= 0.75)
+    ).astype(jnp.float32)
+    center_pawns = jnp.sum((stm_p + opp_p) * center_16, axis=1)
+    openness = jnp.clip(
+        0.55 * jnp.mean(open_f, axis=1) + 0.45 * (1.0 - jnp.clip(center_pawns / 5.0, 0.0, 1.0)),
+        0.0,
+        1.0,
+    )
+
+    n_stm_b = jnp.sum(stm_b, axis=1)
+    n_opp_b = jnp.sum(opp_b, axis=1)
+    n_stm_n = jnp.sum(stm_n, axis=1)
+    n_opp_n = jnp.sum(opp_n, axis=1)
+
+    t0 = 2.0 * openness - 1.0
+    t1 = jnp.tanh((n_stm_b - n_opp_b) * openness)
+    t2 = jnp.tanh((n_stm_n - n_opp_n) * (1.0 - openness))
+    t3 = ((n_stm_b >= 1.5).astype(jnp.float32) - (n_opp_b >= 1.5).astype(jnp.float32)) * (0.4 + 0.6 * openness)
+
+    stm_out = jnp.sum(
+        stm_n * ((rank_n >= 0.40) & (rank_n <= 0.88)).astype(jnp.float32) * stm_atk * (1.0 - opp_atk),
+        axis=1,
+    )
+    opp_out = jnp.sum(
+        opp_n * ((rank_n >= 0.12) & (rank_n <= 0.60)).astype(jnp.float32) * opp_atk * (1.0 - stm_atk),
+        axis=1,
+    )
+    t4 = jnp.tanh(stm_out - opp_out)
+
+    stm_r7 = jnp.sum(stm_r * (open_f + (rank_n > 0.80).astype(jnp.float32)), axis=1)
+    opp_r7 = jnp.sum(opp_r * (open_f + (rank_n < 0.20).astype(jnp.float32)), axis=1)
+    t5 = jnp.tanh(0.5 * (stm_r7 - opp_r7))
+
+    t6 = jnp.tanh(jnp.sum(passed_p * stm_p * rank_n, axis=1) - jnp.sum(passed_p * opp_p * (1.0 - rank_n), axis=1))
+    t7 = jnp.tanh(
+        0.25 * (
+            jnp.sum(opp_kr * stm_atk, axis=1)
+            - jnp.sum(stm_kr * opp_atk, axis=1)
+            + jnp.sum(stm_kr * stm_p, axis=1)
+            - jnp.sum(opp_kr * opp_p, axis=1)
+        )
+    )
+    t8 = jnp.tanh(0.20 * jnp.sum(center_16 * (stm_atk - opp_atk), axis=1))
+
+    dyn_mat = (
+        jnp.sum(stm_p - opp_p, axis=1) * 1.0
+        + (n_stm_n - n_opp_n) * (3.2 + 0.45 * (1.0 - openness))
+        + (n_stm_b - n_opp_b) * (3.3 + 0.55 * openness)
+        + jnp.sum(stm_r - opp_r, axis=1) * (5.0 + 0.30 * openness)
+        + jnp.sum(stm_q - opp_q, axis=1) * 9.0
+    )
+    t9 = jnp.tanh(dyn_mat / 5.0)
+    return jnp.stack([t0, t1, t2, t3, t4, t5, t6, t7, t8, t9], axis=-1)
+
+
+def blunder_repulsion_loss(
+    policy_logits: jnp.ndarray,     # [B, 4096]
+    noduli_delta_map: jnp.ndarray,  # [B, 4096] in [-1, 1]
+    best_move: jnp.ndarray,         # [B] int32
+    blunder_move: jnp.ndarray,      # [B] int32 (0 = none)
+    blunder_drop_cp: jnp.ndarray,   # [B] float32
+) -> jnp.ndarray:
+    """PPL1 Aversive Blunder Repulsion: actively drives down P(m_blunder) and Noduli(m_blunder)!"""
+    bsz = policy_logits.shape[0]
+    row = jnp.arange(bsz)
+    mask = ((blunder_move > 0) & (blunder_move != best_move) & (blunder_drop_cp >= 150.0)).astype(jnp.float32)
+    probs = jax.nn.softmax(policy_logits, axis=-1)
+    p_bad = probs[row, blunder_move]
+    repel_pol = -jnp.log(jnp.clip(1.0 - p_bad, 1e-5, 1.0))
+
+    nod_bad = noduli_delta_map[row, blunder_move]
+    nod_good = noduli_delta_map[row, best_move]
+    repel_nod = jax.nn.relu(nod_bad + 0.55) + jax.nn.relu(0.85 - (nod_good - nod_bad))
+    denom = jnp.maximum(jnp.sum(mask), 1.0)
+    return jnp.sum((2.0 * repel_pol + 0.5 * repel_nod) * mask) / denom
+
+
+def wm_blunder_contrast_loss(
+    params: Dict[str, jnp.ndarray],
+    out_b: Dict[str, jnp.ndarray],
+    best_move: jnp.ndarray,
+    blunder_move: jnp.ndarray,
+    blunder_drop_cp: jnp.ndarray,
+    wdl_target: jnp.ndarray,
+) -> jnp.ndarray:
+    """Before->After Live hDelta World Model Supervision:
+    Teaches exported `b_wm_w1/b1/w2` that `do(m_blunder)` collapses future WDL by `-drop_cp`
+    while `do(m_best)` preserves/achieves the clean target WDL!
+    """
+    bsz = best_move.shape[0]
+    row = jnp.arange(bsz)
+    mask = ((blunder_move > 0) & (blunder_move != best_move) & (blunder_drop_cp >= 150.0)).astype(jnp.float32)
+
+    z0 = jax.lax.stop_gradient(out_b["global_latent"])
+    aq = jax.lax.stop_gradient(out_b["aligned_q"])
+    ck = jax.lax.stop_gradient(out_b["contra_k"])
+    w_wdl = jax.lax.stop_gradient(params["b_wdl_w"])
+    b_wdl = jax.lax.stop_gradient(params["b_wdl_b"])
+
+    def _imagined_wdl_logits(mv_u: jnp.ndarray) -> jnp.ndarray:
+        u = (mv_u >> 6) & 63
+        v = mv_u & 63
+        act_emb = aq[row, u] - ck[row, v]
+        wm_in = jnp.concatenate([z0, act_emb], axis=-1)
+        h = jax.nn.silu(jnp.einsum("bi,hi->bh", wm_in, params["b_wm_w1"]) + params["b_wm_b1"])
+        z_fut = z0 + jnp.einsum("bh,oh->bo", h, params["b_wm_w2"])
+        return jnp.einsum("bg,kg->bk", z_fut, w_wdl) + b_wdl
+
+    logits_bad = _imagined_wdl_logits(blunder_move)
+    logits_good = _imagined_wdl_logits(best_move)
+
+    # Compute exact collapsed post-blunder WDL target: cp_after = cp_before - drop_cp
+    exp_before = jnp.clip(wdl_target[:, 0] - wdl_target[:, 2], -0.99, 0.99)
+    cp_before = 400.0 * jnp.arctanh(exp_before)
+    cp_after = jnp.clip(cp_before - blunder_drop_cp, -2500.0, 2500.0)
+    w_a = jax.nn.sigmoid((cp_after - 90.0) / 140.0)
+    l_a = jax.nn.sigmoid((-cp_after - 90.0) / 140.0)
+    d_a = jnp.maximum(0.02, 1.0 - w_a - l_a)
+    s_a = w_a + d_a + l_a
+    wdl_after = jnp.stack([w_a / s_a, d_a / s_a, l_a / s_a], axis=-1)
+
+    def _kl_vec(logits: jnp.ndarray, t_probs: jnp.ndarray) -> jnp.ndarray:
+        log_p = jax.nn.log_softmax(logits, axis=-1)
+        safe_t = jnp.clip(t_probs, 1e-6, 1.0)
+        return jnp.sum(safe_t * (jnp.log(safe_t) - log_p), axis=-1)
+
+    per_b = _kl_vec(logits_bad, wdl_after) + 0.5 * _kl_vec(logits_good, wdl_target)
+    denom = jnp.maximum(jnp.sum(mask), 1.0)
+    return jnp.sum(per_b * mask) / denom
 
 
 def creative_orthogonality_loss(plans: jnp.ndarray) -> jnp.ndarray:
@@ -129,8 +286,9 @@ def compute_multitask_loss(
     apl_target_active: float = 0.08,
     apl_weight: float = 0.05,
     jepa_target_latent: jnp.ndarray | None = None,
+    params: Dict[str, jnp.ndarray] | None = None,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
-    """Computes full weighted 11-sensor causal multi-task loss and diagnostic scalar metrics."""
+    """Computes full weighted 14-sensor causal, dynamic-imbalance, & blunder/brilliant loss."""
     wdl_t = batch["wdl_target"]
 
     # 1. Deep Supervision across all Central Complex deliberation ticks + Stream A + B->A Distill
@@ -149,9 +307,11 @@ def compute_multitask_loss(
     loss_cp_b = huber_loss(out_b["pred_cp"] / 400.0, target_cp_scaled, delta=0.5)
     loss_wdl = loss_wdl_b + loss_wdl_a + 0.30 * loss_b_to_a + 0.45 * (loss_cp_a + loss_cp_b)
 
-    # 2. Sparse Top-4 PFL3 Policy Loss
+    # 2. Sparse Top-4 PFL3 Policy Loss with 2.2x PAM Brilliant Move (`!!`) Boost!
+    is_bril = batch.get("is_brilliant")
+    pol_weights = (1.0 + 1.2 * is_bril) if is_bril is not None else None
     loss_policy = sparse_topk_policy_loss(
-        out_b["policy_logits"], batch["top4_moves"], batch["top4_probs"]
+        out_b["policy_logits"], batch["top4_moves"], batch["top4_probs"], sample_weights=pol_weights
     )
 
     # 3. 10-20 Ply Strategic Pressure Trajectory Loss
@@ -206,6 +366,29 @@ def compute_multitask_loss(
     else:
         loss_vnc2 = jnp.array(0.0, dtype=jnp.float32)
 
+    # 12. 10-Dim Grandmaster Dynamic Piece-Value & Imbalance Supervision (Stream B + Stream A!)
+    imb_targets = compute_positional_imbalance_targets(batch["board_feats"])
+    loss_imbalance = (
+        huber_loss(out_b["imbalance_pred_b"], imb_targets, delta=0.25)
+        + 0.6 * huber_loss(out_a["imbalance_pred_a"], imb_targets, delta=0.25)
+    )
+
+    # 13. PPL1 Aversive Blunder Repulsion + 14. Before->After Live hDelta World Model Blunder Contrast!
+    if "blunder_move" in batch and "blunder_drop_cp" in batch:
+        loss_blunder_repel = blunder_repulsion_loss(
+            out_b["policy_logits"], out_b["noduli_delta_map"], best_mv,
+            batch["blunder_move"], batch["blunder_drop_cp"],
+        )
+        if params is not None and "b_wm_w1" in params:
+            loss_wm_contrast = wm_blunder_contrast_loss(
+                params, out_b, best_mv, batch["blunder_move"], batch["blunder_drop_cp"], wdl_t
+            )
+        else:
+            loss_wm_contrast = jnp.array(0.0, dtype=jnp.float32)
+    else:
+        loss_blunder_repel = jnp.array(0.0, dtype=jnp.float32)
+        loss_wm_contrast = jnp.array(0.0, dtype=jnp.float32)
+
     total = (
         loss_wdl
         + 0.65 * loss_policy
@@ -219,6 +402,9 @@ def compute_multitask_loss(
         + 0.25 * loss_noduli
         + 0.65 * loss_causal
         + 0.12 * loss_vnc2
+        + 0.35 * loss_imbalance
+        + 0.30 * loss_blunder_repel
+        + 0.25 * loss_wm_contrast
     )
     metrics = {
         "total": total,
@@ -233,6 +419,9 @@ def compute_multitask_loss(
         "causal": loss_causal,
         "causal_f1": causal_f1,
         "vnc2": loss_vnc2,
+        "imbalance": loss_imbalance,
+        "blunder_repel": loss_blunder_repel,
+        "wm_contrast": loss_wm_contrast,
         "active_kc_ratio": out_a["active_kc_ratio"],
         # All-12 Drosophila Brain Circuits live telemetry
         "shunt_gain": out_b["shunt_gain"],

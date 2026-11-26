@@ -607,6 +607,21 @@ def _load_optional_concepts(shard_path: Path, count: int) -> np.ndarray:
     return np.zeros((count,), dtype=np.uint16)
 
 
+def _load_optional_contrast(shard_path: Path, count: int) -> np.ndarray:
+    cpath = shard_path.with_name(shard_path.name + ".contrast.u32")
+    if cpath.exists() and cpath.stat().st_size == count * 4:
+        return np.fromfile(cpath, dtype="<u4", count=count)
+    return np.zeros((count,), dtype=np.uint32)
+
+
+def _unpack_contrast_u32(cu: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Unpacks oriented contrast u32 -> (blunder_move int32, blunder_drop_cp float32, is_brilliant float32)."""
+    bmv = (cu & np.uint32(0x0FFF)).astype(np.int32)
+    is_bril = ((cu >> np.uint32(12)) & np.uint32(1)).astype(np.float32)
+    drop_cp = ((cu >> np.uint32(16)) & np.uint32(0xFFFF)).astype(np.float32)
+    return bmv, drop_cp, is_bril
+
+
 def _decode_chunk_worker(
     args: Tuple[bytes, int]
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -636,10 +651,9 @@ def _find_rust_data_binary() -> Optional[Path]:
     for cand in [
         repo_root / "target" / "release" / "saccadion-data",
         repo_root / "target" / "release" / "saccadion-data.exe",
+        Path("/content/drive/MyDrive/Saccadion_TPU/bin_v11/saccadion-data"),
         Path("/content/drive/MyDrive/Saccadion_TPU/bin_v10/saccadion-data"),
         Path("/content/drive/MyDrive/Saccadion_TPU/bin_v9/saccadion-data"),
-        Path("/content/drive/MyDrive/Saccadion_TPU/bin_v8/saccadion-data"),
-        Path("/content/drive/MyDrive/Saccadion_TPU/bin_v7/saccadion-data"),
     ]:
         if cand.exists():
             return cand
@@ -655,6 +669,10 @@ def _shards_fingerprint(shard_paths: List[Path]) -> str:
         if cp.exists():
             cst = cp.stat()
             h.update(f"c:{cst.st_size}:{int(cst.st_mtime)}|".encode())
+        kp = p.with_name(p.name + ".contrast.u32")
+        if kp.exists():
+            kst = kp.stat()
+            h.update(f"k:{kst.st_size}:{int(kst.st_mtime)}|".encode())
     return h.hexdigest()[:16]
 
 
@@ -689,12 +707,12 @@ def build_or_open_memmap_cache(
     if not shard_paths:
         return None
     fp = _shards_fingerprint(shard_paths)
-    cdir = cache_root / f"{split_name}_v5_{fp}"
+    cdir = cache_root / f"{split_name}_v6_{fp}"
     meta_file = cdir / "meta.json"
     if meta_file.exists():
         try:
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
-            if meta.get("version") == 5 and int(meta.get("count", 0)) > 0:
+            if meta.get("version") == 6 and int(meta.get("count", 0)) > 0:
                 return cdir
         except Exception:
             pass
@@ -702,7 +720,7 @@ def build_or_open_memmap_cache(
     cdir.mkdir(parents=True, exist_ok=True)
     rust_bin = _find_rust_data_binary()
     if rust_bin is not None:
-        print(f"[FastCache] Rust multi-threaded pre-decoding `{split_name}` ({len(shard_paths)} shards, FlyWire Chess-Graph + LC4)...")
+        print(f"[FastCache] Rust multi-threaded pre-decoding `{split_name}` ({len(shard_paths)} shards, Graph+LC4+Blunder/Brilliant)...")
         res = subprocess.run(
             [str(rust_bin), "predecode", str(cdir)] + [str(p) for p in shard_paths],
             capture_output=True,
@@ -712,7 +730,7 @@ def build_or_open_memmap_cache(
         if res.returncode == 0 and meta_file.exists():
             try:
                 m_chk = json.loads(meta_file.read_text(encoding="utf-8"))
-                if m_chk.get("version") == 5:
+                if m_chk.get("version") == 6:
                     print(" ", res.stdout.strip())
                     return cdir
             except Exception:
@@ -723,6 +741,7 @@ def build_or_open_memmap_cache(
     t0 = time.time()
     recs_list: List[np.ndarray] = []
     concepts_list: List[np.ndarray] = []
+    contrast_list: List[np.ndarray] = []
     for p in shard_paths:
         with open(p, "rb") as f:
             hdr = f.read(16)
@@ -732,15 +751,18 @@ def build_or_open_memmap_cache(
         arr = np.memmap(p, dtype=SACC_RECORD_DTYPE, mode="r", offset=16, shape=(count,))
         recs_list.append(arr)
         concepts_list.append(_load_optional_concepts(p, count))
+        contrast_list.append(_load_optional_contrast(p, count))
 
     all_recs = np.concatenate(recs_list, axis=0)
     all_concepts = np.concatenate(concepts_list, axis=0)
+    all_contrast = np.concatenate(contrast_list, axis=0)
     n = len(all_recs)
     # Global cross-shard shuffle prevents contiguous puzzle/survival blocks from skewing epochs!
     if len(shard_paths) > 1 and n > 1:
         g_perm = np.random.default_rng(202605).permutation(n)
         all_recs = all_recs[g_perm]
         all_concepts = all_concepts[g_perm]
+        all_contrast = all_contrast[g_perm]
     n_workers = max(1, min(os.cpu_count() or 2, 8))
     chunk_sz = max(512, min(8192, (n + n_workers * 4 - 1) // (n_workers * 4)))
     print(
@@ -809,9 +831,13 @@ def build_or_open_memmap_cache(
     threat_u8 = ((tm >> shifts) & np.uint64(1)).astype(np.uint8)
     threat_u8.tofile(cdir / "threat_64.u8")
     np.ascontiguousarray(all_concepts, dtype="<u2").tofile(cdir / "causal_bits.u16")
+    bmv_raw = (all_contrast & np.uint32(0x0FFF)).astype(np.uint16)
+    bmv_ori = _orient_move_u16_vec(bmv_raw, stm_arr).astype(np.uint32)
+    contrast_ori = (all_contrast & np.uint32(0xFFFF_F000)) | (bmv_ori & np.uint32(0x0FFF))
+    np.ascontiguousarray(contrast_ori, dtype="<u4").tofile(cdir / "contrast.u32")
 
     meta_file.write_text(
-        json.dumps({"count": n, "max_sparse": max_sparse, "version": 5, "num_shards": len(shard_paths)}),
+        json.dumps({"count": n, "max_sparse": max_sparse, "version": 6, "num_shards": len(shard_paths)}),
         encoding="utf-8",
     )
     dt = max(1e-3, time.time() - t0)
@@ -842,6 +868,7 @@ class SaccShardDataset:
 
         self.records_list: List[np.ndarray] = []
         self.concepts_list: List[np.ndarray] = []
+        self.contrast_list: List[np.ndarray] = []
         for p in shard_paths:
             with open(p, "rb") as f:
                 hdr = f.read(16)
@@ -851,6 +878,7 @@ class SaccShardDataset:
             arr = np.memmap(p, dtype=SACC_RECORD_DTYPE, mode="r", offset=16, shape=(count,))
             self.records_list.append(arr)
             self.concepts_list.append(_load_optional_concepts(p, count))
+            self.contrast_list.append(_load_optional_contrast(p, count))
         self.records = (
             np.concatenate(self.records_list, axis=0)
             if self.records_list
@@ -860,6 +888,11 @@ class SaccShardDataset:
             np.concatenate(self.concepts_list, axis=0)
             if self.concepts_list
             else np.empty(0, dtype=np.uint16)
+        )
+        self.contrast = (
+            np.concatenate(self.contrast_list, axis=0)
+            if self.contrast_list
+            else np.empty(0, dtype=np.uint32)
         )
         self._count = len(self.records)
 
@@ -886,6 +919,8 @@ class SaccShardDataset:
         self._vol = np.memmap(cdir / "vol.f32", dtype="<f4", mode="r", shape=(n,))
         self._th = np.memmap(cdir / "threat_64.u8", dtype=np.uint8, mode="r", shape=(n, 64))
         self._cb = np.memmap(cdir / "causal_bits.u16", dtype="<u2", mode="r", shape=(n,))
+        cpath = cdir / "contrast.u32"
+        self._ct = np.memmap(cpath, dtype="<u4", mode="r", shape=(n,)) if cpath.exists() else np.zeros((n,), dtype=np.uint32)
 
     def __len__(self) -> int:
         return self._count
@@ -895,6 +930,7 @@ class SaccShardDataset:
             cb = np.asarray(self._cb[indices], dtype=np.uint16)
             causal_concepts = ((cb[:, None] >> _BIT_SHIFTS_16[None, :]) & np.uint16(1)).astype(np.float32)
             causal_mask = (cb > 0).astype(np.float32)
+            bmv, bdrop, is_bril = _unpack_contrast_u32(np.asarray(self._ct[indices], dtype=np.uint32))
             return {
                 "sparse_stm": np.asarray(self._sp_s[indices], dtype=np.int32),
                 "sparse_opp": np.asarray(self._sp_o[indices], dtype=np.int32),
@@ -912,6 +948,9 @@ class SaccShardDataset:
                 "threat_map_64": np.asarray(self._th[indices], dtype=np.float32),
                 "causal_concepts": causal_concepts,
                 "causal_mask": causal_mask,
+                "blunder_move": bmv,
+                "blunder_drop_cp": bdrop,
+                "is_brilliant": is_bril,
             }
 
         bsz = len(indices)
@@ -930,6 +969,7 @@ class SaccShardDataset:
         vol = np.zeros((bsz,), dtype=np.float32)
         threat = np.zeros((bsz, 64), dtype=np.float32)
         cb = np.zeros((bsz,), dtype=np.uint16)
+        ct = np.zeros((bsz,), dtype=np.uint32)
 
         for i, ridx in enumerate(indices):
             ii = int(ridx)
@@ -949,9 +989,13 @@ class SaccShardDataset:
             for sq in range(64):
                 threat[i, sq] = 1.0 if (tm & (1 << sq)) else 0.0
             cb[i] = self.concepts[ii]
+            c_raw = int(self.contrast[ii])
+            bmv_ori = _orient_move_u16_scalar(c_raw & 0x0FFF, stm_i)
+            ct[i] = (c_raw & 0xFFFF_F000) | (bmv_ori & 0x0FFF)
 
         causal_concepts = ((cb[:, None] >> _BIT_SHIFTS_16[None, :]) & np.uint16(1)).astype(np.float32)
         causal_mask = (cb > 0).astype(np.float32)
+        bmv, bdrop, is_bril = _unpack_contrast_u32(ct)
         return {
             "sparse_stm": sp_s,
             "sparse_opp": sp_o,
@@ -969,6 +1013,9 @@ class SaccShardDataset:
             "threat_map_64": threat,
             "causal_concepts": causal_concepts,
             "causal_mask": causal_mask,
+            "blunder_move": bmv,
+            "blunder_drop_cp": bdrop,
+            "is_brilliant": is_bril,
         }
 
     def _load_contiguous_chunk(self, start: int, end: int) -> Dict[str, np.ndarray]:
@@ -976,6 +1023,7 @@ class SaccShardDataset:
         cb = np.asarray(self._cb[start:end], dtype=np.uint16)
         causal_concepts = ((cb[:, None] >> _BIT_SHIFTS_16[None, :]) & np.uint16(1)).astype(np.float32)
         causal_mask = (cb > 0).astype(np.float32)
+        bmv, bdrop, is_bril = _unpack_contrast_u32(np.asarray(self._ct[start:end], dtype=np.uint32))
         return {
             "sparse_stm": np.asarray(self._sp_s[start:end], dtype=np.int32),
             "sparse_opp": np.asarray(self._sp_o[start:end], dtype=np.int32),
@@ -993,6 +1041,9 @@ class SaccShardDataset:
             "threat_map_64": np.asarray(self._th[start:end], dtype=np.float32),
             "causal_concepts": causal_concepts,
             "causal_mask": causal_mask,
+            "blunder_move": bmv,
+            "blunder_drop_cp": bdrop,
+            "is_brilliant": is_bril,
         }
 
     def iter_batches(
@@ -1148,6 +1199,11 @@ def augment_batch_file_mirror(
     nm = batch["next_move"].copy()
     nm[do_flip] = _mirror_mv(nm[do_flip])
     out["next_move"] = nm
+
+    if "blunder_move" in batch:
+        bm = batch["blunder_move"].copy()
+        bm[do_flip] = _mirror_mv(bm[do_flip])
+        out["blunder_move"] = bm
 
     th = batch["threat_map_64"].copy()
     th[do_flip] = th[do_flip][:, _SQ_MIRROR_IDX]

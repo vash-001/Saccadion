@@ -163,6 +163,12 @@ def init_saccadion_params(cfg: SaccadionConfig, seed: int = 42) -> Dict[str, jnp
         # Training-only 2-Ply VNC Causal Consequence Head (predicts m_{t+2} enabled by m_t)
         "aux_vnc2_q": u((cx, d), s_d),
         "aux_vnc2_k": u((cx, d), s_d),
+        # Training-only 10-Dim Grandmaster Dynamic Piece-Value & Imbalance Heads (zero Rust latency!)
+        # Teaches open-board Bishops, closed-board Knights, Outposts, Rooks on 7th, King Safety!
+        "aux_imb_b_w": u((10, d + cx), s_d),
+        "aux_imb_b_b": jnp.zeros((10,), dtype=jnp.float32),
+        "aux_imb_a_w": u((10, mbon), float((1.0 / mbon) ** 0.5 * 0.3)),
+        "aux_imb_a_b": jnp.zeros((10,), dtype=jnp.float32),
         # Learnable meta-plasticity scalars (Dop1R1 PAM/PPL1, trace rho, Dop1R2, SOC, DPM consolidation)
         "meta_eta_pam": jnp.array(-2.484, dtype=jnp.float32),
         "meta_eta_ppl1": jnp.array(-1.130, dtype=jnp.float32),
@@ -309,6 +315,10 @@ def forward_stream_a(
     wdl_logits = wdl_logits_raw + jnp.stack([sez_l, jnp.zeros_like(sez_l), -sez_l], axis=-1)
 
     mbon_summary = mbon_stm - 0.5 * mbon_opp
+    if "aux_imb_a_w" in params:
+        imbalance_pred_a = jnp.tanh(jnp.einsum("bm,km->bk", mbon_summary, params["aux_imb_a_w"]) + params["aux_imb_a_b"])
+    else:
+        imbalance_pred_a = jnp.zeros((bsz, 10), dtype=jnp.float32)
     mbon_e = jnp.mean(jnp.abs(mbon_stm[:, :half_mbon]))
     mbon_i = jnp.mean(jnp.abs(mbon_stm[:, half_mbon:]))
     return {
@@ -317,6 +327,7 @@ def forward_stream_a(
         "wdl_logits": wdl_logits,
         "lh_veto": lh_veto,
         "mbon_summary": mbon_summary,
+        "imbalance_pred_a": imbalance_pred_a,
         "kc_stm": kc_stm,
         "kc_opp": kc_opp,
         "kc_gamma_stm": kc_gamma_stm,
@@ -569,6 +580,12 @@ def forward_stream_b(
     else:
         vnc2_logits = policy_flat
 
+    # Training-only 10-Dim Grandmaster Dynamic Piece-Value & Imbalance Readout [B, 10]
+    if "aux_imb_b_w" in params:
+        imbalance_pred_b = jnp.tanh(jnp.einsum("bg,kg->bk", global_vec, params["aux_imb_b_w"]) + params["aux_imb_b_b"])
+    else:
+        imbalance_pred_b = jnp.zeros((bsz, 10), dtype=jnp.float32)
+
     # Top-Down Stream B -> Stream A Seed & Centrifugal KC Mask
     seed_latent = jnp.tanh(jnp.einsum("bg,rg->br", global_vec, params["b_seed_down"]))
     gamma_seed = jnp.einsum("br,gr->bg", seed_latent, params["b_seed_to_gamma"])
@@ -583,6 +600,7 @@ def forward_stream_b(
         "noduli_delta_map": noduli_delta_map,
         "causal_logits": causal_logits,
         "vnc2_logits": vnc2_logits,
+        "imbalance_pred_b": imbalance_pred_b,
         "pfl2_sharpness": pfl2_sharpness,
         "strategic_pressure": strategic_pressure,
         "creative_plans": plans,

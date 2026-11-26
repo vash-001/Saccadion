@@ -120,9 +120,9 @@ def main() -> None:
     # 3. Install lightweight Python packages
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "optax", "python-chess", "zstandard", "matplotlib"])
 
-    # 4. Build or restore Pure-Rust tools (v10 = Saccadion-6.2 Register-Resident AVX2 MBON + Zero-Alloc PVS!)
+    # 4. Build or restore Pure-Rust tools (v11 = Saccadion-6.3 Graph+Contrastive Blunder/Brilliant+10-Dim Imbalance!)
     if in_colab and BUILD_RUST_TOOLS:
-        _ensure_rust_binaries(work_root, persist_root / "bin_v10")
+        _ensure_rust_binaries(work_root, persist_root / "bin_v11")
 
     # 5. Purge any stale in-memory `saccadion_tpu.*` submodules before importing!
     train_pkg_root = str(work_root / "training")
@@ -137,6 +137,7 @@ def main() -> None:
     from saccadion_tpu.fetch_and_prepare_data import (
         download_and_pack_elite_causal_puzzles,
         fetch_and_prepare,
+        generate_blunder_brilliant_shard,
         generate_looming_blunder_shard,
     )
     from saccadion_tpu.train import train_saccadion_smart
@@ -163,6 +164,8 @@ def main() -> None:
             )
         if not (shard_dir / "train_random_looming.sacc").exists():
             generate_looming_blunder_shard(shard_dir, max_samples=40000)
+        if not (shard_dir / "train_random_contrastive.sacc").exists():
+            generate_blunder_brilliant_shard(shard_dir, max_samples=60000)
 
     # 7. Launch Smart Epoch-by-Epoch Causal TPU Training with 50x FastCache, 20Hz HUD, & CPU Arena
     cfg = {
