@@ -2,8 +2,8 @@
 //! and ultra-fast multi-threaded pre-decoding into memmap tensor caches for Colab TPU training.
 
 use saccadion_chess::features::{
-    extract_bilateral_sparse, extract_lateral_horn_features, extract_stream_b_board,
-    LATERAL_HORN_DIM, STREAM_B_SQ_FEAT_DIM,
+    extract_bilateral_sparse, extract_chess_graph_adj, extract_lateral_horn_features,
+    extract_stream_b_board, LATERAL_HORN_DIM, STREAM_B_SQ_FEAT_DIM,
 };
 use saccadion_data::format::{f32_to_f16, read_sacc_shard, write_sacc_shard, SaccRecord};
 use saccadion_data::pgn::parse_pgn_text;
@@ -14,7 +14,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const MAX_SPARSE_CACHE: usize = 80;
+const MAX_SPARSE_CACHE: usize = 96;
 
 #[inline(always)]
 fn orient_move_u16(mv: u16, stm: u32) -> u16 {
@@ -95,6 +95,8 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
     let mut sp_stm = vec![-1i16; n * MAX_SPARSE_CACHE];
     let mut sp_opp = vec![-1i16; n * MAX_SPARSE_CACHE];
     let mut board_f16 = vec![0u16; n * 64 * STREAM_B_SQ_FEAT_DIM];
+    // Bit-packed 4-channel FlyWire Chess-Graph adjacency: [n, 4, 64, 2] u32 (lo/hi 32 bits of u64)
+    let mut graph_adj_u32 = vec![0u32; n * 4 * 64 * 2];
     let mut lh_feat = vec![0.0f32; n * LATERAL_HORN_DIM];
     let mut phase = vec![0u8; n];
     let mut wdl = vec![0.0f32; n * 3];
@@ -116,6 +118,7 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
         let mut rem_sp_s = sp_stm.as_mut_slice();
         let mut rem_sp_o = sp_opp.as_mut_slice();
         let mut rem_bd = board_f16.as_mut_slice();
+        let mut rem_gadj = graph_adj_u32.as_mut_slice();
         let mut rem_lh = lh_feat.as_mut_slice();
         let mut rem_ph = phase.as_mut_slice();
         let mut rem_wdl = wdl.as_mut_slice();
@@ -137,6 +140,8 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
             rem_sp_o = rest;
             let (c_bd, rest) = rem_bd.split_at_mut(len * 64 * STREAM_B_SQ_FEAT_DIM);
             rem_bd = rest;
+            let (c_gadj, rest) = rem_gadj.split_at_mut(len * 4 * 64 * 2);
+            rem_gadj = rest;
             let (c_lh, rest) = rem_lh.split_at_mut(len * LATERAL_HORN_DIM);
             rem_lh = rest;
             let (c_ph, rest) = rem_ph.split_at_mut(len);
@@ -181,6 +186,17 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
                         }
                     }
 
+                    let gadj = extract_chess_graph_adj(&pos);
+                    let dst_g = &mut c_gadj[i * 512..(i + 1) * 512];
+                    for k in 0..4 {
+                        for u in 0..64 {
+                            let bits = gadj[k][u];
+                            let off = (k * 64 + u) * 2;
+                            dst_g[off] = bits as u32;
+                            dst_g[off + 1] = (bits >> 32) as u32;
+                        }
+                    }
+
                     let lh = extract_lateral_horn_features(&pos);
                     c_lh[i * LATERAL_HORN_DIM..(i + 1) * LATERAL_HORN_DIM].copy_from_slice(&lh);
 
@@ -216,6 +232,7 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
     write_raw_slice(&out_cache_dir.join("sparse_stm.i16"), &sp_stm).expect("write sparse_stm");
     write_raw_slice(&out_cache_dir.join("sparse_opp.i16"), &sp_opp).expect("write sparse_opp");
     write_raw_slice(&out_cache_dir.join("board_feats.f16"), &board_f16).expect("write board_feats");
+    write_raw_slice(&out_cache_dir.join("graph_adj.u32"), &graph_adj_u32).expect("write graph_adj");
     write_raw_slice(&out_cache_dir.join("lh_feat.f32"), &lh_feat).expect("write lh_feat");
     write_raw_slice(&out_cache_dir.join("phase.u8"), &phase).expect("write phase");
     write_raw_slice(&out_cache_dir.join("wdl.f32"), &wdl).expect("write wdl");
@@ -229,7 +246,7 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
     write_raw_slice(&out_cache_dir.join("causal_bits.u16"), &all_concepts).expect("write causal_bits");
 
     let meta_json = format!(
-        "{{\"count\": {}, \"max_sparse\": {}, \"version\": 4, \"num_shards\": {}}}",
+        "{{\"count\": {}, \"max_sparse\": {}, \"version\": 5, \"num_shards\": {}}}",
         n,
         MAX_SPARSE_CACHE,
         shard_paths.len()

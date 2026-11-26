@@ -15,6 +15,7 @@ import numpy as np
 
 from .config import (
     AMACRINE_RANK,
+    GRAPH_EDGE_TYPES,
     OPTIC_LAYERS,
     PLASTIC_RANK,
     SACCNET_MAGIC,
@@ -102,6 +103,12 @@ SACCNET_TENSOR_ORDER = [
     "b_cx_ln_g",
     "b_cx_ln_b",
     "b_fc2_conj",
+    "b_gnn_ln_g",
+    "b_gnn_ln_b",
+    "b_gnn_w",
+    "b_wm_w1",
+    "b_wm_b1",
+    "b_wm_w2",
 ]
 
 
@@ -232,6 +239,12 @@ def init_numpy_params(cfg: SaccadionConfig, seed: int = 1234) -> Dict[str, np.nd
         "b_cx_ln_g": np.ones((cx,), dtype=np.float32),
         "b_cx_ln_b": np.zeros((cx,), dtype=np.float32),
         "b_fc2_conj": u((cx, 2 * cx), s_cx * 0.5),
+        "b_gnn_ln_g": np.ones((d,), dtype=np.float32),
+        "b_gnn_ln_b": np.zeros((d,), dtype=np.float32),
+        "b_gnn_w": u((GRAPH_EDGE_TYPES, d, d), s_d * 0.5),
+        "b_wm_w1": u((d + cx, d + 2 * cx), s_d),
+        "b_wm_b1": np.zeros((d + cx,), dtype=np.float32),
+        "b_wm_w2": u((d + cx, d + cx), s_d * 0.5),
     }
 
 
@@ -283,7 +296,7 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
             rec["board_nibbles"][sq >> 1] |= code << 4
     # stm=0, castling=0xF (<<1), ep=0, halfmove=0, phase=7 (30 non-king / 4 -> min 7)
     rec["meta_flags"] = (0x0F << 1) | (7 << 17)
-    sp_s, sp_o, board, lh_feat, phase = decode_record_features(rec, max_sparse=96)
+    sp_s, sp_o, board, graph_adj, lh_feat, phase = decode_record_features(rec, max_sparse=96)
 
     # Stream A reference forward pass (NumPy mirror of model.py + SEZ innate valence)
     ab_dim, _, _ = cfg.lobe_dims_per_hemi()
@@ -322,6 +335,22 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
     inh = np.maximum(board @ params["b_shunt_inh"].T, 0.0)
     leak = np.log1p(np.exp(params["b_shunt_leak"])) + 0.5
     sq_state = exc / (leak + inh) + board @ params["b_lc_w"].T + params["b_optic_b"]
+
+    # B1a. FlyWire Typed Directed Chess-Graph GNN (Dale's Law +ACh STM vs -GABA Opp)
+    shifts32 = np.arange(32, dtype=np.uint32)
+    lo_b = ((graph_adj[..., 0:1] >> shifts32) & np.uint32(1)).astype(np.float32)
+    hi_b = ((graph_adj[..., 1:2] >> shifts32) & np.uint32(1)).astype(np.float32)
+    adj_f = np.concatenate([lo_b, hi_b], axis=-1)  # [4, 64, 64]
+    adj_norm = adj_f / (np.sum(adj_f, axis=1, keepdims=True) + 1.0)
+
+    def _apply_gnn_hop(cur_sq: np.ndarray) -> np.ndarray:
+        x_g = _ln(cur_sq, params["b_gnn_ln_g"], params["b_gnn_ln_b"])
+        agg = np.einsum("kuv,ud->kvd", adj_norm, x_g)
+        proj = np.einsum("kvd,ked->kve", agg, params["b_gnn_w"])
+        signed = proj[0] + proj[1] - proj[2] - proj[3]
+        return cur_sq + _silu(signed)
+
+    sq_state = _apply_gnn_hop(sq_state)
     hubs = params["b_hub_init"].copy()
     cx_p = np.zeros((sectors, cx_d), dtype=np.float32)
     inv_sd = 1.0 / np.sqrt(d)
@@ -352,6 +381,8 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
         fg = _silu(x2 @ params["b_opt_fg"][l_idx].T)
         fu = x2 @ params["b_opt_fu"][l_idx].T
         sq_state = sq_state + (fg * fu) @ params["b_opt_fd"][l_idx].T
+        if l_idx == 0:
+            sq_state = _apply_gnn_hop(sq_state)
 
     for _ in range(cfg.cx_max_ticks):
         int_h = hubs[:n_int]

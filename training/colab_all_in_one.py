@@ -120,9 +120,9 @@ def main() -> None:
     # 3. Install lightweight Python packages
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "optax", "python-chess", "zstandard", "matplotlib"])
 
-    # 4. Build or restore Pure-Rust tools (v7 = Saccadion-5 3-Lobe + Amacrine + INT16 + Global Shuffle!)
+    # 4. Build or restore Pure-Rust tools (v8 = Saccadion-6 FlyWire GNN + INT8 MBON + LC4 + WorldModel!)
     if in_colab and BUILD_RUST_TOOLS:
-        _ensure_rust_binaries(work_root, persist_root / "bin_v7")
+        _ensure_rust_binaries(work_root, persist_root / "bin_v8")
 
     # 5. Purge any stale in-memory `saccadion_tpu.*` submodules before importing!
     train_pkg_root = str(work_root / "training")
@@ -171,8 +171,8 @@ def main() -> None:
         "pro": SaccadionConfig.pro,
     }[MODEL_TIER]()
 
-    ckpt_dir = persist_root / f"checkpoints_{MODEL_TIER}_v5"
-    export_dir = persist_root / f"exports_{MODEL_TIER}_v5"
+    ckpt_dir = persist_root / f"checkpoints_{MODEL_TIER}_v6"
+    export_dir = persist_root / f"exports_{MODEL_TIER}_v6"
     fast_cache = Path("/content/sacc_cache") if in_colab else (data_dir / "cache")
 
     _, history = train_saccadion_smart(

@@ -19,6 +19,7 @@ import numpy as np
 
 from .config import (
     AMACRINE_RANK,
+    GRAPH_EDGE_TYPES,
     NUM_CAUSAL_CONCEPTS,
     OPTIC_LAYERS,
     PLASTIC_RANK,
@@ -149,16 +150,19 @@ def init_saccadion_params(cfg: SaccadionConfig, seed: int = 42) -> Dict[str, jnp
         "b_cx_ln_g": jnp.ones((cx,), dtype=jnp.float32),
         "b_cx_ln_b": jnp.zeros((cx,), dtype=jnp.float32),
         "b_fc2_conj": u((cx, 2 * cx), s_cx * 0.5),
+        # Saccadion-6 FlyWire Typed Directed Chess-Graph GNN + Live hDelta World Model (exported to v6!)
+        "b_gnn_ln_g": jnp.ones((d,), dtype=jnp.float32),
+        "b_gnn_ln_b": jnp.zeros((d,), dtype=jnp.float32),
+        "b_gnn_w": u((GRAPH_EDGE_TYPES, d, d), s_d * 0.5),
+        "b_wm_w1": u((d + cx, d + 2 * cx), s_d),
+        "b_wm_b1": jnp.zeros((d + cx,), dtype=jnp.float32),
+        "b_wm_w2": u((d + cx, d + cx), s_d * 0.5),
         # Training-only AOTU -> LAL -> SMP 16-Causal-Concept Effectome Head (zero Rust latency!)
         "aux_causal_w": u((NUM_CAUSAL_CONCEPTS, d + cx), s_d),
         "aux_causal_b": jnp.full((NUM_CAUSAL_CONCEPTS,), -0.5, dtype=jnp.float32),
         # Training-only 2-Ply VNC Causal Consequence Head (predicts m_{t+2} enabled by m_t)
         "aux_vnc2_q": u((cx, d), s_d),
         "aux_vnc2_k": u((cx, d), s_d),
-        # Training-only Action-Conditioned hDelta Latent World Model (predicts z_{t+2} from z_t + do(m_t))
-        "aux_wm_w1": u((d + cx, d + 2 * cx), s_d),
-        "aux_wm_b1": jnp.zeros((d + cx,), dtype=jnp.float32),
-        "aux_wm_w2": u((d + cx, d + cx), s_d * 0.5),
         # Learnable meta-plasticity scalars (Dop1R1 PAM/PPL1, trace rho, Dop1R2, SOC, DPM consolidation)
         "meta_eta_pam": jnp.array(-2.484, dtype=jnp.float32),
         "meta_eta_ppl1": jnp.array(-1.130, dtype=jnp.float32),
@@ -332,8 +336,10 @@ def forward_stream_b(
     mbon_summary: jnp.ndarray, # [B, 32] float32
     num_ticks: int,
     sez_cp: jnp.ndarray | None = None,
+    graph_adj_u32: jnp.ndarray | None = None,  # [B, 4, 64, 2] uint32 FlyWire Chess-Graph adjacency
     serotonin: float = 1.0,
     qat: bool = False,
+    causal_drop_key: Any | None = None,
 ) -> Dict[str, Any]:
     """Batched Stream B Deep Strategic Brain matching `crates/saccadion-nn/src/stream_b.rs`."""
     bsz = board_feats.shape[0]
@@ -352,6 +358,31 @@ def forward_stream_b(
     leak = jax.nn.softplus(params["b_shunt_leak"]) + 0.5
     lc = jnp.einsum("bsf,df->bsd", board_feats, w_lc)
     sq_state = (exc.astype(jnp.float32) / (leak + inh.astype(jnp.float32))) + lc + params["b_optic_b"]
+
+    # B1a. FlyWire Typed Directed Chess-Graph GNN (Dale's Law +ACh STM vs -GABA Opp)
+    if graph_adj_u32 is not None:
+        bit_shifts = jnp.arange(32, dtype=jnp.uint32)
+        lo_bits = ((graph_adj_u32[..., 0:1] >> bit_shifts) & jnp.uint32(1)).astype(jnp.float32)
+        hi_bits = ((graph_adj_u32[..., 1:2] >> bit_shifts) & jnp.uint32(1)).astype(jnp.float32)
+        adj_f = jnp.concatenate([lo_bits, hi_bits], axis=-1)  # [B, 4, 64, 64]
+        in_deg = jnp.sum(adj_f, axis=2, keepdims=True)        # [B, 4, 1, 64]
+        adj_norm = adj_f / (in_deg + 1.0)
+    else:
+        adj_norm = None
+
+    w_gnn = ste_quantize(params["b_gnn_w"], 8, qat)
+
+    def apply_flywire_gnn_hop(cur_sq: jnp.ndarray) -> jnp.ndarray:
+        if adj_norm is None:
+            return cur_sq
+        x_g = layer_norm(cur_sq, params["b_gnn_ln_g"], params["b_gnn_ln_b"])
+        agg = jnp.einsum("bkuv,bud->bkvd", adj_norm, x_g)
+        proj = jnp.einsum("bkvd,ked->bkve", agg, w_gnn)
+        signed = proj[:, 0] + proj[:, 1] - proj[:, 2] - proj[:, 3]
+        return cur_sq + jax.nn.silu(signed)
+
+    # Hop 1: immediate 1-hop attack/defense synaptic propagation right after T4/T5 Shunting
+    sq_state = apply_flywire_gnn_hop(sq_state)
 
     hubs = jnp.broadcast_to(params["b_hub_init"][None, :, :], (bsz, n_int + cfg.num_broadcasters, d))
     cx_phasor = jnp.zeros((bsz, sectors, cx_d), dtype=jnp.float32)
@@ -418,6 +449,9 @@ def forward_stream_b(
         fg = jax.nn.silu(jnp.einsum("bsd,fd->bsf", x2, wfg_l))
         fu = jnp.einsum("bsd,fd->bsf", x2, wfu_l)
         sq_state = sq_state + jnp.einsum("bsf,df->bsd", fg * fu, wfd_l)
+        # Hop 2 after Layer 0: 2-hop transitive battery/pin/overload propagation across chess graph!
+        if l_idx == 0:
+            sq_state = apply_flywire_gnn_hop(sq_state)
 
     # Weight-tied Central Complex + Rich-Club deliberation loop
     sez_vec = sez_cp if sez_cp is not None else jnp.zeros((bsz,), dtype=jnp.float32)
@@ -513,9 +547,15 @@ def forward_stream_b(
     nod_to = jnp.einsum("bvc,c->bv", contra_k, params["b_noduli_w"]) * inv_sqrt_cx     # [B, 64]
     noduli_delta_map = jnp.tanh(nod_from[:, :, None] - nod_to[:, None, :] + params["b_noduli_b"]).reshape((bsz, 4096))
 
-    # Training-only AOTU -> LAL -> SMP 16-Causal-Concept Logits [B, 16]
+    # Training-only AOTU -> LAL -> SMP 16-Causal-Concept Logits [B, 16] (with 25% head dropout)
     if "aux_causal_w" in params:
-        causal_logits = jnp.einsum("bg,kg->bk", global_vec, params["aux_causal_w"]) + params["aux_causal_b"]
+        if causal_drop_key is not None:
+            keep_c = 0.75
+            c_mask = (jax.random.uniform(causal_drop_key, global_vec.shape) < keep_c).astype(jnp.float32) / keep_c
+            c_in = global_vec * c_mask
+        else:
+            c_in = global_vec
+        causal_logits = jnp.einsum("bg,kg->bk", c_in, params["aux_causal_w"]) + params["aux_causal_b"]
     else:
         causal_logits = jnp.zeros((bsz, NUM_CAUSAL_CONCEPTS), dtype=jnp.float32)
 
@@ -574,8 +614,8 @@ def predict_action_world_model(
     v = move_u16 & 63
     act_emb = out_b["aligned_q"][row, u] - out_b["contra_k"][row, v]  # [B, cx_d]
     wm_in = jnp.concatenate([out_b["global_latent"], act_emb], axis=-1)
-    h = jax.nn.silu(jnp.einsum("bi,hi->bh", wm_in, params["aux_wm_w1"]) + params["aux_wm_b1"])
-    return out_b["global_latent"] + jnp.einsum("bh,oh->bo", h, params["aux_wm_w2"])
+    h = jax.nn.silu(jnp.einsum("bi,hi->bh", wm_in, params["b_wm_w1"]) + params["b_wm_b1"])
+    return out_b["global_latent"] + jnp.einsum("bh,oh->bo", h, params["b_wm_w2"])
 
 
 def meta_dopamine_trajectory_scan(

@@ -9,14 +9,15 @@
 //! - B6. PFL3 (99% Contralateral) Policy, PFL2 (50/50) Urgency Gain, Noduli Efference Copy,
 //!       10-20 Ply Strategic Pressure Forecast, and Top-Down Seed Injection -> Stream A.
 
-use crate::config::{AMACRINE_RANK, OPTIC_LAYERS};
+use crate::config::{AMACRINE_RANK, GRAPH_EDGE_TYPES, OPTIC_LAYERS};
 use crate::plasticity::DopaminePlasticityState;
 use crate::simd::{dot_f32, layer_norm, sigmoid, silu, softmax_inplace, softplus};
 use crate::stream_a::wdl_to_cp;
 use crate::weights::SaccadionWeights;
-use saccadion_chess::features::extract_stream_b_board;
+use saccadion_chess::features::{extract_chess_graph_adj, extract_stream_b_board};
 use saccadion_chess::position::Position;
 use saccadion_chess::types::{Move, MoveList};
+use saccadion_chess::Bitboard;
 
 /// Scored move returned by PFL3 99%-contralateral goal-vector steering + Noduli expectation.
 #[derive(Copy, Clone, Debug)]
@@ -56,6 +57,66 @@ pub struct StreamBOutput {
 fn matvec(w: &[f32], x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
     for r in 0..rows {
         out[r] = dot_f32(&w[r * cols..(r + 1) * cols], x);
+    }
+}
+
+/// FlyWire Dale's-Law Typed Directed Chess-Graph Message Passing (GNN) over live piece edges:
+/// Propagates signed synaptic messages along STM Attack (+E), STM Defend (+E),
+/// Opp Attack (-I), and Opp Defend (-I) edges directly across the 64-square chess graph!
+fn apply_flywire_gnn_hop(sq_state: &mut [f32], graph_adj: &[[u64; 64]; 4], w: &SaccadionWeights, d: usize) {
+    let mut x_g = vec![0.0f32; 64 * d];
+    for sq in 0..64 {
+        layer_norm(
+            &sq_state[sq * d..(sq + 1) * d],
+            &w.b_gnn_ln_g,
+            &w.b_gnn_ln_b,
+            &mut x_g[sq * d..(sq + 1) * d],
+        );
+    }
+    let mut agg = vec![0.0f32; 64 * d];
+    let mut in_deg = [0.0f32; 64];
+    let mut proj = vec![0.0f32; d];
+    let mut signed_sum = vec![0.0f32; 64 * d];
+
+    for k in 0..GRAPH_EDGE_TYPES {
+        agg.fill(0.0);
+        in_deg.fill(0.0);
+        for u in 0..64 {
+            let mask = graph_adj[k][u];
+            if mask == 0 {
+                continue;
+            }
+            let xu = &x_g[u * d..(u + 1) * d];
+            for v_sq in Bitboard(mask) {
+                let v = v_sq.index();
+                in_deg[v] += 1.0;
+                let dst = &mut agg[v * d..(v + 1) * d];
+                for j in 0..d {
+                    dst[j] += xu[j];
+                }
+            }
+        }
+        let wk = &w.b_gnn_w[k * d * d..(k + 1) * d * d];
+        let sign = if k < 2 { 1.0f32 } else { -1.0f32 }; // Dale's Law: +ACh (STM) vs -GABA (Opp)
+        for v in 0..64 {
+            if in_deg[v] == 0.0 {
+                continue;
+            }
+            let inv = 1.0 / (in_deg[v] + 1.0);
+            let av = &mut agg[v * d..(v + 1) * d];
+            for j in 0..d {
+                av[j] *= inv;
+            }
+            matvec(wk, av, d, d, &mut proj);
+            let dst = &mut signed_sum[v * d..(v + 1) * d];
+            for j in 0..d {
+                dst[j] += sign * proj[j];
+            }
+        }
+    }
+
+    for i in 0..64 * d {
+        sq_state[i] += silu(signed_sum[i]);
     }
 }
 
@@ -108,6 +169,10 @@ pub fn evaluate_stream_b(
             dst[j] = (exc / (leak + inh)) + lc_buf[j] + w.b_optic_b[j];
         }
     }
+
+    // B1a. FlyWire Typed Directed Chess-Graph GNN (Hop 1: exact 1-hop live attack/defense graph!)
+    let graph_adj = extract_chess_graph_adj(pos);
+    apply_flywire_gnn_hop(&mut sq_state, &graph_adj, w, d);
 
     // -------------------------------------------------------------------------
     // B1b. 3-Layer Untied FlyWire Optic Lobe Stack (Medulla -> Lobula -> Lobula Plate):
@@ -229,6 +294,10 @@ pub fn evaluate_stream_b(
             for j in 0..d {
                 cur[j] += o_buf[j];
             }
+        }
+        // Hop 2 after Layer 0: 2-hop transitive battery/pin/overload propagation across chess graph!
+        if l == 0 {
+            apply_flywire_gnn_hop(&mut sq_state, &graph_adj, w, d);
         }
     }
 
@@ -573,6 +642,52 @@ pub fn evaluate_stream_b(
     }
 
     if !logits_tmp.is_empty() {
+        // Saccadion-6 Live Test-Time hDelta Mental Rollout:
+        // Mentally simulates the top-6 PFL3 candidate moves in latent space z_{t+2} = WM(z_t, do(m))
+        // and blends the imagined future consequence into expected_delta_cp & move priority!
+        let wm_active = w.b_wm_w2.iter().any(|&x| x != 0.0);
+        if wm_active {
+            let g_dim = d + cx_d;
+            let mut order: Vec<usize> = (0..logits_tmp.len()).collect();
+            order.sort_by(|&a, &b| logits_tmp[b].total_cmp(&logits_tmp[a]));
+            let mut wm_in = vec![0.0f32; g_dim + cx_d];
+            wm_in[..g_dim].copy_from_slice(&global_vec);
+            let mut wm_h = vec![0.0f32; g_dim];
+            let mut wm_delta = vec![0.0f32; g_dim];
+            let mut z_fut = vec![0.0f32; g_dim];
+
+            for &idx in order.iter().take(6) {
+                let mv = policy_moves[idx].mv;
+                let u = mv.from_sq().relative_to(stm).index();
+                let v = mv.to_sq().relative_to(stm).index();
+                let qu = &q_sq[u * cx_d..(u + 1) * cx_d];
+                let kv = &k_sq[v * cx_d..(v + 1) * cx_d];
+                let ov = &opp_sq[v * cx_d..(v + 1) * cx_d];
+                for j in 0..cx_d {
+                    wm_in[g_dim + j] = qu[j] * (1.0 + eff_goal[j]) - (kv[j] - 0.99 * ov[j]);
+                }
+                matvec(&w.b_wm_w1, &wm_in, g_dim, g_dim + cx_d, &mut wm_h);
+                for j in 0..g_dim {
+                    wm_h[j] = silu(wm_h[j] + w.b_wm_b1[j]);
+                }
+                matvec(&w.b_wm_w2, &wm_h, g_dim, g_dim, &mut wm_delta);
+                for j in 0..g_dim {
+                    z_fut[j] = global_vec[j] + wm_delta[j];
+                }
+                let mut fut_logits = [0.0f32; 3];
+                for c in 0..3 {
+                    let row = &w.b_wdl_w[c * g_dim..(c + 1) * g_dim];
+                    fut_logits[c] = dot_f32(row, &z_fut) + w.b_wdl_b[c];
+                }
+                softmax_inplace(&mut fut_logits);
+                let fut_pos_cp = wdl_to_cp(fut_logits);
+                let imagined_delta = (fut_pos_cp - deep_pos_cp).clamp(-300.0, 300.0);
+                policy_moves[idx].expected_delta_cp =
+                    0.65 * policy_moves[idx].expected_delta_cp + 0.35 * imagined_delta;
+                logits_tmp[idx] += 0.0025 * imagined_delta;
+                policy_moves[idx].logit = logits_tmp[idx];
+            }
+        }
         softmax_inplace(&mut logits_tmp);
         for i in 0..policy_moves.len() {
             policy_moves[i].prob = logits_tmp[i];

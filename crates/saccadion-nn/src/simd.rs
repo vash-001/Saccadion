@@ -45,6 +45,23 @@ pub fn axpy_f32_scalar(dst: &mut [f32], src: &[f32], scale: f32) {
     }
 }
 
+/// Quantized INT8-to-F32 scaled vector accumulate: `dst[i] += scale * (src[i] as f32)`.
+/// 4x smaller L1/L2 cache footprint for MBON sparse gathers inside neural Quiescence!
+#[inline]
+pub fn axpy_i8_f32(dst: &mut [f32], src: &[i8], scale: f32) {
+    debug_assert_eq!(dst.len(), src.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe { axpy_i8_f32_avx2(dst, src, scale) };
+            return;
+        }
+    }
+    for i in 0..dst.len() {
+        dst[i] += scale * (src[i] as f32);
+    }
+}
+
 /// Vector add: `dst[i] += src[i]`.
 #[inline]
 pub fn add_inplace_f32(dst: &mut [f32], src: &[f32]) {
@@ -161,6 +178,31 @@ unsafe fn axpy_f32_avx2(dst: &mut [f32], src: &[f32], scale: f32) {
         }
         while i < n {
             *pd.add(i) += *ps.add(i) * scale;
+            i += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn axpy_i8_f32_avx2(dst: &mut [f32], src: &[i8], scale: f32) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = dst.len();
+        let mut i = 0usize;
+        let vs = _mm256_set1_ps(scale);
+        let pd = dst.as_mut_ptr();
+        let ps = src.as_ptr();
+        while i + 8 <= n {
+            let raw8 = _mm_loadl_epi64(ps.add(i) as *const __m128i);
+            let vi32 = _mm256_cvtepi8_epi32(raw8);
+            let vf32 = _mm256_cvtepi32_ps(vi32);
+            let vd = _mm256_loadu_ps(pd.add(i));
+            _mm256_storeu_ps(pd.add(i), _mm256_fmadd_ps(vf32, vs, vd));
+            i += 8;
+        }
+        while i < n {
+            *pd.add(i) += (*ps.add(i) as f32) * scale;
             i += 1;
         }
     }

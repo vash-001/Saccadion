@@ -8,8 +8,8 @@
 
 use crate::plasticity::{DopaminePlasticityState, SparseActiveKc};
 use crate::simd::{
-    add_inplace_f32, add_inplace_i16, axpy_f32, dot_f32, sigmoid, silu, softmax_inplace,
-    sub_inplace_f32, sub_inplace_i16,
+    add_inplace_f32, add_inplace_i16, axpy_f32, axpy_i8_f32, dot_f32, sigmoid, silu,
+    softmax_inplace, sub_inplace_f32, sub_inplace_i16,
 };
 use crate::weights::{SaccadionWeights, FT_I16_INV_SCALE};
 use saccadion_chess::features::{
@@ -415,7 +415,9 @@ pub fn evaluate_giant_fiber_cp(
     ws.mbon_opp
         .copy_from_slice(&w.a_mbon_bias[stack_bias_off..stack_bias_off + mbon_dim]);
 
-    // Zero-copy 16-wide AVX2 INT16 STM hemisphere update + APL sparse alpha/beta gather
+    // Zero-copy 16-wide AVX2 INT16 STM hemisphere update + L1-resident INT8 AVX2 alpha/beta MBON gather!
+    let ipsi_sc = w.a_mbon_ipsi_scale[stack];
+    let contra_sc = 0.5 * w.a_mbon_contra_scale[stack];
     let b0 = w.a_apl_beta[0];
     let sez_stm = {
         let (acc_s, sez_all) = ws.finny_i16.update_halfka_ref_i16(pos, stm, w);
@@ -434,14 +436,14 @@ pub fn evaluate_giant_fiber_cp(
                 let c = s.min(1.0);
                 let act = c * c;
                 let off = stack_mbon_off + i * mbon_dim;
-                axpy_f32(&mut ws.mbon_stm, &w.a_mbon_ipsi[off..off + mbon_dim], act);
-                axpy_f32(&mut ws.mbon_opp, &w.a_mbon_contra[off..off + mbon_dim], 0.5 * act);
+                axpy_i8_f32(&mut ws.mbon_stm, &w.a_mbon_ipsi_i8[off..off + mbon_dim], act * ipsi_sc);
+                axpy_i8_f32(&mut ws.mbon_opp, &w.a_mbon_contra_i8[off..off + mbon_dim], act * contra_sc);
             }
         }
         sez_all[stack]
     };
 
-    // Zero-copy 16-wide AVX2 INT16 Opp hemisphere update + APL sparse alpha/beta gather
+    // Zero-copy 16-wide AVX2 INT16 Opp hemisphere update + L1-resident INT8 AVX2 alpha/beta MBON gather!
     let b1 = w.a_apl_beta[1];
     let sez_opp = {
         let (acc_o, sez_all) = ws.finny_i16.update_halfka_ref_i16(pos, opp, w);
@@ -460,8 +462,8 @@ pub fn evaluate_giant_fiber_cp(
                 let c = o.min(1.0);
                 let act = c * c;
                 let off = stack_mbon_off + i * mbon_dim;
-                axpy_f32(&mut ws.mbon_opp, &w.a_mbon_ipsi[off..off + mbon_dim], act);
-                axpy_f32(&mut ws.mbon_stm, &w.a_mbon_contra[off..off + mbon_dim], 0.5 * act);
+                axpy_i8_f32(&mut ws.mbon_opp, &w.a_mbon_ipsi_i8[off..off + mbon_dim], act * ipsi_sc);
+                axpy_i8_f32(&mut ws.mbon_stm, &w.a_mbon_contra_i8[off..off + mbon_dim], act * contra_sc);
             }
         }
         sez_all[stack]

@@ -18,10 +18,9 @@ pub const NUM_KING_BUCKETS: usize = 16;
 pub const HALFKA_PER_BUCKET: usize = 768;
 /// Total HalfKAv2_hm piece-square sparse features = 12,288.
 pub const HALFKA_DIM: usize = NUM_KING_BUCKETS * HALFKA_PER_BUCKET;
-/// Compact FullRays ON/OFF sparse features appended after HalfKA:
-/// 64 squares * 4 states (own_attacked, opp_attacked, own_pinned, open_file_or_passer) = 256.
-pub const RAY_SPARSE_DIM: usize = 256;
-/// Total sparse input dimension per isolated hemisphere for Stream A.
+/// Compact FullRays ON/OFF (256) + LC4/LPLC2 Pairwise Threat-Edge Graph (1,024) = 1,280.
+pub const RAY_SPARSE_DIM: usize = 256 + 1024;
+/// Total sparse input dimension per isolated hemisphere for Stream A (12,288 + 1,280 = 13,568).
 pub const STREAM_A_SPARSE_DIM: usize = HALFKA_DIM + RAY_SPARSE_DIM;
 
 /// Square feature width for Stream B (Optic Lobe T4/T5 ON-OFF + Lobula Columnar features).
@@ -164,7 +163,91 @@ fn extract_one_hemisphere(
         list.push(HALFKA_DIM + 192 + rsq.index());
     }
 
+    // 3. LC4/LPLC2 Optic Glomeruli Pairwise Threat-Edge Graph (attacker_p x victim_p x quadrant x edge_cat)
+    //    Captures direct piece-on-piece attack & defense interactions in 1024 sparse buckets!
+    let all_occ = pos.all_occ;
+    let mut seen_lc4 = [0u64; 16]; // 1024-bit deduplication mask
+    for c in [Color::White, Color::Black] {
+        let is_own_atk = c == persp;
+        for p in Piece::ALL {
+            for u in pos.piece_bb(c, p) {
+                let atks = piece_attacks_from(pos, c, p, u, all_occ) & all_occ;
+                for v in atks {
+                    if let Some((vc, vp)) = pos.piece_at(v) {
+                        let mut rv = v.relative_to(persp);
+                        if mirror {
+                            rv = rv.flip_file();
+                        }
+                        let quad = (((rv.rank() as usize) >> 2) << 1) | ((rv.file() as usize) >> 2);
+                        let is_attack = vc != c;
+                        let edge_cat = (if is_own_atk { 0 } else { 2 }) + (if is_attack { 0 } else { 1 });
+                        let pair_id = (p.index() * 6 + vp.index()) * 4 + quad;
+                        let lc4 = (edge_cat * 256 + (pair_id & 255)) & 1023;
+                        let word = lc4 >> 6;
+                        let bit = 1u64 << (lc4 & 63);
+                        if (seen_lc4[word] & bit) == 0 {
+                            seen_lc4[word] |= bit;
+                            list.push(HALFKA_DIM + 256 + lc4);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     list
+}
+
+#[inline(always)]
+fn piece_attacks_from(pos: &Position, c: Color, p: Piece, sq: Square, occ: Bitboard) -> Bitboard {
+    let _ = pos;
+    match p {
+        Piece::Pawn => pawn_attacks(c, sq),
+        Piece::Knight => knight_attacks(sq),
+        Piece::Bishop => bishop_attacks(sq, occ),
+        Piece::Rook => rook_attacks(sq, occ),
+        Piece::Queen => bishop_attacks(sq, occ) | rook_attacks(sq, occ),
+        Piece::King => king_ring(sq) & !Bitboard::from_sq(sq),
+    }
+}
+
+/// Extracts the exact 4-channel FlyWire Typed Directed Chess-Graph Adjacency Matrix (STM-oriented):
+/// - Channel 0: STM Attack Edge (STM piece u -> empty or enemy square v)  [+ACh Excitatory]
+/// - Channel 1: STM Defend Edge (STM piece u -> own STM piece v)          [+ACh Excitatory]
+/// - Channel 2: Opp Attack Edge (Opp piece u -> empty or STM square v)    [-GABA Inhibitory]
+/// - Channel 3: Opp Defend Edge (Opp piece u -> own Opp piece v)          [-GABA Inhibitory]
+/// Each entry `adj[k][rel_u]` is a 64-bit bitmask of destination squares `rel_v` in STM orientation.
+pub fn extract_chess_graph_adj(pos: &Position) -> [[u64; 64]; 4] {
+    let mut adj = [[0u64; 64]; 4];
+    let stm = pos.side_to_move;
+    let opp = stm.flip();
+    let all_occ = pos.all_occ;
+    let stm_occ = pos.color_occ[stm.index()];
+    let opp_occ = pos.color_occ[opp.index()];
+
+    let orient_bb = |bb: Bitboard| -> u64 {
+        if stm == Color::White {
+            bb.0
+        } else {
+            bb.0.swap_bytes()
+        }
+    };
+
+    for p in Piece::ALL {
+        for u in pos.piece_bb(stm, p) {
+            let atks = piece_attacks_from(pos, stm, p, u, all_occ);
+            let rel_u = u.relative_to(stm).index();
+            adj[0][rel_u] = orient_bb(atks & !stm_occ);
+            adj[1][rel_u] = orient_bb(atks & stm_occ);
+        }
+        for u in pos.piece_bb(opp, p) {
+            let atks = piece_attacks_from(pos, opp, p, u, all_occ);
+            let rel_u = u.relative_to(stm).index();
+            adj[2][rel_u] = orient_bb(atks & !opp_occ);
+            adj[3][rel_u] = orient_bb(atks & opp_occ);
+        }
+    }
+    adj
 }
 
 /// Extracts Stream B's 64-square biological Optic Lobe tensor [64][48] from STM perspective.

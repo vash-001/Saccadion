@@ -257,7 +257,7 @@ def _save_metrics_and_dashboard(history: List[Dict[str, Any]], ckpt_dir: Path) -
 
         epochs = [r.get("epoch", i + 1) for i, r in enumerate(history)]
         fig, axes = plt.subplots(2, 3, figsize=(16, 9))
-        fig.suptitle("Saccadion-5 (3-Lobe+Amacrine+WorldModel) Smart TPU Telemetry", fontsize=14, fontweight="bold")
+        fig.suptitle("Saccadion-6 (FlyWire-GNN+INT8+WorldModel) Smart TPU Telemetry", fontsize=14, fontweight="bold")
 
         # Panel 1: Total Train vs Val Loss
         ax = axes[0, 0]
@@ -448,7 +448,7 @@ def train_saccadion_smart(
     total_steps = steps_per_epoch * epochs
     dev_label = f"{n_dev}x {jax.devices()[0].platform.upper()}"
 
-    print(f"=== SACCADION-5 (3-LOBE+AMACRINE+WORLD-MODEL) SMART TPU TRAINER ===")
+    print(f"=== SACCADION-6 (FLYWIRE-GNN+INT8+LIVE-WORLD-MODEL) SMART TPU TRAINER ===")
     print(f"Devices      : {dev_label} (pmap={use_pmap})")
     print(f"Model Tier   : tier_id={cfg.tier_id} (acc_dim={cfg.acc_dim}, D={cfg.stream_b_dim}, CX={cfg.cx_dim}, T_max={cfg.cx_max_ticks})")
     print(f"Dataset      : train={len(train_ds):,} pos | val={len(val_ds):,} pos | traj={len(traj_ds)//12:,} windows")
@@ -500,7 +500,7 @@ def train_saccadion_smart(
             weights_path=export_dir / "saccadion_best.saccnet",
             harvest_shard_path=sparring_shard,
             status_json_path=checkpoint_dir / "arena_status.json",
-            movetime_ms=120,
+            movetime_ms=150,
         )
         arena.start()
 
@@ -516,7 +516,7 @@ def train_saccadion_smart(
             return compiled_train[key]
 
         def loss_single(cur_p, batch, apl_target, apl_w, rng_key):
-            k1, k2 = jax.random.split(rng_key)
+            k1, k2, k3 = jax.random.split(rng_key, 3)
             out_a = forward_stream_a(
                 cur_p, cfg, claws_idx,
                 batch["sparse_stm"], batch["sparse_opp"],
@@ -525,7 +525,9 @@ def train_saccadion_smart(
             )
             out_b = forward_stream_b(
                 cur_p, cfg, batch["board_feats"], out_a["mbon_summary"],
-                num_ticks=num_ticks, sez_cp=out_a["sez_cp"], qat=qat,
+                num_ticks=num_ticks, sez_cp=out_a["sez_cp"],
+                graph_adj_u32=batch.get("graph_adj"),
+                qat=qat, causal_drop_key=k3,
             )
             out_a_steered = forward_stream_a(
                 cur_p, cfg, claws_idx,
@@ -572,7 +574,8 @@ def train_saccadion_smart(
             )
             out_b = forward_stream_b(
                 p, cfg, batch["board_feats"], out_a["mbon_summary"],
-                num_ticks=num_ticks, sez_cp=out_a["sez_cp"], qat=qat,
+                num_ticks=num_ticks, sez_cp=out_a["sez_cp"],
+                graph_adj_u32=batch.get("graph_adj"), qat=qat,
             )
             out_a_s = forward_stream_a(
                 p, cfg, claws_idx,
@@ -627,9 +630,11 @@ def train_saccadion_smart(
                 tbatch["sparse_stm"][:, 0], tbatch["sparse_opp"][:, 0],
                 tbatch["lh_feat"][:, 0], tbatch["phase_bucket"][:, 0], qat=False,
             )
+            gadj_t = tbatch.get("graph_adj")
             out_b0 = forward_stream_b(
                 cur_p, cfg, tbatch["board_feats"][:, 0], out_a0["mbon_summary"],
-                num_ticks=2, sez_cp=out_a0["sez_cp"], qat=False,
+                num_ticks=2, sez_cp=out_a0["sez_cp"],
+                graph_adj_u32=gadj_t[:, 0] if gadj_t is not None else None, qat=False,
             )
             out_a2 = forward_stream_a(
                 cur_p, cfg, claws_idx,
@@ -638,7 +643,8 @@ def train_saccadion_smart(
             )
             out_b2 = forward_stream_b(
                 cur_p, cfg, tbatch["board_feats"][:, 2], out_a2["mbon_summary"],
-                num_ticks=2, sez_cp=out_a2["sez_cp"], qat=False,
+                num_ticks=2, sez_cp=out_a2["sez_cp"],
+                graph_adj_u32=gadj_t[:, 2] if gadj_t is not None else None, qat=False,
             )
             out_a4 = forward_stream_a(
                 cur_p, cfg, claws_idx,
@@ -647,7 +653,8 @@ def train_saccadion_smart(
             )
             out_b4 = forward_stream_b(
                 cur_p, cfg, tbatch["board_feats"][:, 4], out_a4["mbon_summary"],
-                num_ticks=2, sez_cp=out_a4["sez_cp"], qat=False,
+                num_ticks=2, sez_cp=out_a4["sez_cp"],
+                graph_adj_u32=gadj_t[:, 4] if gadj_t is not None else None, qat=False,
             )
             pred_z2 = predict_action_world_model(cur_p, out_b0, tbatch["top4_moves"][:, 0, 0])
             pred_z4 = predict_action_world_model(cur_p, out_b2, tbatch["top4_moves"][:, 2, 0])

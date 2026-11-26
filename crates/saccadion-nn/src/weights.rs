@@ -4,8 +4,8 @@
 //! checkpoints load directly into Pure Rust with bit-verified numerical parity.
 
 use crate::config::{
-    build_flyhash_claws, splitmix64, ModelConfig, AMACRINE_RANK, OPTIC_LAYERS, PLASTIC_RANK,
-    SACCNET_MAGIC, SACCNET_VERSION,
+    build_flyhash_claws, splitmix64, ModelConfig, AMACRINE_RANK, GRAPH_EDGE_TYPES, OPTIC_LAYERS,
+    PLASTIC_RANK, SACCNET_MAGIC, SACCNET_VERSION,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -19,6 +19,24 @@ fn quantize_to_i16(src: &[f32]) -> Vec<i16> {
     src.iter()
         .map(|&v| (v * FT_I16_SCALE).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16)
         .collect()
+}
+
+fn quantize_stacks_to_i8(src: &[f32], num_stacks: usize) -> (Vec<i8>, Vec<f32>) {
+    let per_stack = src.len() / num_stacks.max(1);
+    let mut out = vec![0i8; src.len()];
+    let mut scales = vec![1.0f32; num_stacks];
+    for s in 0..num_stacks {
+        let sl = &src[s * per_stack..(s + 1) * per_stack];
+        let max_abs = sl.iter().fold(1e-6f32, |m, &v| m.max(v.abs()));
+        let scale = max_abs / 127.0;
+        let inv = 127.0 / max_abs;
+        scales[s] = scale;
+        let dst = &mut out[s * per_stack..(s + 1) * per_stack];
+        for i in 0..per_stack {
+            dst[i] = (sl[i] * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    (out, scales)
 }
 
 /// All static (frozen after TPU training) weights of Stream A + Stream B.
@@ -160,10 +178,25 @@ pub struct SaccadionWeights {
     /// [cx_dim * (2 * cx_dim)] comparing committed FC2 goal with current EPG board heading.
     pub b_fc2_conj: Vec<f32>,
 
-    // ==================== DERIVED RUNTIME AVX2 INT16 CACHE (NOT ON DISK) ====================
-    /// Pre-quantized INT16 feature transformer for 16-wide AVX2 neural Quiescence evaluation.
+    // ==================== SACCADION-6 FLYWIRE GRAPH-BRAIN + LIVE WORLD MODEL ====================
+    /// FlyWire Dale's-Law Typed Directed Chess-Graph GNN (4 edge types: STM Atk/Def +E, Opp Atk/Def -I):
+    pub b_gnn_ln_g: Vec<f32>,        // [stream_b_dim]
+    pub b_gnn_ln_b: Vec<f32>,        // [stream_b_dim]
+    pub b_gnn_w: Vec<f32>,           // [GRAPH_EDGE_TYPES * stream_b_dim * stream_b_dim]
+    /// Live Test-Time hDelta Action-Conditioned Latent World Model (promoted from training aux!):
+    /// Predicts future latent z_{t+2} from [global_vec (D+CX) || action_embed (CX)] in < 20 us!
+    pub b_wm_w1: Vec<f32>,           // [(stream_b_dim + cx_dim) * (stream_b_dim + 2 * cx_dim)]
+    pub b_wm_b1: Vec<f32>,           // [stream_b_dim + cx_dim]
+    pub b_wm_w2: Vec<f32>,           // [(stream_b_dim + cx_dim) * (stream_b_dim + cx_dim)]
+
+    // ==================== DERIVED RUNTIME AVX2 INT16/INT8 CACHE (NOT ON DISK) ====================
+    /// Pre-quantized INT16 feature transformer & INT8 MBON weights for blazing AVX2 neural QSearch.
     pub a_ft_weight_i16: Vec<i16>,
     pub a_ft_bias_i16: Vec<i16>,
+    pub a_mbon_ipsi_i8: Vec<i8>,
+    pub a_mbon_ipsi_scale: Vec<f32>,
+    pub a_mbon_contra_i8: Vec<i8>,
+    pub a_mbon_contra_scale: Vec<f32>,
 }
 
 fn rand_uniform_scaled(rng: &mut u64, scale: f32) -> f32 {
@@ -238,6 +271,8 @@ impl SaccadionWeights {
 
         let a_mbon_ipsi = alloc_init(stacks * cfg.acc_dim * mbon, (1.0 / (cfg.acc_dim as f32 * 0.1)).sqrt() * 0.25, &mut rng);
         let a_mbon_contra = alloc_init(stacks * cfg.acc_dim * mbon, (1.0 / (cfg.acc_dim as f32 * 0.1)).sqrt() * 0.25, &mut rng);
+        let (a_mbon_ipsi_i8, a_mbon_ipsi_scale) = quantize_stacks_to_i8(&a_mbon_ipsi, stacks);
+        let (a_mbon_contra_i8, a_mbon_contra_scale) = quantize_stacks_to_i8(&a_mbon_contra, stacks);
         let a_mbon_bias = vec![0.0; stacks * mbon];
 
         let a_lh_w_inh = alloc_init(cfg.lh_hidden_dim * cfg.lh_input_dim, 0.15, &mut rng);
@@ -332,8 +367,18 @@ impl SaccadionWeights {
             b_cx_ln_g: vec![1.0; cx],
             b_cx_ln_b: vec![0.0; cx],
             b_fc2_conj: alloc_init(cx * (2 * cx), s_cx * 0.5, &mut rng),
+            b_gnn_ln_g: vec![1.0; d],
+            b_gnn_ln_b: vec![0.0; d],
+            b_gnn_w: alloc_init(GRAPH_EDGE_TYPES * d * d, s_d * 0.5, &mut rng),
+            b_wm_w1: alloc_init((d + cx) * (d + 2 * cx), s_d, &mut rng),
+            b_wm_b1: vec![0.0; d + cx],
+            b_wm_w2: alloc_init((d + cx) * (d + cx), s_d * 0.5, &mut rng),
             a_ft_weight_i16,
             a_ft_bias_i16,
+            a_mbon_ipsi_i8,
+            a_mbon_ipsi_scale,
+            a_mbon_contra_i8,
+            a_mbon_contra_scale,
             cfg,
         }
     }
@@ -414,7 +459,13 @@ impl SaccadionWeights {
             + self.b_ama_g.len()
             + self.b_cx_ln_g.len()
             + self.b_cx_ln_b.len()
-            + self.b_fc2_conj.len();
+            + self.b_fc2_conj.len()
+            + self.b_gnn_ln_g.len()
+            + self.b_gnn_ln_b.len()
+            + self.b_gnn_w.len()
+            + self.b_wm_w1.len()
+            + self.b_wm_b1.len()
+            + self.b_wm_w2.len();
         (sparse, dense)
     }
 
@@ -534,6 +585,12 @@ impl SaccadionWeights {
         write_slice(&mut w, &self.b_cx_ln_g)?;
         write_slice(&mut w, &self.b_cx_ln_b)?;
         write_slice(&mut w, &self.b_fc2_conj)?;
+        write_slice(&mut w, &self.b_gnn_ln_g)?;
+        write_slice(&mut w, &self.b_gnn_ln_b)?;
+        write_slice(&mut w, &self.b_gnn_w)?;
+        write_slice(&mut w, &self.b_wm_w1)?;
+        write_slice(&mut w, &self.b_wm_b1)?;
+        write_slice(&mut w, &self.b_wm_w2)?;
 
         w.flush()
     }
@@ -564,10 +621,10 @@ impl SaccadionWeights {
         };
 
         let ver = read_u32(&mut r)?;
-        if ver != SACCNET_VERSION && ver != 4 && ver != 3 {
+        if ver < 3 || ver > SACCNET_VERSION {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Unsupported SACCNET version: {} (expected 3, 4, or {})", ver, SACCNET_VERSION),
+                format!("Unsupported SACCNET version: {} (expected 3..={})", ver, SACCNET_VERSION),
             ));
         }
         let tier_id = read_u32(&mut r)?;
@@ -710,8 +767,30 @@ impl SaccadionWeights {
                 )
             };
 
+        let (b_gnn_ln_g, b_gnn_ln_b, b_gnn_w, b_wm_w1, b_wm_b1, b_wm_w2) = if ver >= 6 {
+            (
+                read_vec(&mut r, d)?,
+                read_vec(&mut r, d)?,
+                read_vec(&mut r, GRAPH_EDGE_TYPES * d * d)?,
+                read_vec(&mut r, (d + cx) * (d + 2 * cx))?,
+                read_vec(&mut r, d + cx)?,
+                read_vec(&mut r, (d + cx) * (d + cx))?,
+            )
+        } else {
+            (
+                vec![1.0; d],
+                vec![0.0; d],
+                vec![0.0; GRAPH_EDGE_TYPES * d * d],
+                vec![0.0; (d + cx) * (d + 2 * cx)],
+                vec![0.0; d + cx],
+                vec![0.0; (d + cx) * (d + cx)],
+            )
+        };
+
         let a_ft_weight_i16 = quantize_to_i16(&a_ft_weight);
         let a_ft_bias_i16 = quantize_to_i16(&a_ft_bias);
+        let (a_mbon_ipsi_i8, a_mbon_ipsi_scale) = quantize_stacks_to_i8(&a_mbon_ipsi, stacks);
+        let (a_mbon_contra_i8, a_mbon_contra_scale) = quantize_stacks_to_i8(&a_mbon_contra, stacks);
 
         Ok(Self {
             cfg,
@@ -793,8 +872,18 @@ impl SaccadionWeights {
             b_cx_ln_g,
             b_cx_ln_b,
             b_fc2_conj,
+            b_gnn_ln_g,
+            b_gnn_ln_b,
+            b_gnn_w,
+            b_wm_w1,
+            b_wm_b1,
+            b_wm_w2,
             a_ft_weight_i16,
             a_ft_bias_i16,
+            a_mbon_ipsi_i8,
+            a_mbon_ipsi_scale,
+            a_mbon_contra_i8,
+            a_mbon_contra_scale,
         })
     }
 }
