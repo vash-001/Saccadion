@@ -66,5 +66,17 @@ mod tests {
         engine.new_game();
         assert!(engine.plasticity.dw_gamma_stm.iter().all(|&x| x == 0.0));
         assert!(engine.plasticity.dw_apbp_stm.iter().all(|&x| x == 0.0));
+
+        // Verify Parallel DNp Multi-Core Lazy SMP (threads=2) completes cleanly on shared lock-free TT
+        let mut pos_mp = Position::startpos();
+        let cfg_mp = SearchConfig {
+            max_depth: 4,
+            threads: 2,
+            cx_min_depth: 4,
+            ..SearchConfig::default()
+        };
+        let res_mp = engine.search(&mut pos_mp, cfg_mp, |_| {});
+        assert!(!res_mp.best_move.is_null());
+        assert!(res_mp.nodes > 50);
     }
 }

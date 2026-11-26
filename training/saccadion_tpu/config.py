@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import numpy as np
 
 SACCNET_MAGIC = b"SACCNET1"
-SACCNET_VERSION = 3
+SACCNET_VERSION = 4
 OPTIC_LAYERS = 3
 
 HALFKA_DIM = 16 * 768
@@ -134,3 +134,37 @@ def build_flyhash_claws(cfg: SaccadionConfig) -> np.ndarray:
                 chosen.append(cand)
         out[p_i] = chosen
     return out
+
+
+def init_sez_innate_weights(sparse_input_dim: int, num_phase_stacks: int) -> np.ndarray:
+    """Deterministic Drosophila SEZ (Subesophageal Zone) innate survival valence prior (in pawns).
+
+    Matches Rust `crates/saccadion-nn/src/weights.rs::init_sez_innate_weights` bit-for-bit!
+    """
+    w = np.zeros((sparse_input_dim, num_phase_stacks), dtype=np.float32)
+    piece_pawns = (1.00, 3.20, 3.30, 5.00, 9.00, 0.00)
+    halfka_dim = 16 * 768
+    for bucket in range(16):
+        for rel_c in range(2):
+            sign = 1.0 if rel_c == 0 else -1.0
+            for piece in range(6):
+                base_v = piece_pawns[piece]
+                for rel_sq in range(64):
+                    f = bucket * 768 + (rel_c * 6 + piece) * 64 + rel_sq
+                    if f >= halfka_dim or f >= sparse_input_dim:
+                        continue
+                    file_i = float(rel_sq & 7)
+                    rank_i = float(rel_sq >> 3)
+                    center = 1.0 - (abs(file_i - 3.5) + abs(rank_i - 3.5)) / 7.0
+                    if piece == 0:
+                        psq_bonus = 0.06 * rank_i + 0.04 * center
+                    elif piece in (1, 2):
+                        psq_bonus = 0.14 * center
+                    elif piece == 3:
+                        psq_bonus = 0.04 * center
+                    elif piece == 4:
+                        psq_bonus = 0.05 * center
+                    else:
+                        psq_bonus = 0.0
+                    w[f, :] = np.float32(sign * (base_v + psq_bonus))
+    return w

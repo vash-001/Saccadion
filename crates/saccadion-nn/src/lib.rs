@@ -9,7 +9,9 @@ pub mod weights;
 
 pub use config::ModelConfig;
 pub use plasticity::{DopaminePlasticityState, PlasticityParams, SparseActiveKc};
-pub use stream_a::{evaluate_stream_a, LateralHornVeto, StreamAOutput, StreamAWorkspace};
+pub use stream_a::{
+    evaluate_giant_fiber_cp, evaluate_stream_a, LateralHornVeto, StreamAOutput, StreamAWorkspace,
+};
 pub use stream_b::{evaluate_stream_b, PolicyMoveScore, StreamBOutput};
 pub use weights::SaccadionWeights;
 
@@ -61,6 +63,7 @@ mod tests {
             &legal,
             &weights,
             &out_a0.mbon_summary,
+            out_a0.sez_cp,
             Some(&plasticity),
             novelty,
             1.0,
@@ -105,6 +108,14 @@ mod tests {
         plasticity.reset_game();
         let out_a_reset = evaluate_stream_a(&pos, &weights, &mut ws, Some(&plasticity), None, 1.0);
         assert!((out_a_reset.total_cp - out_a0.total_cp).abs() < 1e-5);
+
+        // Verify Drosophila SEZ innate survival valence knows a Queen is worth ~900 cp from Epoch 0!
+        let pos_q_down = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR w KQkq - 0 1").unwrap();
+        let out_qd = evaluate_stream_a(&pos_q_down, &weights, &mut ws, None, None, 1.0);
+        let gf_qd = evaluate_giant_fiber_cp(&pos_q_down, &weights, &mut ws);
+        assert!(out_qd.sez_cp < -850.0, "SEZ should value missing Queen ~-900 cp, got {}", out_qd.sez_cp);
+        assert!(out_qd.slow_cp < -700.0, "Stream A should never evaluate missing Queen near 0, got {}", out_qd.slow_cp);
+        assert!(gf_qd < -600, "Giant Fiber fast reflex must alarm on missing Queen, got {}", gf_qd);
     }
 
     #[test]

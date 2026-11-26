@@ -17,7 +17,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .config import NUM_CAUSAL_CONCEPTS, OPTIC_LAYERS, SaccadionConfig, build_flyhash_claws
+from .config import (
+    NUM_CAUSAL_CONCEPTS,
+    OPTIC_LAYERS,
+    SaccadionConfig,
+    build_flyhash_claws,
+    init_sez_innate_weights,
+)
 
 
 def ste_quantize(w: jnp.ndarray, bits: int = 8, enabled: bool = False) -> jnp.ndarray:
@@ -62,6 +68,7 @@ def init_saccadion_params(cfg: SaccadionConfig, seed: int = 42) -> Dict[str, jnp
         # Stream A
         "a_ft_weight": u((cfg.sparse_input_dim, cfg.acc_dim), s_ft),
         "a_ft_bias": jnp.full((cfg.acc_dim,), 0.05, dtype=jnp.float32),
+        "a_sez_weight": jnp.asarray(init_sez_innate_weights(cfg.sparse_input_dim, stacks), dtype=jnp.float32),
         "a_claw_weight": u((plastic_dim, cfg.flyhash_claws), 0.35),
         "a_apl_beta": jnp.array([0.85, 0.85], dtype=jnp.float32),
         "a_apl_thresh": jnp.full((cfg.acc_dim,), 0.18, dtype=jnp.float32),
@@ -165,14 +172,22 @@ def forward_stream_a(
     ab_dim, gamma_dim, _ = cfg.lobe_dims_per_hemi()
     half_mbon = cfg.mbon_dim // 2
 
-    # 1. Isolated Bilateral Feature Accumulation (padded -1 indices masked out)
+    # 1. Isolated Bilateral Feature Accumulation + SEZ Innate Survival Valence (padded -1 masked out)
     ft_w = ste_quantize(params["a_ft_weight"], bits=16, enabled=qat)
     ft_pad = jnp.concatenate([ft_w, jnp.zeros((1, cfg.acc_dim), dtype=ft_w.dtype)], axis=0)
+    sez_w = params["a_sez_weight"]
+    sez_pad = jnp.concatenate([sez_w, jnp.zeros((1, cfg.num_phase_stacks), dtype=sez_w.dtype)], axis=0)
     pad_idx = cfg.sparse_input_dim
     idx_s = jnp.where(sparse_stm >= 0, sparse_stm, pad_idx)
     idx_o = jnp.where(sparse_opp >= 0, sparse_opp, pad_idx)
     acc_stm = jnp.sum(ft_pad[idx_s], axis=1) + params["a_ft_bias"]
     acc_opp = jnp.sum(ft_pad[idx_o], axis=1) + params["a_ft_bias"]
+
+    bsz = sparse_stm.shape[0]
+    row_arange = jnp.arange(bsz)
+    sez_stm = jnp.sum(sez_pad[idx_s], axis=1)[row_arange, phase_bucket]
+    sez_opp = jnp.sum(sez_pad[idx_o], axis=1)[row_arange, phase_bucket]
+    sez_cp = (sez_stm - sez_opp) * 50.0
 
     # 2. FlyHash Sparse Claw Projection onto gamma + alpha'/beta' lobes
     claw_w = ste_quantize(params["a_claw_weight"], bits=8, enabled=qat)  # [plastic, claws]
@@ -225,11 +240,11 @@ def forward_stream_a(
         axis=-1,
     )
 
-    # 6. SMP/CRE/SIP Convergence Hub -> WDL Logits
+    # 6. SMP/CRE/SIP Convergence Hub -> Positional MBON residual + SEZ Innate Survival Fusion
     smp_in = jnp.concatenate([mbon_stm, mbon_opp, lh_veto], axis=-1)  # [B, 68]
     smp_w = ste_quantize(params["a_smp_w"], bits=8, enabled=qat)[phase_bucket]  # [B, 3, 68]
     smp_b = params["a_smp_b"][phase_bucket]                                     # [B, 3]
-    wdl_logits = jnp.einsum("bi,bki->bk", smp_in, smp_w) + smp_b
+    wdl_logits_raw = jnp.einsum("bi,bki->bk", smp_in, smp_w) + smp_b
 
     # Optional bounded fast-weight shift on Win vs Loss logits (Stage-3 Meta-Dopamine)
     kc_gamma_stm = kc_stm[:, ab_dim : ab_dim + gamma_dim]
@@ -237,12 +252,22 @@ def forward_stream_a(
     if dw_gamma_stm is not None and dw_gamma_opp is not None:
         raw_fast = jnp.sum(dw_gamma_stm * kc_gamma_stm, axis=-1) - 0.5 * jnp.sum(dw_gamma_opp * kc_gamma_opp, axis=-1)
         fast_shift = jnp.clip(raw_fast, -1.2, 1.2)
-        wdl_logits = wdl_logits + jnp.stack([fast_shift, jnp.zeros_like(fast_shift), -fast_shift], axis=-1)
+        wdl_logits_raw = wdl_logits_raw + jnp.stack([fast_shift, jnp.zeros_like(fast_shift), -fast_shift], axis=-1)
+
+    mbon_probs = jax.nn.softmax(wdl_logits_raw, axis=-1)
+    mbon_cp = 400.0 * jnp.arctanh(jnp.clip(mbon_probs[:, 0] - mbon_probs[:, 2], -0.999, 0.999))
+    fortress_scale = 1.0 - 0.55 * lh_veto[:, 1]
+    pred_cp = jnp.clip((sez_cp + mbon_cp) * fortress_scale, -2500.0, 2500.0)
+
+    sez_l = jnp.clip(sez_cp / 280.0, -5.0, 5.0)
+    wdl_logits = wdl_logits_raw + jnp.stack([sez_l, jnp.zeros_like(sez_l), -sez_l], axis=-1)
 
     mbon_summary = mbon_stm - 0.5 * mbon_opp
     mbon_e = jnp.mean(jnp.abs(mbon_stm[:, :half_mbon]))
     mbon_i = jnp.mean(jnp.abs(mbon_stm[:, half_mbon:]))
     return {
+        "sez_cp": sez_cp,
+        "pred_cp": pred_cp,
         "wdl_logits": wdl_logits,
         "lh_veto": lh_veto,
         "mbon_summary": mbon_summary,
@@ -262,6 +287,7 @@ def forward_stream_b(
     board_feats: jnp.ndarray,  # [B, 64, 48] float32
     mbon_summary: jnp.ndarray, # [B, 32] float32
     num_ticks: int,
+    sez_cp: jnp.ndarray | None = None,
     serotonin: float = 1.0,
     qat: bool = False,
 ) -> Dict[str, Any]:
@@ -336,7 +362,11 @@ def forward_stream_b(
         sq_state = sq_state + jnp.einsum("bsf,df->bsd", fg * fu, wfd_l)
 
     # Weight-tied Central Complex + Rich-Club deliberation loop
+    sez_vec = sez_cp if sez_cp is not None else jnp.zeros((bsz,), dtype=jnp.float32)
+    sez_l = jnp.clip(sez_vec / 280.0, -5.0, 5.0)
+    sez_shift = jnp.stack([sez_l, jnp.zeros_like(sez_l), -sez_l], axis=-1)
     per_tick_wdl = []
+    last_wdl_raw = None
     for _ in range(num_ticks):
         # Step A: Integrators Cross-Attention from 64 squares
         int_h = hubs[:, :n_int, :]
@@ -378,11 +408,12 @@ def forward_stream_b(
         sq_delta = jnp.tanh(jnp.einsum("bsd,ed->bse", sq_in_upd, w_squpd))
         sq_state = layer_norm(sq_state + 0.5 * sq_delta, params["b_sq_ln_g"], params["b_sq_ln_b"])
 
-        # Deep Supervision tick WDL readout
+        # Deep Supervision tick WDL readout (fused with SEZ innate survival valence)
         tick_cx = jnp.mean(cx_phasor, axis=1)
         tick_global = jnp.concatenate([broad_mean, tick_cx], axis=-1)
-        tick_wdl = jnp.einsum("bg,kg->bk", tick_global, params["b_wdl_w"]) + params["b_wdl_b"]
-        per_tick_wdl.append(tick_wdl)
+        tick_wdl_raw = jnp.einsum("bg,kg->bk", tick_global, params["b_wdl_w"]) + params["b_wdl_b"]
+        last_wdl_raw = tick_wdl_raw
+        per_tick_wdl.append(tick_wdl_raw + sez_shift)
 
     cx_pooled = jnp.mean(cx_phasor, axis=1)
     global_vec = jnp.concatenate([broad_mean, cx_pooled], axis=-1)  # [B, D + cx_d]
@@ -395,8 +426,11 @@ def forward_stream_b(
     plan_w = jax.nn.softmax(plan_scores, axis=-1)
     committed_goal = jnp.einsum("bk,bkc->bc", plan_w, plans)
 
-    # B6. Readout Heads: WDL, PFL2 Sharpness, Strategic Pressure, PFL3 64x64 Policy, Noduli, Seed
+    # B6. Readout Heads: WDL, Direct CP, PFL2 Sharpness, Strategic Pressure, PFL3 64x64 Policy, Noduli, Seed
     wdl_logits = per_tick_wdl[-1]
+    pos_probs_b = jax.nn.softmax(last_wdl_raw, axis=-1)
+    deep_pos_cp = 400.0 * jnp.arctanh(jnp.clip(pos_probs_b[:, 0] - pos_probs_b[:, 2], -0.999, 0.999))
+    pred_cp = jnp.clip(sez_vec + deep_pos_cp, -2500.0, 2500.0)
     pfl2_sharpness = jax.nn.sigmoid(jnp.einsum("bg,g->b", global_vec, params["b_pfl2_w"]) + params["b_pfl2_b"])
     strategic_pressure = jnp.tanh(jnp.einsum("bg,pg->bp", global_vec, params["b_press_w"]) + params["b_press_b"])
 
@@ -438,6 +472,7 @@ def forward_stream_b(
 
     plan_entropy = -jnp.mean(jnp.sum(plan_w * jnp.log(jnp.clip(plan_w, 1e-6, 1.0)), axis=-1))
     return {
+        "pred_cp": pred_cp,
         "wdl_logits": wdl_logits,
         "per_tick_wdl": per_tick_wdl,
         "policy_logits": policy_flat,

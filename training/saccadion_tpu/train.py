@@ -129,9 +129,19 @@ def build_muon_adamw_optimizer(
         end_value=lr_adamw_peak * 0.05,
     )
 
+    sched_sez = optax.warmup_cosine_decay_schedule(
+        init_value=lr_adamw_peak * 0.02,
+        peak_value=lr_adamw_peak * 0.25,
+        warmup_steps=warmup_steps,
+        decay_steps=decay_steps,
+        end_value=lr_adamw_peak * 0.02,
+    )
+
     labels = {}
     for k, v in params.items():
-        if k == "a_ft_weight" or v.ndim < 2 or "ln" in k or "bias" in k or "meta_" in k or "_rel" in k:
+        if k == "a_sez_weight":
+            labels[k] = "sez"
+        elif k == "a_ft_weight" or v.ndim < 2 or "ln" in k or "bias" in k or "meta_" in k or "_rel" in k:
             labels[k] = "adamw"
         else:
             labels[k] = "muon"
@@ -160,11 +170,13 @@ def build_muon_adamw_optimizer(
             _signed_decoupled_weight_decay(sched_muon, weight_decay=0.005),
         )
 
-    # Calibrated decoupled weight decay (5e-3) prevents sparse table memorization without crushing T4/T5
+    # Calibrated decoupled weight decay (5e-3) prevents sparse table memorization without crushing T4/T5;
+    # SEZ innate survival table uses gentle LR + tiny decay so neural PSQTs refine smoothly around Queen=900!
     adamw_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=5.0e-3)
+    sez_tx = optax.adamw(learning_rate=sched_sez, weight_decay=1.0e-4)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.multi_transform({"muon": muon_tx, "adamw": adamw_tx}, labels),
+        optax.multi_transform({"muon": muon_tx, "adamw": adamw_tx, "sez": sez_tx}, labels),
     )
     return tx, sched_muon, sched_adamw
 
@@ -239,7 +251,7 @@ def _save_metrics_and_dashboard(history: List[Dict[str, Any]], ckpt_dir: Path) -
 
         epochs = [r.get("epoch", i + 1) for i, r in enumerate(history)]
         fig, axes = plt.subplots(2, 3, figsize=(16, 9))
-        fig.suptitle("Saccadion-2 Causal Smart TPU Training Telemetry", fontsize=14, fontweight="bold")
+        fig.suptitle("Saccadion-4 (SEZ+GF+DNp) Smart TPU Training Telemetry", fontsize=14, fontweight="bold")
 
         # Panel 1: Total Train vs Val Loss
         ax = axes[0, 0]
@@ -430,7 +442,7 @@ def train_saccadion_smart(
     total_steps = steps_per_epoch * epochs
     dev_label = f"{n_dev}x {jax.devices()[0].platform.upper()}"
 
-    print(f"=== SACCADION-2 CAUSAL SMART TPU TRAINER ===")
+    print(f"=== SACCADION-4 (SEZ+GF+DNp) SMART TPU TRAINER ===")
     print(f"Devices      : {dev_label} (pmap={use_pmap})")
     print(f"Model Tier   : tier_id={cfg.tier_id} (acc_dim={cfg.acc_dim}, D={cfg.stream_b_dim}, CX={cfg.cx_dim}, T_max={cfg.cx_max_ticks})")
     print(f"Dataset      : train={len(train_ds):,} pos | val={len(val_ds):,} pos | traj={len(traj_ds)//12:,} windows")
@@ -505,7 +517,7 @@ def train_saccadion_smart(
             )
             out_b = forward_stream_b(
                 cur_p, cfg, batch["board_feats"], out_a["mbon_summary"],
-                num_ticks=num_ticks, qat=qat,
+                num_ticks=num_ticks, sez_cp=out_a["sez_cp"], qat=qat,
             )
             out_a_steered = forward_stream_a(
                 cur_p, cfg, claws_idx,
@@ -552,7 +564,7 @@ def train_saccadion_smart(
             )
             out_b = forward_stream_b(
                 p, cfg, batch["board_feats"], out_a["mbon_summary"],
-                num_ticks=num_ticks, qat=qat,
+                num_ticks=num_ticks, sez_cp=out_a["sez_cp"], qat=qat,
             )
             out_a_s = forward_stream_a(
                 p, cfg, claws_idx,
@@ -574,9 +586,8 @@ def train_saccadion_smart(
             wdl_true = batch["wdl_target"]
             wdl_acc = jnp.mean((jnp.argmax(wdl_pred, axis=-1) == jnp.argmax(wdl_true, axis=-1)).astype(jnp.float32)) * 100.0
 
-            exp_pred = jnp.clip(wdl_pred[:, 0] - wdl_pred[:, 2], -0.99, 0.99)
             exp_true = jnp.clip(wdl_true[:, 0] - wdl_true[:, 2], -0.99, 0.99)
-            cp_mae = jnp.mean(jnp.abs(400.0 * jnp.arctanh(exp_pred) - 400.0 * jnp.arctanh(exp_true)))
+            cp_mae = jnp.mean(jnp.abs(out_b["pred_cp"] - 400.0 * jnp.arctanh(exp_true)))
 
             m["top1_acc"] = top1_acc
             m["top3_acc"] = top3_acc
@@ -608,7 +619,8 @@ def train_saccadion_smart(
                 tbatch["lh_feat"][:, 0], tbatch["phase_bucket"][:, 0], qat=False,
             )
             out_b0 = forward_stream_b(
-                cur_p, cfg, tbatch["board_feats"][:, 0], out_a0["mbon_summary"], num_ticks=2, qat=False,
+                cur_p, cfg, tbatch["board_feats"][:, 0], out_a0["mbon_summary"],
+                num_ticks=2, sez_cp=out_a0["sez_cp"], qat=False,
             )
             out_a2 = forward_stream_a(
                 cur_p, cfg, claws_idx,
@@ -616,7 +628,8 @@ def train_saccadion_smart(
                 tbatch["lh_feat"][:, 2], tbatch["phase_bucket"][:, 2], qat=False,
             )
             out_b2 = forward_stream_b(
-                cur_p, cfg, tbatch["board_feats"][:, 2], out_a2["mbon_summary"], num_ticks=2, qat=False,
+                cur_p, cfg, tbatch["board_feats"][:, 2], out_a2["mbon_summary"],
+                num_ticks=2, sez_cp=out_a2["sez_cp"], qat=False,
             )
             loss_jepa = jepa_vicreg_loss(out_b0["global_latent"], out_b2["global_latent"])
             return loss_traj + loss_apl + 0.25 * loss_jepa, {
@@ -640,12 +653,42 @@ def train_saccadion_smart(
     try:
         for epoch in range(start_epoch, epochs + 1):
             t_ep0 = time.time()
+            # Keep QAT disabled until the final 2 epochs so validation converges smoothly!
+            qat_active = epoch >= max(2, epochs - 1) and epochs >= 4
             if epoch <= stage1_end:
-                stage, stage_name, num_ticks, apl_target, qat = 1, "Optic-Vision", 3, 0.16, False
+                stage, stage_name, num_ticks, apl_target, qat = 1, "Optic-SEZ-Vision", 3, 0.16, False
             elif epoch <= stage2_end:
-                stage, stage_name, num_ticks, apl_target, qat = 2, "Phasor-Causal", min(4, cfg.cx_max_ticks), 0.10, False
+                stage, stage_name, num_ticks, apl_target, qat = 2, "Phasor-Causal", min(4, cfg.cx_max_ticks), 0.10, qat_active
             else:
-                stage, stage_name, num_ticks, apl_target, qat = 3, "Meta-Dopamine+QAT", min(4, cfg.cx_max_ticks), 0.08, True
+                stage, stage_name, num_ticks, apl_target, qat = (
+                    3,
+                    "Meta-Dopamine+QAT" if qat_active else "Meta-Dopamine",
+                    min(4, cfg.cx_max_ticks),
+                    0.08,
+                    qat_active,
+                )
+
+            # Stage 2 & 3: Run Meta-Dopamine + JEPA 2-Ply at the START of the epoch (before main
+            # full-tick sweep!) so policy/WDL weights settle cleanly before held-out validation!
+            meta_gain_vals: List[float] = []
+            jepa_loss_vals: List[float] = []
+            if stage >= 2 and len(traj_ds) >= 12:
+                host_params = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
+                host_opt = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
+                traj_bsz = max(4, min(32, (len(traj_ds) // 12) // 2 or 1))
+                max_t_batches = 12 if stage == 2 else 28
+                for t_i, tbatch_np in enumerate(traj_ds.iter_trajectory_batches(traj_bsz, window_k=12, seed=epoch * 31)):
+                    tbatch = {k: jnp.asarray(v) for k, v in tbatch_np.items()}
+                    host_params, host_opt, mm = stage_meta_jepa_step(host_params, host_opt, tbatch)
+                    meta_gain_vals.append(float(mm["adapt_gain"]))
+                    jepa_loss_vals.append(float(mm["jepa_loss"]))
+                    if t_i + 1 >= max_t_batches:
+                        break
+                if use_pmap:
+                    params_dev = jax.device_put_replicated(host_params, jax.local_devices())
+                    opt_dev = jax.device_put_replicated(host_opt, jax.local_devices())
+                else:
+                    params_dev, opt_dev = host_params, host_opt
 
             train_fn = get_train_step(num_ticks, qat)
             val_fn = get_val_step(num_ticks, qat)
@@ -702,28 +745,9 @@ def train_saccadion_smart(
                     save_checkpoint(ckpt_file, host_p, host_o, epoch - 1, global_step, best_val_loss, history)
                     last_ckpt_time = time.time()
 
-            # Unwrap single-host copy for Stage-3 Meta-Dopamine scan & Validation
+            # Unwrap single-host copy for Validation & .saccnet export
             host_params = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
             host_opt = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
-
-            # Stage 2 & 3: Active Meta-Dopamine Trajectory Scan (Dop1R1+Dop1R2+MBON->DAN SOC) + JEPA 2-Ply!
-            meta_gain_vals: List[float] = []
-            jepa_loss_vals: List[float] = []
-            if stage >= 2 and len(traj_ds) >= 12:
-                traj_bsz = max(4, min(32, (len(traj_ds) // 12) // 2 or 1))
-                max_t_batches = 12 if stage == 2 else 36
-                for t_i, tbatch_np in enumerate(traj_ds.iter_trajectory_batches(traj_bsz, window_k=12, seed=epoch * 31)):
-                    tbatch = {k: jnp.asarray(v) for k, v in tbatch_np.items()}
-                    host_params, host_opt, mm = stage_meta_jepa_step(host_params, host_opt, tbatch)
-                    meta_gain_vals.append(float(mm["adapt_gain"]))
-                    jepa_loss_vals.append(float(mm["jepa_loss"]))
-                    if t_i + 1 >= max_t_batches:
-                        break
-                if use_pmap:
-                    params_dev = jax.device_put_replicated(host_params, jax.local_devices())
-                    opt_dev = jax.device_put_replicated(host_opt, jax.local_devices())
-                else:
-                    params_dev, opt_dev = host_params, host_opt
 
             # Full Held-Out Validation Evaluation (Games + Dedicated 16-Causal-Concept Puzzles!)
             val_acc: Dict[str, List[float]] = {

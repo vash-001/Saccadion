@@ -17,10 +17,14 @@ pub struct SaccadionWeights {
     /// Deterministic FlyHash sparse claw indices: [plastic_dim_per_hemi * flyhash_claws].
     pub flyhash_claws: Vec<u16>,
 
-    // ==================== STREAM A (Fast Reflex & Calyx) ====================
+    // ==================== STREAM A (Fast Reflex, SEZ & Calyx) ====================
     /// Sparse feature transformer: [sparse_input_dim * acc_dim] (row-major by feature index).
     pub a_ft_weight: Vec<f32>,
     pub a_ft_bias: Vec<f32>,
+    /// SEZ (Subesophageal Zone) Innate Survival Valence table: [sparse_input_dim * num_phase_stacks].
+    /// Initialized to biological piece-square survival values (P=1, N=3.2, B=3.3, R=5, Q=9 pawns)
+    /// and fine-tuned end-to-end so MBONs/CX modulate innate value instead of re-learning material!
+    pub a_sez_weight: Vec<f32>,
     /// FlyHash claw weights for plastic KCs: [plastic_dim_per_hemi * flyhash_claws].
     pub a_claw_weight: Vec<f32>,
     /// APL global GABA inhibition scaling per hemisphere [2] and per-KC thresholds [acc_dim].
@@ -139,6 +143,43 @@ fn alloc_init(len: usize, scale: f32, rng: &mut u64) -> Vec<f32> {
     (0..len).map(|_| rand_uniform_scaled(rng, scale)).collect()
 }
 
+/// Deterministic Drosophila SEZ (Subesophageal Zone) innate survival valence prior (in pawn units).
+/// Identical to `training/saccadion_tpu/model.py::init_sez_innate_weights`.
+pub fn init_sez_innate_weights(sparse_input_dim: usize, num_phase_stacks: usize) -> Vec<f32> {
+    let mut w = vec![0.0f32; sparse_input_dim * num_phase_stacks];
+    let piece_pawns = [1.00f32, 3.20, 3.30, 5.00, 9.00, 0.00];
+    let halfka_dim = 16 * 768;
+    for bucket in 0..16usize {
+        for rel_c in 0..2usize {
+            let sign = if rel_c == 0 { 1.0f32 } else { -1.0f32 };
+            for piece in 0..6usize {
+                let base_v = piece_pawns[piece];
+                for rel_sq in 0..64usize {
+                    let f = bucket * 768 + (rel_c * 6 + piece) * 64 + rel_sq;
+                    if f >= halfka_dim || f >= sparse_input_dim {
+                        continue;
+                    }
+                    let file = (rel_sq & 7) as f32;
+                    let rank = (rel_sq >> 3) as f32;
+                    let center = 1.0 - ((file - 3.5).abs() + (rank - 3.5).abs()) / 7.0;
+                    let psq_bonus = match piece {
+                        0 => 0.06 * rank + 0.04 * center, // Pawn advancement & center
+                        1 | 2 => 0.14 * center,           // Minor piece centralization
+                        3 => 0.04 * center,               // Rook activity
+                        4 => 0.05 * center,               // Queen centralization
+                        _ => 0.0,
+                    };
+                    let val = sign * (base_v + psq_bonus);
+                    for s in 0..num_phase_stacks {
+                        w[f * num_phase_stacks + s] = val;
+                    }
+                }
+            }
+        }
+    }
+    w
+}
+
 impl SaccadionWeights {
     /// Deterministic He/Xavier initialization matching our exact biological sign constraints.
     pub fn init_random(cfg: ModelConfig, seed: u64) -> Self {
@@ -157,6 +198,7 @@ impl SaccadionWeights {
 
         let a_ft_weight = alloc_init(cfg.sparse_input_dim * cfg.acc_dim, s_ft, &mut rng);
         let a_ft_bias = vec![0.05; cfg.acc_dim];
+        let a_sez_weight = init_sez_innate_weights(cfg.sparse_input_dim, stacks);
         let a_claw_weight = alloc_init(plastic_dim * cfg.flyhash_claws, 0.35, &mut rng);
         let a_apl_thresh = vec![0.18; cfg.acc_dim];
 
@@ -176,6 +218,7 @@ impl SaccadionWeights {
             flyhash_claws,
             a_ft_weight,
             a_ft_bias,
+            a_sez_weight,
             a_claw_weight,
             a_apl_beta: [0.85, 0.85],
             a_apl_thresh,
@@ -254,7 +297,7 @@ impl SaccadionWeights {
 
     /// Total static parameter count (sparse_params, dense_params).
     pub fn param_counts(&self) -> (usize, usize) {
-        let sparse = self.a_ft_weight.len() + self.a_ft_bias.len();
+        let sparse = self.a_ft_weight.len() + self.a_ft_bias.len() + self.a_sez_weight.len();
         let dense = self.a_claw_weight.len()
             + 2
             + self.a_apl_thresh.len()
@@ -365,6 +408,7 @@ impl SaccadionWeights {
 
         write_slice(&mut w, &self.a_ft_weight)?;
         write_slice(&mut w, &self.a_ft_bias)?;
+        write_slice(&mut w, &self.a_sez_weight)?;
         write_slice(&mut w, &self.a_claw_weight)?;
         write_slice(&mut w, &self.a_apl_beta)?;
         write_slice(&mut w, &self.a_apl_thresh)?;
@@ -463,10 +507,10 @@ impl SaccadionWeights {
         };
 
         let ver = read_u32(&mut r)?;
-        if ver != SACCNET_VERSION {
+        if ver != SACCNET_VERSION && ver != 3 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Unsupported SACCNET version: {}", ver),
+                format!("Unsupported SACCNET version: {} (expected 3 or {})", ver, SACCNET_VERSION),
             ));
         }
         let tier_id = read_u32(&mut r)?;
@@ -510,6 +554,11 @@ impl SaccadionWeights {
 
         let a_ft_weight = read_vec(&mut r, cfg.sparse_input_dim * cfg.acc_dim)?;
         let a_ft_bias = read_vec(&mut r, cfg.acc_dim)?;
+        let a_sez_weight = if ver >= 4 {
+            read_vec(&mut r, cfg.sparse_input_dim * stacks)?
+        } else {
+            init_sez_innate_weights(cfg.sparse_input_dim, stacks)
+        };
         let a_claw_weight = read_vec(&mut r, plastic_dim * cfg.flyhash_claws)?;
         let apl_v = read_vec(&mut r, 2)?;
         let a_apl_thresh = read_vec(&mut r, cfg.acc_dim)?;
@@ -584,6 +633,7 @@ impl SaccadionWeights {
             flyhash_claws,
             a_ft_weight,
             a_ft_bias,
+            a_sez_weight,
             a_claw_weight,
             a_apl_beta: [apl_v[0], apl_v[1]],
             a_apl_thresh,

@@ -62,12 +62,15 @@ fn matvec(w: &[f32], x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
 /// Runs the complete Stream B Deep Strategic Brain on `pos` with legal moves `legal_moves`.
 ///
 /// `mbon_summary` is the 32-dim Push-Pull MBON signal from Stream A (feeding CX Ring/Tangential).
+/// `sez_cp` is the SEZ innate survival valence in centipawns fused cleanly into deep strategic value.
 /// `serotonin` in [0.5, 1.5] modulates hDelta 180-deg prophylaxis weight & strategic persistence.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_stream_b(
     pos: &Position,
     legal_moves: &MoveList,
     w: &SaccadionWeights,
     mbon_summary: &[f32],
+    sez_cp: f32,
     plasticity: Option<&DopaminePlasticityState>,
     novelty_score: f32,
     serotonin: f32,
@@ -458,9 +461,14 @@ pub fn evaluate_stream_b(
         let row = &w.b_wdl_w[c * (d + cx_d)..(c + 1) * (d + cx_d)];
         wdl_logits[c] = dot_f32(row, &global_vec) + w.b_wdl_b[c];
     }
-    let mut wdl_probs = wdl_logits;
+    let mut pos_probs = wdl_logits;
+    softmax_inplace(&mut pos_probs);
+    let deep_pos_cp = wdl_to_cp(pos_probs);
+    let deep_cp = (sez_cp + deep_pos_cp).clamp(-2500.0, 2500.0);
+
+    let sez_l = (sez_cp / 280.0).clamp(-5.0, 5.0);
+    let mut wdl_probs = [wdl_logits[0] + sez_l, wdl_logits[1], wdl_logits[2] - sez_l];
     softmax_inplace(&mut wdl_probs);
-    let deep_cp = wdl_to_cp(wdl_probs);
 
     let pfl2_sharpness = sigmoid(dot_f32(&w.b_pfl2_w, &global_vec) + w.b_pfl2_b);
 

@@ -132,6 +132,7 @@ def compute_multitask_loss(
     wdl_t = batch["wdl_target"]
 
     # 1. Deep Supervision across all Central Complex deliberation ticks + Stream A + B->A Distill
+    #    + Direct Centipawn Smooth-L1 Loss (non-saturating material & positional calibration up to +/-2500 cp!)
     ticks = out_b["per_tick_wdl"]
     n_t = len(ticks)
     w_sum = sum(range(1, n_t + 1))
@@ -139,7 +140,12 @@ def compute_multitask_loss(
     loss_wdl_a = soft_kl_loss(out_a["wdl_logits"], wdl_t)
     probs_b_sg = jax.lax.stop_gradient(jax.nn.softmax(out_b["wdl_logits"], axis=-1))
     loss_b_to_a = soft_kl_loss(out_a["wdl_logits"], probs_b_sg)
-    loss_wdl = loss_wdl_b + loss_wdl_a + 0.30 * loss_b_to_a
+
+    target_exp = jnp.clip(wdl_t[:, 0] - wdl_t[:, 2], -0.995, 0.995)
+    target_cp_scaled = jnp.arctanh(target_exp)  # target_cp / 400.0
+    loss_cp_a = huber_loss(out_a["pred_cp"] / 400.0, target_cp_scaled, delta=0.5)
+    loss_cp_b = huber_loss(out_b["pred_cp"] / 400.0, target_cp_scaled, delta=0.5)
+    loss_wdl = loss_wdl_b + loss_wdl_a + 0.30 * loss_b_to_a + 0.45 * (loss_cp_a + loss_cp_b)
 
     # 2. Sparse Top-4 PFL3 Policy Loss
     loss_policy = sparse_topk_policy_loss(

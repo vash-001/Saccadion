@@ -7,7 +7,7 @@ use saccadion_chess::perft::perft;
 use saccadion_chess::position::Position;
 use saccadion_chess::types::{Color, MoveList};
 use saccadion_nn::config::ModelConfig;
-use saccadion_nn::stream_a::evaluate_stream_a;
+use saccadion_nn::stream_a::{evaluate_giant_fiber_cp, evaluate_stream_a};
 use saccadion_nn::stream_b::evaluate_stream_b;
 use saccadion_nn::weights::SaccadionWeights;
 use saccadion_search::{SearchConfig, SearchEngine, MATE_SCORE, MATE_THRESHOLD};
@@ -38,6 +38,7 @@ fn print_bio_eval(engine: &mut SearchEngine, pos: &mut Position) {
         None,
         1.0,
     );
+    let gf_cp = evaluate_giant_fiber_cp(pos, &engine.weights, &mut engine.ws_a);
     let novelty = engine
         .plasticity
         .mbon_alpha_prime3_novelty(&out_a.active_apbp_stm, false);
@@ -46,15 +47,20 @@ fn print_bio_eval(engine: &mut SearchEngine, pos: &mut Position) {
         &legal,
         &engine.weights,
         &out_a.mbon_summary,
+        out_a.sez_cp,
         Some(&engine.plasticity),
         novelty,
         1.0,
         true,
     );
     let (sp, dp) = engine.weights.param_counts();
-    println!("=== SACCADION BIOLOGICAL CIRCUIT TELEMETRY ===");
+    println!("=== SACCADION-4 BIOLOGICAL CIRCUIT TELEMETRY ===");
     println!("FEN                : {}", pos.to_fen());
     println!("Params (Sparse/Dns): {} / {}", sp, dp);
+    println!(
+        "SEZ / Giant Fiber  : sez={:+.1} cp | giant_fiber={:+} cp",
+        out_a.sez_cp, gf_cp
+    );
     println!(
         "Stream A Eval (cp) : total={:+.1} (frozen={:+.1}, gamma={:+.1}, game={:+.1})",
         out_a.total_cp, out_a.slow_cp, out_a.gamma_cp, out_a.game_cp
@@ -149,6 +155,7 @@ fn main() {
             &legal,
             &weights,
             &out_a.mbon_summary,
+            out_a.sez_cp,
             None,
             0.0,
             1.0,
@@ -174,11 +181,29 @@ fn main() {
         return;
     }
 
-    // Default engine starts with Tiny/Nano weights unless user loads a trained `.saccnet` via UCI
-    let weights = SaccadionWeights::init_random(ModelConfig::tiny(), 0x5ACC_AD10);
-    let mut engine = SearchEngine::new(weights, 32);
+    // Auto-load `saccadion_best.saccnet` if present in CWD or alongside the binary, else Tiny fallback
+    let auto_weights = [
+        Path::new("saccadion_best.saccnet").to_path_buf(),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("saccadion_best.saccnet")))
+            .unwrap_or_default(),
+    ]
+    .into_iter()
+    .find(|p| !p.as_os_str().is_empty() && p.exists())
+    .and_then(|p| SaccadionWeights::load_saccnet(&p).ok());
+
+    let weights = auto_weights.unwrap_or_else(|| SaccadionWeights::init_random(ModelConfig::tiny(), 0x5ACC_AD10));
+    let mut hash_mb = 64usize;
+    let default_threads = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(1, 4))
+        .unwrap_or(1);
+    let mut engine = SearchEngine::new(weights, hash_mb);
     let mut pos = Position::startpos();
-    let mut base_cfg = SearchConfig::default();
+    let mut base_cfg = SearchConfig {
+        threads: default_threads,
+        ..SearchConfig::default()
+    };
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -194,9 +219,10 @@ fn main() {
         }
         match tokens[0] {
             "uci" => {
-                println!("id name Saccadion 0.1.0");
+                println!("id name Saccadion 4.0 (Drosophila SEZ+GF+DNp)");
                 println!("id author Saccadion Research Team");
-                println!("option name Hash type spin default 32 min 1 max 4096");
+                println!("option name Hash type spin default {} min 1 max 4096", hash_mb);
+                println!("option name Threads type spin default {} min 1 max 64", default_threads);
                 println!("option name WeightsPath type string default ");
                 println!("option name AdaptivePlasticity type check default true");
                 println!("option name UseStreamB type check default true");
@@ -223,13 +249,19 @@ fn main() {
                     match name.as_str() {
                         "Hash" => {
                             if let Ok(mb) = val.parse::<usize>() {
-                                engine.tt = saccadion_search::TranspositionTable::new_mb(mb);
+                                hash_mb = mb.clamp(1, 4096);
+                                engine.resize_tt(hash_mb);
+                            }
+                        }
+                        "Threads" => {
+                            if let Ok(t) = val.parse::<usize>() {
+                                base_cfg.threads = t.clamp(1, 64);
                             }
                         }
                         "WeightsPath" if !val.is_empty() => {
                             match SaccadionWeights::load_saccnet(Path::new(&val)) {
                                 Ok(w) => {
-                                    engine = SearchEngine::new(w, 32);
+                                    engine = SearchEngine::new(w, hash_mb);
                                     println!("info string Loaded .saccnet weights from {}", val);
                                 }
                                 Err(e) => {

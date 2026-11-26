@@ -357,6 +357,7 @@ class StockfishSparringArena:
         for cand in [
             repo_root / "target" / "release" / "saccadion",
             repo_root / "target" / "release" / "saccadion.exe",
+            Path("/content/drive/MyDrive/Saccadion_TPU/bin_v6/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v5/saccadion"),
         ]:
             if cand.exists():
@@ -507,7 +508,7 @@ class StockfishSparringArena:
                 if sacc_proc is None or mtime > self._last_weights_mtime:
                     if sacc_proc is not None:
                         sacc_proc.close()
-                    sacc_proc = _UciProcess([str(rust_bin)], {"Hash": "16"})
+                    sacc_proc = _UciProcess([str(rust_bin)], {"Hash": "32", "Threads": "2"})
                     sacc_proc.set_option("WeightsPath", str(self.weights_path))
                     self._last_weights_mtime = mtime
 

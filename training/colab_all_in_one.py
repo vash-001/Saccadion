@@ -28,14 +28,14 @@ from pathlib import Path
 
 # ======================== USER CONFIGURATION ========================
 REPO_URL = "https://github.com/vash-001/Saccadion.git"
-MODEL_TIER = "nano"          # "tiny" (smoke test) | "nano" (fast ablation) | "pro" (full 62M)
-DATA_SOURCE = "auto"         # "auto" (Elite + Fishtest + Causal Puzzles)
-MAX_GAMES = 12000            # ~1.2M positions (prevents overfitting on Nano!)
-MAX_CAUSAL_PUZZLES = 35000   # Elite Rating >= 2000, Popularity >= 85, 16 Causal Concepts
-EPOCHS = 15                  # Smart 3-stage Neurodevelopmental Causal curriculum
-BATCH_SIZE = 1024            # Optimal for TPU v5e-1 / v2-8
-LR_MUON = 4.0e-3             # Calibrated Muon peak LR
-LR_ADAMW = 6.0e-4            # Calibrated AdamW peak LR
+MODEL_TIER = "pro"           # "tiny" (smoke test) | "nano" (fast ablation) | "pro" (full 58MB)
+DATA_SOURCE = "auto"         # "auto" (70% Fishtest + 30% Lichess 1900+ [%eval] + Puzzles + Looming)
+MAX_GAMES = 14000            # ~1.5M positions (100% engine-evaluated!)
+MAX_CAUSAL_PUZZLES = 40000   # Elite Rating >= 2000, Popularity >= 85, 16 Causal Concepts
+EPOCHS = 20                  # Smart 3-stage Neurodevelopmental Saccadion-4 curriculum
+BATCH_SIZE = 512             # Optimal for PRO on TPU v5e-1
+LR_MUON = 3.5e-3             # Calibrated Muon peak LR
+LR_ADAMW = 5.0e-4            # Calibrated AdamW peak LR
 BUILD_RUST_TOOLS = True      # Builds Pure-Rust pre-decoder + UCI engine once & caches on Drive!
 ENABLE_CPU_ARENA = True      # Background Stockfish sparring on idle CPU cores -> REAL ELO!
 LIVE_HUD_HZ = 20.0           # Smooth 20 Hz flicker-free Colab HTML/SVG cockpit
@@ -120,9 +120,9 @@ def main() -> None:
     # 3. Install lightweight Python packages
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "optax", "python-chess", "zstandard", "matplotlib"])
 
-    # 4. Build or restore Pure-Rust tools (v5 = SACCNET v3 3-Layer Optic Stack + Fused Search!)
+    # 4. Build or restore Pure-Rust tools (v6 = SACCNET v4 SEZ + Giant Fiber + Parallel DNp!)
     if in_colab and BUILD_RUST_TOOLS:
-        _ensure_rust_binaries(work_root, persist_root / "bin_v5")
+        _ensure_rust_binaries(work_root, persist_root / "bin_v6")
 
     # 5. Purge any stale in-memory `saccadion_tpu.*` submodules before importing!
     train_pkg_root = str(work_root / "training")
@@ -137,13 +137,14 @@ def main() -> None:
     from saccadion_tpu.fetch_and_prepare_data import (
         download_and_pack_elite_causal_puzzles,
         fetch_and_prepare,
+        generate_looming_blunder_shard,
     )
     from saccadion_tpu.train import train_saccadion_smart
 
     print("JAX version:", jax.__version__, "| Devices:", jax.devices())
 
-    # 6. Download & organize chess datasets + Elite 16-Causal-Concept Puzzles (cached on Drive)
-    data_dir = persist_root / "data"
+    # 6. Download & organize chess datasets + Elite 16-Causal-Concept Puzzles + Looming Survival
+    data_dir = persist_root / "data_v4_sez"
     shard_dir = data_dir / "shards"
     if not list(shard_dir.glob("train_random_*.sacc")):
         shard_dir = fetch_and_prepare(
@@ -156,11 +157,12 @@ def main() -> None:
         )
     else:
         print(f"Using cached organized shards in {shard_dir}")
-        # Seamlessly add Elite Causal Puzzles to existing cached datasets if missing!
         if MAX_CAUSAL_PUZZLES > 0 and not (shard_dir / "train_random_puzzles.sacc").exists():
             download_and_pack_elite_causal_puzzles(
                 shard_dir, max_puzzles=MAX_CAUSAL_PUZZLES, val_pct=5
             )
+        if not (shard_dir / "train_random_looming.sacc").exists():
+            generate_looming_blunder_shard(shard_dir, max_samples=40000)
 
     # 7. Launch Smart Epoch-by-Epoch Causal TPU Training with 50x FastCache, 20Hz HUD, & CPU Arena
     cfg = {
@@ -169,8 +171,8 @@ def main() -> None:
         "pro": SaccadionConfig.pro,
     }[MODEL_TIER]()
 
-    ckpt_dir = persist_root / f"checkpoints_{MODEL_TIER}"
-    export_dir = persist_root / f"exports_{MODEL_TIER}"
+    ckpt_dir = persist_root / f"checkpoints_{MODEL_TIER}_v4"
+    export_dir = persist_root / f"exports_{MODEL_TIER}_v4"
     fast_cache = Path("/content/sacc_cache") if in_colab else (data_dir / "cache")
 
     _, history = train_saccadion_smart(

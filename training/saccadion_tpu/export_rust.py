@@ -25,6 +25,7 @@ from .config import (
 SACCNET_TENSOR_ORDER = [
     "a_ft_weight",
     "a_ft_bias",
+    "a_sez_weight",
     "a_claw_weight",
     "a_apl_beta",
     "a_apl_thresh",
@@ -132,6 +133,8 @@ def export_params_to_saccnet(
 
 def init_numpy_params(cfg: SaccadionConfig, seed: int = 1234) -> Dict[str, np.ndarray]:
     """Pure-NumPy initializer with identical shapes to JAX `init_saccadion_params`."""
+    from .config import init_sez_innate_weights
+
     rng = np.random.default_rng(seed)
     u = lambda shape, scale: rng.uniform(-scale, scale, size=shape).astype(np.float32)
 
@@ -145,6 +148,7 @@ def init_numpy_params(cfg: SaccadionConfig, seed: int = 1234) -> Dict[str, np.nd
     return {
         "a_ft_weight": u((cfg.sparse_input_dim, cfg.acc_dim), 0.05),
         "a_ft_bias": np.full((cfg.acc_dim,), 0.05, dtype=np.float32),
+        "a_sez_weight": init_sez_innate_weights(cfg.sparse_input_dim, stacks),
         "a_claw_weight": u((plastic_dim, cfg.flyhash_claws), 0.35),
         "a_apl_beta": np.array([0.85, 0.85], dtype=np.float32),
         "a_apl_thresh": np.full((cfg.acc_dim,), 0.18, dtype=np.float32),
@@ -265,11 +269,14 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
     rec["meta_flags"] = (0x0F << 1) | (7 << 17)
     sp_s, sp_o, board, lh_feat, phase = decode_record_features(rec, max_sparse=96)
 
-    # Stream A reference forward pass (NumPy mirror of model.py)
+    # Stream A reference forward pass (NumPy mirror of model.py + SEZ innate valence)
     ab_dim, _, _ = cfg.lobe_dims_per_hemi()
     claws = build_flyhash_claws(cfg)
     acc_s = np.sum(params["a_ft_weight"][sp_s[sp_s >= 0]], axis=0) + params["a_ft_bias"]
     acc_o = np.sum(params["a_ft_weight"][sp_o[sp_o >= 0]], axis=0) + params["a_ft_bias"]
+    sez_s = float(np.sum(params["a_sez_weight"][sp_s[sp_s >= 0], phase]))
+    sez_o = float(np.sum(params["a_sez_weight"][sp_o[sp_o >= 0], phase]))
+    sez_cp_py = (sez_s - sez_o) * 50.0
     pre_s = np.concatenate([acc_s[:ab_dim], np.sum(acc_s[claws] * params["a_claw_weight"], axis=-1)])
     pre_o = np.concatenate([acc_o[:ab_dim], np.sum(acc_o[claws] * params["a_claw_weight"], axis=-1)])
     kc_s = np.clip(pre_s - params["a_apl_beta"][0] * np.mean(np.maximum(pre_s, 0.0)) - params["a_apl_thresh"], 0.0, 1.0) ** 2
@@ -286,9 +293,11 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
     lh_veto = np.array([0.7 * lh_raw[0], 0.65 * lh_raw[1], 0.7 * lh_raw[2], 0.7 * lh_raw[3]], dtype=np.float32)
 
     smp_in = np.concatenate([mbon_s, mbon_o, lh_veto])
-    wdl_a = _softmax(params["a_smp_w"][phase] @ smp_in + params["a_smp_b"][phase])
-    exp_a = float(np.clip(wdl_a[0] - wdl_a[2], -0.999, 0.999))
-    slow_cp_py = float(np.clip(400.0 * np.arctanh(exp_a), -2500.0, 2500.0) * (1.0 - 0.55 * lh_veto[1]))
+    wdl_a_raw = params["a_smp_w"][phase] @ smp_in + params["a_smp_b"][phase]
+    mbon_probs_a = _softmax(wdl_a_raw)
+    exp_a = float(np.clip(mbon_probs_a[0] - mbon_probs_a[2], -0.999, 0.999))
+    mbon_cp_py = float(np.clip(400.0 * np.arctanh(exp_a), -2500.0, 2500.0))
+    slow_cp_py = float(np.clip((sez_cp_py + mbon_cp_py) * (1.0 - 0.55 * lh_veto[1]), -2500.0, 2500.0))
     mbon_summary = mbon_s - 0.5 * mbon_o
 
     # Stream B reference forward pass (all cx_max_ticks, adaptive_halt=False)
@@ -352,8 +361,10 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
         sq_state = _ln(sq_state + 0.5 * sq_upd, params["b_sq_ln_g"], params["b_sq_ln_b"])
 
     global_vec = np.concatenate([broad_mean, np.mean(cx_p, axis=0)])
-    wdl_b = _softmax(params["b_wdl_w"] @ global_vec + params["b_wdl_b"])
-    deep_cp_py = float(np.clip(400.0 * np.arctanh(np.clip(wdl_b[0] - wdl_b[2], -0.999, 0.999)), -2500.0, 2500.0))
+    wdl_b_raw = params["b_wdl_w"] @ global_vec + params["b_wdl_b"]
+    pos_probs_b = _softmax(wdl_b_raw)
+    deep_pos_cp = float(np.clip(400.0 * np.arctanh(np.clip(pos_probs_b[0] - pos_probs_b[2], -0.999, 0.999)), -2500.0, 2500.0))
+    deep_cp_py = float(np.clip(sez_cp_py + deep_pos_cp, -2500.0, 2500.0))
     pfl2_py = float(_sigmoid(np.dot(params["b_pfl2_w"], global_vec) + params["b_pfl2_b"]))
     press_py = np.tanh(params["b_press_w"] @ global_vec + params["b_press_b"])
 
