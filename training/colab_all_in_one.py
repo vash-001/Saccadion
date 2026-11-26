@@ -120,9 +120,9 @@ def main() -> None:
     # 3. Install lightweight Python packages
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "optax", "python-chess", "zstandard", "matplotlib"])
 
-    # 4. Build or restore Pure-Rust tools (v8 = Saccadion-6 FlyWire GNN + INT8 MBON + LC4 + WorldModel!)
+    # 4. Build or restore Pure-Rust tools (v9 = Saccadion-6 + 4-Row AVX2 Stream B + Singular/LMP Search!)
     if in_colab and BUILD_RUST_TOOLS:
-        _ensure_rust_binaries(work_root, persist_root / "bin_v8")
+        _ensure_rust_binaries(work_root, persist_root / "bin_v9")
 
     # 5. Purge any stale in-memory `saccadion_tpu.*` submodules before importing!
     train_pkg_root = str(work_root / "training")

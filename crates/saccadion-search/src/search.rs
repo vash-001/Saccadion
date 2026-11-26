@@ -92,6 +92,7 @@ struct DnpWorker {
     history: [[[i32; 64]; 64]; 2],
     countermoves: [[Move; 64]; 64],
     dpm_corr: [i32; 4096],
+    static_evals: [i32; MAX_PLY],
     nodes: u64,
     q_nodes: u64,
     stream_b_evals: u64,
@@ -140,6 +141,7 @@ impl DnpWorker {
             history: [[[0; 64]; 64]; 2],
             countermoves: [[Move::NULL; 64]; 64],
             dpm_corr: [0; 4096],
+            static_evals: [0; MAX_PLY],
             nodes: 0,
             q_nodes: 0,
             stream_b_evals: 0,
@@ -192,6 +194,13 @@ impl DnpWorker {
         false
     }
 
+    #[inline(always)]
+    fn update_history(&mut self, stm_idx: usize, mv: Move, delta: i32) {
+        let h = &mut self.history[stm_idx][mv.from_sq().index()][mv.to_sq().index()];
+        let clamped = delta.clamp(-16_384, 16_384);
+        *h += clamped - ((*h * clamped.abs()) / 16_384);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn pvs(
         &mut self,
@@ -202,6 +211,7 @@ impl DnpWorker {
         beta: i32,
         is_pv: bool,
         prev_move: Move,
+        excluded_move: Move,
         parent_cent_mask: Option<&[f32]>,
         expected_eval_from_parent: f32,
         pv_out: &mut Vec<Move>,
@@ -234,25 +244,31 @@ impl DnpWorker {
 
         self.nodes += 1;
 
-        // 1. Probe Lock-Free Atomic Transposition Table
+        // 1. Probe Lock-Free Atomic Transposition Table (skipped during Singular verification)
         let mut tt_move = Move::NULL;
-        if let Some(entry) = self.tt.probe(pos.hash) {
-            tt_move = entry.best_move;
-            if !is_pv && entry.depth as i32 >= depth {
-                let tt_score = score_from_tt(entry.score as i32, ply as i32);
-                match entry.bound {
-                    Bound::Exact => return tt_score,
-                    Bound::Lower if tt_score >= beta => return tt_score,
-                    Bound::Upper if tt_score <= alpha => return tt_score,
-                    _ => {}
+        let mut tt_score_val = 0i32;
+        let mut tt_depth_val = -1i32;
+        let mut tt_bound_val = Bound::None;
+        if excluded_move.is_null() {
+            if let Some(entry) = self.tt.probe(pos.hash) {
+                tt_move = entry.best_move;
+                tt_score_val = score_from_tt(entry.score as i32, ply as i32);
+                tt_depth_val = entry.depth as i32;
+                tt_bound_val = entry.bound;
+                if !is_pv && tt_depth_val >= depth {
+                    match tt_bound_val {
+                        Bound::Exact => return tt_score_val,
+                        Bound::Lower if tt_score_val >= beta => return tt_score_val,
+                        Bound::Upper if tt_score_val <= alpha => return tt_score_val,
+                        _ => {}
+                    }
                 }
             }
         }
 
         // 2. Biological 3-Tier Evaluation Hierarchy:
-        //    - Tier 1 (Shallow Non-PV Frontier depth <= 2): Giant Fiber (SEZ + alpha/beta MBON)
-        //      delivers 10x-20x higher CPU NPS without rebuilding full 64-sq rays/claws!
-        //    - Tier 2 (PV or depth >= 3): Full Stream A (FullRays + FlyHash + Lateral Horn + Dopamine)
+        //    - Tier 1 (Shallow Non-PV Frontier depth <= 2): Giant Fiber (SEZ + INT8 AVX2 alpha/beta MBON)
+        //    - Tier 2 (PV or depth >= 3): Full Stream A (FullRays + LC4 + FlyHash + Lateral Horn + Dopamine)
         let cached_strat_hit = if self.cfg.use_stream_b && (is_pv || depth >= 3) {
             self.strategic_tt.probe(pos.hash).cloned()
         } else {
@@ -300,31 +316,42 @@ impl DnpWorker {
         let corr_idx = (pos.hash as usize) & 4095;
         let static_eval = (raw_static_eval + (self.dpm_corr[corr_idx] / 4).clamp(-100, 100))
             .clamp(-2600, 2600);
+        self.static_evals[ply] = static_eval;
+        let improving = !in_check && ply >= 2 && static_eval > self.static_evals[ply - 2];
         let parent_eval_f32 = out_a_opt
             .as_ref()
             .map(|o| o.total_cp)
             .unwrap_or(static_eval as f32);
 
-        // 3. Reverse Futility Pruning (RFP) & Null-Move Pruning (NMP) — strictly vetoed by Lateral Horn!
-        if !is_pv && !in_check && !lh_tactical_alert && !efference_surprise {
-            if depth <= 3 && static_eval - 95 * depth >= beta {
+        // 3. Reverse Futility Pruning (RFP), Razoring, & Null-Move Pruning (NMP) — vetoed by Lateral Horn!
+        if !is_pv && !in_check && excluded_move.is_null() && !lh_tactical_alert && !efference_surprise {
+            let rfp_margin = if improving { 75 * depth } else { 95 * depth };
+            if depth <= 4 && static_eval - rfp_margin >= beta {
                 return static_eval;
+            }
+            // Razoring: hopeless shallow positions drop straight into Quiescence
+            if depth <= 2 && static_eval + 260 * depth <= alpha {
+                let q = self.quiescence(pos, ply, alpha, alpha + 1);
+                if q <= alpha {
+                    return q;
+                }
             }
             let us = pos.side_to_move;
             let non_pawn = pos.color_occ[us.index()]
                 ^ pos.piece_bb(us, saccadion_chess::types::Piece::Pawn)
                 ^ pos.piece_bb(us, saccadion_chess::types::Piece::King);
             if depth >= 3 && static_eval >= beta && non_pawn.non_empty() {
-                let r = 2 + depth / 4;
+                let r = 3 + depth / 4 + ((static_eval - beta) / 200).clamp(0, 2);
                 let undo = pos.make_null_move();
                 let mut dummy_pv = Vec::new();
                 let null_score = -self.pvs(
                     pos,
-                    depth - 1 - r,
+                    (depth - 1 - r).max(0),
                     ply + 1,
                     -beta,
                     -beta + 1,
                     false,
+                    Move::NULL,
                     Move::NULL,
                     parent_cent_mask,
                     0.0,
@@ -348,9 +375,12 @@ impl DnpWorker {
         }
 
         // 5. Selective Stream B Deep Strategic Brain (wakes up on PV, high-depth crossroads,
-        //    Lateral Horn tactical/fortress/passed-pawn alerts, or Noduli causal surprises!)
+        //    Lateral Horn alerts, or Noduli surprises — throttled cleanly in ultra-blitz!)
+        let allow_subtree_sb = self.cfg.time_limit_ms == 0 || self.cfg.time_limit_ms > 280;
         let need_stream_b = self.cfg.use_stream_b
+            && allow_subtree_sb
             && !self.is_helper
+            && excluded_move.is_null()
             && out_a_opt.is_some()
             && (depth >= self.cfg.cx_min_depth
                 || (is_pv && depth >= 5)
@@ -392,7 +422,7 @@ impl DnpWorker {
             depth += 1;
         }
 
-        // 6. Move Ordering: TT > PFL3 Goal-Aligned > MVV-LVA > Killers > Countermove > History
+        // 6. Move Ordering: TT > Good Captures (SEE>=0) > PFL3 Goal-Aligned > Killers > Countermove > History > Bad Captures
         let counter_mv = if !prev_move.is_null() {
             self.countermoves[prev_move.from_sq().index()][prev_move.to_sq().index()]
         } else {
@@ -401,6 +431,9 @@ impl DnpWorker {
         let mut scored_moves: Vec<(Move, i32, usize, f32)> = Vec::with_capacity(moves.len());
         let stm_idx = pos.side_to_move.index();
         for &mv in moves.as_slice() {
+            if mv == excluded_move {
+                continue;
+            }
             let mut priority = 0i32;
             let mut pfl3_rank = usize::MAX;
             let mut noduli_delta = 0.0f32;
@@ -424,7 +457,8 @@ impl DnpWorker {
                     .piece_at(mv.from_sq())
                     .map(|(_, p)| p.cp_value())
                     .unwrap_or(100);
-                priority += 1_000_000 + vic * 10 - atk;
+                let good_cap = vic >= atk || pos.see_ge(mv, 0);
+                priority += if good_cap { 1_000_000 } else { -200_000 } + vic * 10 - atk;
             } else if mv.is_promotion() {
                 priority += 950_000;
             } else if mv == self.killers[ply][0] {
@@ -438,6 +472,9 @@ impl DnpWorker {
             }
             scored_moves.push((mv, priority, pfl3_rank, noduli_delta));
         }
+        if scored_moves.is_empty() {
+            return alpha;
+        }
         scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
         let child_cent_mask: Option<&[f32]> = local_strat
@@ -449,9 +486,78 @@ impl DnpWorker {
         let mut best_move = scored_moves[0].0;
         let mut best_score = -INF;
         let mut child_pv = Vec::with_capacity(depth as usize);
+        let mut quiets_tried = [Move::NULL; 64];
+        let mut n_quiets_tried = 0usize;
 
         for (move_idx, &(mv, _, pfl3_rank, noduli_delta)) in scored_moves.iter().enumerate() {
             let is_quiet = !mv.is_capture() && !mv.is_promotion();
+
+            // Late Move Pruning (LMP), Futility Pruning, & Main-Search SEE Pruning
+            // Strictly immune for PV, checks, Lateral Horn alerts, and top-3 PFL3 creative moves!
+            if !is_pv
+                && !in_check
+                && move_idx > 0
+                && !lh_tactical_alert
+                && pfl3_rank >= 3
+                && best_score > -MATE_THRESHOLD + 256
+            {
+                if is_quiet {
+                    let lmp_limit = (4 + depth * depth * if improving { 2 } else { 1 } / 2) as usize;
+                    if depth <= 4 && move_idx >= lmp_limit {
+                        continue;
+                    }
+                    let fut_margin = 120 * depth + if improving { 60 } else { 0 };
+                    if depth <= 3 && static_eval + fut_margin <= alpha {
+                        continue;
+                    }
+                } else if depth <= 4 && !mv.is_promotion() && !pos.see_ge(mv, -85 * depth) {
+                    continue;
+                }
+            }
+
+            // Singular Extension (PFL2/LAL Commitment Lock-In):
+            // If TT move is much better than all alternatives at depth >= 7, extend it by +1 ply!
+            let mut ext = 0i32;
+            if depth >= 7
+                && ply > 0
+                && ply < 32
+                && excluded_move.is_null()
+                && mv == tt_move
+                && tt_depth_val >= depth - 3
+                && matches!(tt_bound_val, Bound::Exact | Bound::Lower)
+                && tt_score_val.abs() < MATE_THRESHOLD - 256
+            {
+                let s_beta = (tt_score_val - 2 * depth).max(-MATE_THRESHOLD + 256);
+                let s_depth = (depth - 1) / 2;
+                let mut s_pv = Vec::new();
+                let s_score = self.pvs(
+                    pos,
+                    s_depth,
+                    ply,
+                    s_beta - 1,
+                    s_beta,
+                    false,
+                    prev_move,
+                    mv,
+                    parent_cent_mask,
+                    expected_eval_from_parent,
+                    &mut s_pv,
+                );
+                if self.aborted {
+                    return 0;
+                }
+                if s_score < s_beta {
+                    ext = 1;
+                } else if s_beta >= beta {
+                    return s_beta;
+                }
+            }
+
+            if is_quiet && n_quiets_tried < 64 {
+                quiets_tried[n_quiets_tried] = mv;
+                n_quiets_tried += 1;
+            }
+
             let undo = pos.make_move(mv);
             let gives_check = pos.in_check();
             let expected_child_eval = if noduli_delta != 0.0 {
@@ -460,26 +566,33 @@ impl DnpWorker {
                 0.0
             };
 
+            let new_depth = depth - 1 + ext;
             child_pv.clear();
             let score = if move_idx == 0 {
                 -self.pvs(
                     pos,
-                    depth - 1,
+                    new_depth,
                     ply + 1,
                     -beta,
                     -alpha,
                     is_pv,
                     mv,
+                    Move::NULL,
                     child_cent_mask,
                     expected_child_eval,
                     &mut child_pv,
                 )
             } else {
-                // Logarithmic LMR modulated by PFL3 top-3 immunity, PFL2 sharpness, & Lateral Horn veto
+                // Logarithmic LMR modulated by PFL3 top-3 immunity, PFL2 sharpness, History, & Lateral Horn veto
                 let mut r = 0i32;
                 if depth >= 3 && move_idx >= 3 && is_quiet && !in_check && !gives_check {
-                    let log_r = ((depth as f32).ln() * ((move_idx + 1) as f32).ln() * 0.48) as i32;
+                    let log_r = ((depth as f32).ln() * ((move_idx + 1) as f32).ln() * 0.50) as i32;
                     r = log_r.max(1);
+                    if !improving {
+                        r += 1;
+                    }
+                    let hist_v = self.history[stm_idx][mv.from_sq().index()][mv.to_sq().index()];
+                    r -= (hist_v / 4096).clamp(-1, 2);
                     if pfl3_rank < 3 {
                         r = (r - 3).max(0);
                     }
@@ -489,17 +602,18 @@ impl DnpWorker {
                     if lh_tactical_alert || lh_deep_alert || efference_surprise {
                         r = (r - 1).max(0);
                     }
-                    r = r.min(depth - 2).max(0);
+                    r = r.min(new_depth - 1).max(0);
                 }
 
                 let mut s = -self.pvs(
                     pos,
-                    depth - 1 - r,
+                    new_depth - r,
                     ply + 1,
                     -alpha - 1,
                     -alpha,
                     false,
                     mv,
+                    Move::NULL,
                     child_cent_mask,
                     expected_child_eval,
                     &mut child_pv,
@@ -508,12 +622,13 @@ impl DnpWorker {
                     child_pv.clear();
                     s = -self.pvs(
                         pos,
-                        depth - 1,
+                        new_depth,
                         ply + 1,
                         -alpha - 1,
                         -alpha,
                         false,
                         mv,
+                        Move::NULL,
                         child_cent_mask,
                         expected_child_eval,
                         &mut child_pv,
@@ -523,12 +638,13 @@ impl DnpWorker {
                     child_pv.clear();
                     s = -self.pvs(
                         pos,
-                        depth - 1,
+                        new_depth,
                         ply + 1,
                         -beta,
                         -alpha,
                         true,
                         mv,
+                        Move::NULL,
                         child_cent_mask,
                         expected_child_eval,
                         &mut child_pv,
@@ -555,13 +671,19 @@ impl DnpWorker {
                     }
                     if alpha >= beta {
                         if is_quiet {
-                            self.killers[ply][1] = self.killers[ply][0];
-                            self.killers[ply][0] = mv;
+                            if self.killers[ply][0] != mv {
+                                self.killers[ply][1] = self.killers[ply][0];
+                                self.killers[ply][0] = mv;
+                            }
                             if !prev_move.is_null() {
                                 self.countermoves[prev_move.from_sq().index()][prev_move.to_sq().index()] = mv;
                             }
-                            let h = &mut self.history[stm_idx][mv.from_sq().index()][mv.to_sq().index()];
-                            *h = (*h + depth * depth).min(200_000);
+                            let bonus = (depth * depth * 16).min(4096);
+                            self.update_history(stm_idx, mv, bonus);
+                            // History malus on earlier failed quiet moves
+                            for &qm in &quiets_tried[..n_quiets_tried.saturating_sub(1)] {
+                                self.update_history(stm_idx, qm, -bonus / 2);
+                            }
                         }
                         break;
                     }
@@ -570,7 +692,7 @@ impl DnpWorker {
         }
 
         // 7. Live Bounded PAM / 12x PPL1 / Dop1R2 Dopamine Update + DPM Eval Correction Memory
-        if depth >= 3 && best_score.abs() < MATE_THRESHOLD {
+        if excluded_move.is_null() && depth >= 3 && best_score.abs() < MATE_THRESHOLD {
             let err = (best_score - raw_static_eval).clamp(-300, 300);
             self.dpm_corr[corr_idx] = ((self.dpm_corr[corr_idx] * 7 + err * 2) / 8).clamp(-400, 400);
             if self.cfg.use_dopamine {
@@ -586,39 +708,47 @@ impl DnpWorker {
         }
 
         // 8. Store in Lock-Free Atomic Transposition Table
-        let bound = if best_score <= orig_alpha {
-            Bound::Upper
-        } else if best_score >= beta {
-            Bound::Lower
-        } else {
-            Bound::Exact
-        };
-        self.tt
-            .store(pos.hash, best_move, best_score, depth, bound, ply as i32);
+        if excluded_move.is_null() {
+            let bound = if best_score <= orig_alpha {
+                Bound::Upper
+            } else if best_score >= beta {
+                Bound::Lower
+            } else {
+                Bound::Exact
+            };
+            self.tt
+                .store(pos.hash, best_move, best_score, depth, bound, ply as i32);
+        }
 
         best_score
     }
 
-    /// LC4/LPLC2 -> Giant Fiber (GF / DNp01) Ultra-Fast Tactical Quiescence Reflex!
-    ///
-    /// Evaluates looming captures, promotions, and check evasions using incremental FinnyCache
-    /// SEZ Innate Survival Valence + frozen alpha/beta MBONs (<1.5 us -> 20x-40x higher NPS!).
+    /// LC4/LPLC2 -> Giant Fiber (GF / DNp01) Ultra-Fast Neural Quiescence Reflex with TT Caching!
     fn quiescence(&mut self, pos: &mut Position, ply: usize, mut alpha: i32, beta: i32) -> i32 {
         if self.check_stop() {
             return 0;
         }
         self.nodes += 1;
         self.q_nodes += 1;
-        // Saccadion-5 Full-Neural AVX2 INT16 Quiescence:
-        // NEVER drops back to blind SEZ-only PSQT! Every quiescence leaf evaluates SEZ +
-        // 16-wide AVX2 INT16 HalfKA + APL sparse alpha/beta MBONs + SMP so passed pawns,
-        // fortresses, king safety, and piece synergy are seen all the way to the leaf!
         if ply >= MAX_PLY - 1 {
             return evaluate_giant_fiber_cp(pos, &self.weights, &mut self.ws_a);
         }
 
+        let orig_alpha = alpha;
+        if let Some(entry) = self.tt.probe(pos.hash) {
+            let tt_score = score_from_tt(entry.score as i32, ply as i32);
+            match entry.bound {
+                Bound::Exact => return tt_score,
+                Bound::Lower if tt_score >= beta => return tt_score,
+                Bound::Upper if tt_score <= alpha => return tt_score,
+                _ => {}
+            }
+        }
+
         let in_check = pos.in_check();
         let stand_pat = evaluate_giant_fiber_cp(pos, &self.weights, &mut self.ws_a);
+        let mut best_score = if in_check { -INF } else { stand_pat };
+        let mut best_move = Move::NULL;
         if !in_check {
             if stand_pat >= beta {
                 return beta;
@@ -656,11 +786,9 @@ impl DnpWorker {
 
         for &(mv, _, vic_cp) in &scored[..n_scored] {
             if !in_check && mv.is_capture() && !mv.is_promotion() {
-                // Delta pruning: skip captures that cannot possibly lift score to alpha
                 if stand_pat + vic_cp + 220 < alpha {
                     continue;
                 }
-                // SEE pruning for clearly losing captures
                 if !pos.see_ge(mv, -50) {
                     continue;
                 }
@@ -671,13 +799,25 @@ impl DnpWorker {
             if self.aborted {
                 return 0;
             }
-            if score >= beta {
-                return beta;
-            }
-            if score > alpha {
-                alpha = score;
+            if score > best_score {
+                best_score = score;
+                best_move = mv;
+                if score >= beta {
+                    self.tt.store(pos.hash, best_move, score, 0, Bound::Lower, ply as i32);
+                    return beta;
+                }
+                if score > alpha {
+                    alpha = score;
+                }
             }
         }
+        let bound = if best_score <= orig_alpha {
+            Bound::Upper
+        } else {
+            Bound::Exact
+        };
+        self.tt
+            .store(pos.hash, best_move, best_score, 0, bound, ply as i32);
         alpha
     }
 }
@@ -754,6 +894,17 @@ impl SearchEngine {
         if root_moves.is_empty() {
             return SearchResult::default();
         }
+        // Instant reflex exit when only 1 legal move exists in timed games
+        if root_moves.len() == 1 && cfg.time_limit_ms > 0 {
+            let mv = root_moves.as_slice()[0];
+            return SearchResult {
+                best_move: mv,
+                depth: 1,
+                nodes: 1,
+                pv: vec![mv],
+                ..SearchResult::default()
+            };
+        }
 
         // Pre-evaluate root with Stream A + Stream B for top-down centrifugal/seed steering
         let root_a = evaluate_stream_a(
@@ -816,6 +967,7 @@ impl SearchEngine {
             history: self.history,
             countermoves: [[Move::NULL; 64]; 64],
             dpm_corr: [0; 4096],
+            static_evals: [0; MAX_PLY],
             nodes: 0,
             q_nodes: 0,
             stream_b_evals: initial_sb_evals,
@@ -869,7 +1021,7 @@ impl SearchEngine {
                     let mut dummy_pv = Vec::with_capacity(32);
                     while d <= cfg_h.max_depth && !worker.aborted {
                         dummy_pv.clear();
-                        let _ = worker.pvs(&mut pos_h, d, 0, -INF, INF, true, Move::NULL, None, 0.0, &mut dummy_pv);
+                        let _ = worker.pvs(&mut pos_h, d, 0, -INF, INF, true, Move::NULL, Move::NULL, None, 0.0, &mut dummy_pv);
                         // Slight depth diversity across parallel DNp channels
                         d += if d >= 4 && ((tid + d as usize) & 1) == 0 { 2 } else { 1 };
                     }
@@ -891,7 +1043,7 @@ impl SearchEngine {
                 let mut pv_line = Vec::with_capacity(depth as usize + 4);
                 let score = loop {
                     pv_line.clear();
-                    let s = main_worker.pvs(pos, depth, 0, alpha, beta, true, Move::NULL, None, 0.0, &mut pv_line);
+                    let s = main_worker.pvs(pos, depth, 0, alpha, beta, true, Move::NULL, Move::NULL, None, 0.0, &mut pv_line);
                     if main_worker.aborted {
                         break s;
                     }

@@ -317,8 +317,8 @@ def _save_metrics_and_dashboard(history: List[Dict[str, Any]], ckpt_dir: Path) -
             ax.plot([p[0] for p in pvs_pts], [p[1] for p in pvs_pts], label="Est. +Rust PVS Elo", color="tab:cyan", linestyle="--", marker="^")
         real_pts = [(r.get("epoch", i + 1), r["real_arena_elo"]) for i, r in enumerate(history) if r.get("real_arena_elo", 0.0) > 0]
         if real_pts:
-            ax.plot([p[0] for p in real_pts], [p[1] for p in real_pts], label="REAL Stockfish Arena Elo", color="tab:red", marker="D", linewidth=2.4)
-        ax.set_title("Real Stockfish Arena vs Proxy Elo")
+            ax.plot([p[0] for p in real_pts], [p[1] for p in real_pts], label="REAL Multi-Engine Arena Elo", color="tab:red", marker="D", linewidth=2.4)
+        ax.set_title("Real Multi-Engine Arena vs Proxy Elo")
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Elo")
         ax.grid(True, alpha=0.3)
@@ -343,10 +343,12 @@ def _shard_batch_for_pmap(batch: Dict[str, np.ndarray], n_dev: int) -> Dict[str,
 
 def _print_epoch_banner(row: Dict[str, Any], is_best: bool) -> None:
     best_tag = "  *** NEW BEST -> EXPORTED .saccnet ***" if is_best else ""
+    eng_summary = row.get("arena_engines_str", "")
     real_elo_s = (
-        f"REAL SF-ARENA={row['real_arena_elo']:.0f} Elo ({row['arena_games']}g)"
+        f"REAL MULTI-ARENA={row['real_arena_elo']:.0f} +/-{row.get('arena_ci', 0):.0f} Elo "
+        f"({row['arena_games']}g | {row.get('arena_workers', 1)}x parallel{eng_summary})"
         if row.get("real_arena_elo", 0.0) > 0
-        else "REAL SF-ARENA=calibrating..."
+        else f"REAL MULTI-ARENA=calibrating ({row.get('arena_workers', 1)}x parallel)..."
     )
     print("\n" + "=" * 96)
     print(
@@ -500,7 +502,7 @@ def train_saccadion_smart(
             weights_path=export_dir / "saccadion_best.saccnet",
             harvest_shard_path=sparring_shard,
             status_json_path=checkpoint_dir / "arena_status.json",
-            movetime_ms=150,
+            movetime_ms=250,
         )
         arena.start()
 
@@ -781,6 +783,29 @@ def train_saccadion_smart(
                     save_checkpoint(ckpt_file, host_p, host_o, epoch - 1, global_step, best_val_loss, history)
                     last_ckpt_time = time.time()
 
+            # Closed-Loop Online Anti-Blunder DAgger Replay:
+            # Immediately train on newly harvested refutations from our parallel Multi-Engine Arena!
+            replay_batches_run = 0
+            if epoch >= 2 and sparring_shard.exists() and sparring_shard.stat().st_size > 16 + 64 * 128:
+                try:
+                    sp_ds = SaccShardDataset([sparring_shard], cache_dir=None, split_name="sparring")
+                    if len(sp_ds) >= min(eff_bsz, 64):
+                        r_bsz = min(eff_bsz, max(n_dev, (len(sp_ds) // n_dev) * n_dev))
+                        for r_i, rbatch_np in enumerate(sp_ds.iter_batches(r_bsz, seed=epoch * 131)):
+                            jax_rng, step_key = jax.random.split(jax_rng)
+                            if use_pmap:
+                                b_in = _shard_batch_for_pmap(rbatch_np, n_dev)
+                                dev_keys = jax.random.split(step_key, n_dev)
+                                params_dev, opt_dev, _ = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight, dev_keys)
+                            else:
+                                b_in = {k: jnp.asarray(v) for k, v in rbatch_np.items()}
+                                params_dev, opt_dev, _ = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight, step_key)
+                            replay_batches_run += 1
+                            if r_i + 1 >= 6:
+                                break
+                except Exception:
+                    pass
+
             # Unwrap single-host copy for Validation & .saccnet export
             host_params = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
             host_opt = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
@@ -842,6 +867,9 @@ def train_saccadion_smart(
             est_raw_elo = estimate_elo_proxy(v_mean["top1_acc"], v_mean["wdl_acc"], v_mean["cp_mae"])
             est_search_elo = min(3700.0, est_raw_elo + 520.0)
             a_st = arena.get_status() if arena else {}
+            per_eng = a_st.get("per_engine_wdl", {})
+            eng_parts = [f"{k}:{v[0]}W/{v[1]}D/{v[2]}L" for k, v in sorted(per_eng.items())]
+            arena_engines_str = (" | " + ", ".join(eng_parts)) if eng_parts else ""
 
             row = {
                 "epoch": epoch,
@@ -871,6 +899,9 @@ def train_saccadion_smart(
                 "est_raw_elo": est_raw_elo,
                 "est_search_elo": est_search_elo,
                 "real_arena_elo": float(a_st.get("real_elo", 0.0)),
+                "arena_ci": float(a_st.get("elo_ci", 999.0)),
+                "arena_workers": int(a_st.get("parallel_workers", 1)),
+                "arena_engines_str": arena_engines_str,
                 "arena_games": int(a_st.get("games_played", 0)),
                 "arena_harvested": int(a_st.get("harvested_positions", 0)),
                 "val_active_kc_pct": v_mean["active_kc_ratio"] * 100.0,
@@ -894,7 +925,7 @@ def train_saccadion_smart(
                 "trace_rho": rho_v,
                 "lr_muon": float(sched_muon(global_step)),
                 "lr_adamw": float(sched_adamw(global_step)),
-                "replay_batches": 0,
+                "replay_batches": replay_batches_run,
                 "epoch_sec": ep_sec,
                 "pos_per_sec": pos_seen / ep_sec,
             }

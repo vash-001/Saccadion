@@ -181,17 +181,24 @@ fn main() {
         return;
     }
 
-    // Auto-load `saccadion_best.saccnet` if present in CWD or alongside the binary, else Tiny fallback
-    let auto_weights = [
-        Path::new("saccadion_best.saccnet").to_path_buf(),
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("saccadion_best.saccnet")))
-            .unwrap_or_default(),
-    ]
-    .into_iter()
-    .find(|p| !p.as_os_str().is_empty() && p.exists())
-    .and_then(|p| SaccadionWeights::load_saccnet(&p).ok());
+    // Auto-load `saccadion_best.saccnet` from CWD, executable folder, or repo root (../../)
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let mut weight_cands = vec![Path::new("saccadion_best.saccnet").to_path_buf()];
+    if let Some(ref d) = exe_dir {
+        weight_cands.push(d.join("saccadion_best.saccnet"));
+        if let Some(p1) = d.parent() {
+            weight_cands.push(p1.join("saccadion_best.saccnet"));
+            if let Some(p2) = p1.parent() {
+                weight_cands.push(p2.join("saccadion_best.saccnet"));
+            }
+        }
+    }
+    let auto_weights = weight_cands
+        .into_iter()
+        .find(|p| p.exists())
+        .and_then(|p| SaccadionWeights::load_saccnet(&p).ok());
 
     let weights = auto_weights.unwrap_or_else(|| SaccadionWeights::init_random(ModelConfig::tiny(), 0x5ACC_AD10));
     let mut hash_mb = 64usize;

@@ -1,19 +1,26 @@
-"""Background CPU Stockfish Sparring Arena & Real-Elo Calibrator for Colab TPU VMs.
+"""Parallel Multi-Engine CPU Sparring Arena & Real-Elo Calibrator for Colab TPU VMs.
 
-Exploits idle CPU cores in the background while the TPU trains:
-1. Plays rapid UCI games between our latest Pure-Rust `saccadion` engine (auto-reloading
-   `saccadion_latest.saccnet` after each epoch!) and calibrated Stockfish strength levels
-   (plus an internal ~900 Elo material baseline for Epoch-1 calibration).
-2. Auto-adjusts opponent difficulty upward as Saccadion improves (900 -> 1320 -> 1550 ->
-   1850 -> 2200 -> 2600 -> 3000+ Elo) and computes Maximum-Likelihood Real Elo + 95% CI.
-3. Harvests turning-point / loss positions against Stockfish (with Stockfish's refutation move
-   and evaluation) into `sparring_hard.sacc` so future epochs actively learn anti-Stockfish play!
+Exploits ALL idle CPU cores in parallel while the TPU trains:
+1. Auto-installs and probes a diverse Multi-Engine UCI Gauntlet on Linux/Colab:
+   - Stockfish (calibrated Elo ladder 1320 -> 3190 + full-strength refutation oracle)
+   - GNU Chess (UCI mode, ~2300 Elo)
+   - Fruit 2.1 (~2680 Elo positional legend)
+   - Glaurung 2.2 (~2750 Elo tactical classic)
+   - Toga II (~2800 Elo aggressive Fruit fork)
+   - Plus built-in Baseline-Material-d2 (~900 Elo) for Epoch-1 calibration.
+2. Launches `N` parallel match workers (auto-scaled up to 6 simultaneous games across idle
+   Colab vCPUs!) so Saccadion battles multiple distinct engines concurrently, yielding 6x
+   more games/epoch, rock-solid multi-engine MLE Elo with tight 95% CI, and 6x richer
+   anti-blunder training data!
+3. Harvests turning-point / loss positions from EVERY opponent (annotated with full-strength
+   Stockfish refutations) into `sparring_hard.sacc` for live closed-loop TPU self-improvement!
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import shutil
 import struct
@@ -28,31 +35,28 @@ import numpy as np
 
 from .dataset import SACC_RECORD_DTYPE, SACC_SHARD_MAGIC
 
-OPPONENT_LADDER: List[Tuple[str, int, Optional[int]]] = [
-    # (display_name, calibrated_elo, stockfish_uci_elo_or_None_for_builtin_baseline)
-    ("Baseline-Material-d2", 900, None),
-    ("Stockfish-1320 (Lv0)", 1320, 1320),
-    ("Stockfish-1550 (Lv3)", 1550, 1550),
-    ("Stockfish-1850 (Lv6)", 1850, 1850),
-    ("Stockfish-2200 (Lv10)", 2200, 2200),
-    ("Stockfish-2600 (Lv15)", 2600, 2600),
-    ("Stockfish-3000 (Lv20)", 3000, 3000),
-]
-
 PIECE_VALUES_CP = {1: 100, 2: 320, 3: 330, 4: 500, 5: 900, 6: 0}
 
 
+@dataclass(frozen=True)
+class EngineSpec:
+    name: str
+    family: str
+    elo: int
+    cmd: Optional[List[str]]
+    uci_options: Dict[str, str] = field(default_factory=dict)
+    is_stockfish: bool = False
+
+
 def estimate_mle_elo(results: List[Tuple[int, float]]) -> Tuple[float, float]:
-    """Computes logistic MLE Real Elo and approximate standard error from (opp_elo, score) pairs."""
+    """Computes logistic MLE Real Elo and approximate 95% CI from (opp_elo, score) pairs."""
     if not results:
         return 0.0, 999.0
-    # Regularized Newton-Raphson with mild Gaussian prior around 1200 Elo (sigma=600)
-    # so even 100% wins or 100% losses produce stable finite Elo estimates!
-    r = 1200.0
-    prior_mu = 1200.0
-    prior_inv_var = 1.0 / (600.0 * 600.0)
+    r = 1400.0
+    prior_mu = 1400.0
+    prior_inv_var = 1.0 / (700.0 * 700.0)
     k = math.log(10.0) / 400.0
-    for _ in range(25):
+    for _ in range(30):
         grad = -(r - prior_mu) * prior_inv_var
         hess = -prior_inv_var
         for opp_elo, score in results:
@@ -67,6 +71,55 @@ def estimate_mle_elo(results: List[Tuple[int, float]]) -> Tuple[float, float]:
     return float(r), float(min(450.0, 1.96 * se))
 
 
+def _probe_uci_binary(cmd: List[str], timeout_s: float = 3.0) -> bool:
+    """Verifies that a candidate binary responds cleanly with `uciok` within `timeout_s`."""
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+    except Exception:
+        return False
+    ok = False
+    try:
+        if proc.stdin:
+            proc.stdin.write("uci\n")
+            proc.stdin.flush()
+        t0 = time.time()
+        while time.time() - t0 < timeout_s and proc.stdout is not None:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            if "uciok" in line:
+                ok = True
+                break
+        if proc.stdin:
+            try:
+                proc.stdin.write("quit\n")
+                proc.stdin.flush()
+            except Exception:
+                pass
+        proc.wait(timeout=1.0)
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+    finally:
+        for s in (proc.stdin, proc.stdout):
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+    return ok
+
+
 def find_or_install_stockfish() -> Optional[Path]:
     """Locates Stockfish binary, installs via apt, or fetches official Linux AVX2 binary on Colab."""
     for cand in [
@@ -79,7 +132,6 @@ def find_or_install_stockfish() -> Optional[Path]:
         if cand and Path(cand).exists():
             return Path(cand)
 
-    # 1. Try apt-get on Colab Linux VM
     if Path("/content").exists() and shutil.which("apt-get"):
         try:
             subprocess.run(
@@ -102,10 +154,8 @@ def find_or_install_stockfish() -> Optional[Path]:
         except Exception:
             pass
 
-    # 2. Direct fallback: download official Stockfish Linux x86-64 AVX2 release tarball (~2s!)
     if Path("/content").exists():
         try:
-            import os
             import tarfile
             import urllib.request
 
@@ -113,7 +163,7 @@ def find_or_install_stockfish() -> Optional[Path]:
             sf_dir.mkdir(parents=True, exist_ok=True)
             tar_path = sf_dir / "sf.tar"
             url = "https://github.com/official-stockfish/Stockfish/releases/latest/download/stockfish-ubuntu-x86-64-avx2.tar"
-            req = urllib.request.Request(url, headers={"User-Agent": "Saccadion-Arena/1.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Saccadion-Arena/2.0"})
             with urllib.request.urlopen(req, timeout=45) as resp, open(tar_path, "wb") as out:
                 shutil.copyfileobj(resp, out)
             with tarfile.open(tar_path, "r") as tf:
@@ -133,8 +183,83 @@ def find_or_install_stockfish() -> Optional[Path]:
     return None
 
 
+def discover_and_install_multi_engines() -> Tuple[List[EngineSpec], Optional[Path]]:
+    """Discovers & installs a diverse Multi-Engine UCI Gauntlet (Stockfish + Fruit + Toga2 + Glaurung + GNUChess)."""
+    sf_bin = find_or_install_stockfish()
+
+    # On Colab Linux VM, install additional diverse classic/tactical UCI engines in one clean pass!
+    extra_apt_pkgs = ["toga2", "fruit", "glaurung", "gnuchess"]
+    if Path("/content").exists() and shutil.which("apt-get"):
+        for pkg in extra_apt_pkgs:
+            if shutil.which(pkg) or Path(f"/usr/games/{pkg}").exists():
+                continue
+            try:
+                subprocess.run(
+                    ["apt-get", "install", "-qq", "-y", pkg],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=35,
+                    check=False,
+                )
+            except Exception:
+                pass
+
+    gauntlet: List[EngineSpec] = [
+        EngineSpec("Baseline-Material-d2", "Baseline", 900, None),
+    ]
+
+    if sf_bin is not None:
+        sf_cmd = [str(sf_bin)]
+        for name, elo in [
+            ("Stockfish-1320 (Lv0)", 1320),
+            ("Stockfish-1550 (Lv3)", 1550),
+            ("Stockfish-1850 (Lv6)", 1850),
+            ("Stockfish-2200 (Lv10)", 2200),
+            ("Stockfish-2600 (Lv15)", 2600),
+            ("Stockfish-3000 (Lv20)", 3000),
+            ("Stockfish-3190 (Max)", 3190),
+        ]:
+            gauntlet.append(
+                EngineSpec(
+                    name=name,
+                    family="Stockfish",
+                    elo=elo,
+                    cmd=sf_cmd,
+                    uci_options={
+                        "Threads": "1",
+                        "Hash": "16",
+                        "UCI_LimitStrength": "true",
+                        "UCI_Elo": str(elo),
+                    },
+                    is_stockfish=True,
+                )
+            )
+
+    # Probe diverse non-Stockfish UCI engines and add every verified engine to the gauntlet!
+    third_party_defs = [
+        ("GNUChess-UCI", "GNUChess", 2300, ["gnuchess", "/usr/games/gnuchess", "/usr/bin/gnuchess"], ["--uci"], {}),
+        ("Fruit-2.1", "Fruit", 2680, ["fruit", "/usr/games/fruit", "/usr/bin/fruit"], [], {"Hash": "16"}),
+        ("Glaurung-2.2", "Glaurung", 2750, ["glaurung", "/usr/games/glaurung", "/usr/bin/glaurung"], [], {"Threads": "1", "Hash": "16"}),
+        ("Toga-II", "Toga2", 2800, ["toga2", "/usr/games/toga2", "/usr/bin/toga2"], [], {"Hash": "16"}),
+    ]
+    for name, family, elo, paths, extra_args, opts in third_party_defs:
+        found = None
+        for p in paths:
+            resolved = shutil.which(p) if "/" not in p else (p if Path(p).exists() else None)
+            if resolved and Path(resolved).exists():
+                found = resolved
+                break
+        if found is not None:
+            cmd = [found] + extra_args
+            if _probe_uci_binary(cmd):
+                gauntlet.append(EngineSpec(name=name, family=family, elo=elo, cmd=cmd, uci_options=opts))
+
+    gauntlet.sort(key=lambda e: e.elo)
+    return gauntlet, sf_bin
+
+
 def _material_eval_cp(board: Any) -> int:
-    """Fast material + center-control fallback evaluator for Baseline-Material-d2 (~900 Elo)."""
+    """Fast material fallback evaluator for Baseline-Material-d2 (~900 Elo)."""
     import chess
 
     score = 0
@@ -156,14 +281,10 @@ def _baseline_d2_move(board: Any, rng: random.Random) -> Any:
         if board.is_checkmate():
             board.pop()
             return mv
-        # Opponent best 1-ply reply
         opp_best = -999999
         for omv in list(board.legal_moves)[:20]:
             board.push(omv)
-            if board.is_checkmate():
-                sc = 100000
-            else:
-                sc = -_material_eval_cp(board)
+            sc = 100000 if board.is_checkmate() else -_material_eval_cp(board)
             board.pop()
             if sc > opp_best:
                 opp_best = sc
@@ -179,6 +300,7 @@ class _UciProcess:
     """Minimal, leak-free UCI subprocess wrapper."""
 
     def __init__(self, cmd: List[str], options: Optional[Dict[str, str]] = None):
+        self.cmd = list(cmd)
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -272,6 +394,9 @@ class ArenaStatus:
     active: bool = False
     engine_mode: str = "waiting_weights"
     stockfish_available: bool = False
+    parallel_workers: int = 1
+    engine_families: List[str] = field(default_factory=list)
+    per_engine_wdl: Dict[str, List[int]] = field(default_factory=dict)
     opponent_name: str = "Baseline-Material-d2"
     opponent_elo: int = 900
     level_idx: int = 0
@@ -284,13 +409,15 @@ class ArenaStatus:
     harvested_positions: int = 0
     current_game_ply: int = 0
     last_result: str = "Warming up..."
-    history_elo: List[Tuple[int, float]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "active": self.active,
             "engine_mode": self.engine_mode,
             "stockfish_available": self.stockfish_available,
+            "parallel_workers": self.parallel_workers,
+            "engine_families": list(self.engine_families),
+            "per_engine_wdl": {k: list(v) for k, v in self.per_engine_wdl.items()},
             "opponent_name": self.opponent_name,
             "opponent_elo": self.opponent_elo,
             "level_idx": self.level_idx,
@@ -306,8 +433,24 @@ class ArenaStatus:
         }
 
 
+OPENING_LINES = [
+    ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6"],
+    ["d2d4", "d7d5", "c2c4", "e7e6", "b1c3", "g8f6"],
+    ["e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4"],
+    ["c2c4", "e7e5", "b1c3", "g8f6", "g2g3", "d7d5"],
+    ["d2d4", "g8f6", "c2c4", "g7g6", "b1c3", "f8g7"],
+    ["e2e4", "e7e6", "d2d4", "d7d5", "b1c3", "g8f6"],
+    ["g1f3", "d7d5", "g2g3", "g8f6", "f1g2", "c7c6"],
+    ["e2e4", "c7c6", "d2d4", "d7d5", "b1c3", "d5e4"],
+    ["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "f8c5"],
+    ["d2d4", "g8f6", "c2c4", "e7e6", "b1c3", "f8b4"],
+    ["e2e4", "c7c5", "b1c3", "b8c6", "g2g3", "g7g6"],
+    ["d2d4", "d7d5", "g1f3", "g8f6", "c1f4", "e7e6"],
+]
+
+
 class StockfishSparringArena:
-    """Runs asynchronous background CPU sparring games while the TPU trains."""
+    """Runs `num_workers` simultaneous Multi-Engine CPU sparring matches while the TPU trains!"""
 
     def __init__(
         self,
@@ -315,8 +458,9 @@ class StockfishSparringArena:
         harvest_shard_path: Path,
         status_json_path: Path,
         rust_uci_binary: Optional[Path] = None,
-        movetime_ms: int = 60,
-        max_plies: int = 120,
+        movetime_ms: int = 150,
+        max_plies: int = 130,
+        num_workers: Optional[int] = None,
     ):
         self.weights_path = weights_path
         self.harvest_shard_path = harvest_shard_path
@@ -325,26 +469,40 @@ class StockfishSparringArena:
         self.movetime_ms = movetime_ms
         self.max_plies = max_plies
 
+        n_cpu = os.cpu_count() or 2
+        if num_workers is None:
+            # Auto-scale across idle vCPUs: 1 on 2-4 cores, up to 6 simultaneous matches on Colab TPU VMs!
+            self.num_workers = max(1, min(6, (n_cpu - 2) // 3)) if n_cpu >= 6 else 1
+        else:
+            self.num_workers = max(1, min(8, num_workers))
+        self.sacc_threads_per_worker = 2 if n_cpu >= self.num_workers * 3 + 2 else 1
+
         self._lock = threading.Lock()
         self._stop_evt = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._status = ArenaStatus()
+        self._manager_thread: Optional[threading.Thread] = None
+        self._worker_threads: List[threading.Thread] = []
+        self._status = ArenaStatus(parallel_workers=self.num_workers)
         self._results: List[Tuple[int, float]] = []
-        self._recent_level_scores: List[float] = []
         self._harvest_records: List[np.ndarray] = []
-        self._last_weights_mtime: float = 0.0
+        self._game_counter = 0
+        self._gauntlet: List[EngineSpec] = []
+        self._sf_bin: Optional[Path] = None
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
+        if self._manager_thread is not None and self._manager_thread.is_alive():
             return
         self._stop_evt.clear()
-        self._thread = threading.Thread(target=self._run_loop, name="SaccadionCPUArena", daemon=True)
-        self._thread.start()
+        self._manager_thread = threading.Thread(
+            target=self._bootstrap_and_run, name="SaccadionMultiArenaMgr", daemon=True
+        )
+        self._manager_thread.start()
 
     def stop(self) -> None:
         self._stop_evt.set()
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
+        for t in self._worker_threads:
+            t.join(timeout=3.0)
+        if self._manager_thread is not None:
+            self._manager_thread.join(timeout=3.0)
 
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
@@ -357,6 +515,7 @@ class StockfishSparringArena:
         for cand in [
             repo_root / "target" / "release" / "saccadion",
             repo_root / "target" / "release" / "saccadion.exe",
+            Path("/content/drive/MyDrive/Saccadion_TPU/bin_v9/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v8/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v7/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v6/saccadion"),
@@ -433,11 +592,11 @@ class StockfishSparringArena:
         rec["threat_mask_opp"] = orient_bb(atk_b if stm == 0 else atk_w)
         return rec
 
-    def _flush_harvest(self) -> None:
+    def _flush_harvest_locked(self) -> None:
         if not self._harvest_records:
             return
         self.harvest_shard_path.parent.mkdir(parents=True, exist_ok=True)
-        arr = np.asarray(self._harvest_records[-20000:], dtype=SACC_RECORD_DTYPE)
+        arr = np.asarray(self._harvest_records[-30000:], dtype=SACC_RECORD_DTYPE)
         tmp = self.harvest_shard_path.with_suffix(".sacc.tmp")
         with open(tmp, "wb") as f:
             f.write(struct.pack("<8sII", SACC_SHARD_MAGIC, 0, len(arr)))
@@ -451,109 +610,151 @@ class StockfishSparringArena:
         except Exception:
             pass
 
-    def _run_loop(self) -> None:
+    def _pick_opponent(self, worker_id: int, local_game: int, rng: random.Random) -> EngineSpec:
+        """Selects an opponent near Saccadion's live Elo while rotating across ALL engine families!"""
+        with self._lock:
+            cur_elo = self._status.real_elo if self._status.games_played >= 4 else 1650.0
+        non_base = [e for e in self._gauntlet if e.cmd is not None]
+        pool = non_base if non_base else self._gauntlet
+        # Matchmaking band: [cur_elo - 280, cur_elo + 450] so Saccadion always gets informative matches
+        band = [e for e in pool if (cur_elo - 280.0) <= e.elo <= (cur_elo + 450.0)]
+        if not band:
+            band = sorted(pool, key=lambda e: abs(e.elo - cur_elo))[:3]
+
+        # Prioritize diverse non-Stockfish engines on alternating workers so every family gets played!
+        non_sf = [e for e in pool if not e.is_stockfish and e.cmd is not None]
+        if non_sf and ((worker_id + local_game) % 2 == 1) and cur_elo >= 1450.0:
+            near_other = [e for e in non_sf if abs(e.elo - cur_elo) <= 750.0]
+            if near_other:
+                return near_other[(worker_id + local_game) % len(near_other)]
+        return rng.choice(band)
+
+    def _bootstrap_and_run(self) -> None:
         try:
-            import chess
+            import chess  # noqa: F401
         except ImportError:
             with self._lock:
                 self._status.last_result = "python-chess not installed"
             return
 
-        sf_bin = find_or_install_stockfish()
+        self._gauntlet, self._sf_bin = discover_and_install_multi_engines()
         rust_bin = self._find_rust_uci()
+        families = sorted({e.family for e in self._gauntlet if e.cmd is not None or len(self._gauntlet) == 1})
+
         with self._lock:
-            self._status.stockfish_available = sf_bin is not None
-            self._status.engine_mode = "Pure-Rust UCI" if rust_bin else "Waiting Rust UCI"
+            self._status.stockfish_available = self._sf_bin is not None
+            self._status.engine_families = families
+            self._status.parallel_workers = self.num_workers
+            self._status.engine_mode = (
+                f"{self.num_workers}x Parallel ({'+'.join(families)})" if rust_bin else "Waiting Rust UCI"
+            )
             self._status.active = True
 
-        # Wait gently until at least one `.saccnet` checkpoint exists
+        # Wait gently until Epoch-1 `.saccnet` exists
         while not self._stop_evt.is_set() and not self.weights_path.exists():
             with self._lock:
                 self._status.last_result = "Waiting for Epoch-1 .saccnet export..."
             time.sleep(2.0)
 
-        if self._stop_evt.is_set():
-            return
-
-        if rust_bin is None:
+        if self._stop_evt.is_set() or rust_bin is None:
             with self._lock:
-                self._status.engine_mode = "No Rust binary"
-                self._status.last_result = "Build saccadion-uci to enable live CPU sparring"
+                self._status.active = False
             return
 
-        sacc_proc: Optional[_UciProcess] = None
-        sf_proc: Optional[_UciProcess] = None
-        rng = random.Random(2026)
+        print(
+            f"[Multi-Arena] Launched {self.num_workers} parallel match boards "
+            f"({self.sacc_threads_per_worker}t/Saccadion) across {len(self._gauntlet)} opponents "
+            f"({', '.join(families)})!",
+            flush=True,
+        )
 
-        # Diverse opening suite (6-ply book) so sparring games never repeat the same game
-        opening_lines = [
-            ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6"],
-            ["d2d4", "d7d5", "c2c4", "e7e6", "b1c3", "g8f6"],
-            ["e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4"],
-            ["c2c4", "e7e5", "b1c3", "g8f6", "g2g3", "d7d5"],
-            ["d2d4", "g8f6", "c2c4", "g7g6", "b1c3", "f8g7"],
-            ["e2e4", "e7e6", "d2d4", "d7d5", "b1c3", "g8f6"],
-            ["g1f3", "d7d5", "g2g3", "g8f6", "f1g2", "c7c6"],
-            ["e2e4", "c7c6", "d2d4", "d7d5", "b1c3", "d5e4"],
-        ]
+        self._worker_threads = []
+        for wid in range(self.num_workers):
+            t = threading.Thread(
+                target=self._worker_loop,
+                args=(wid, rust_bin),
+                name=f"SaccArenaW{wid}",
+                daemon=True,
+            )
+            t.start()
+            self._worker_threads.append(t)
+
+        for t in self._worker_threads:
+            t.join()
+        with self._lock:
+            self._status.active = False
+        self._save_status()
+
+    def _worker_loop(self, worker_id: int, rust_bin: Path) -> None:
+        import chess
+
+        rng = random.Random(2026 + worker_id * 7919)
+        sacc_proc: Optional[_UciProcess] = None
+        opp_procs: Dict[str, _UciProcess] = {}
+        oracle_proc: Optional[_UciProcess] = None
+        last_mtime = 0.0
+        local_game = 0
 
         try:
-            if sf_bin is not None:
-                sf_proc = _UciProcess([str(sf_bin)], {"Threads": "1", "Hash": "16"})
-
-            level_idx = 1 if sf_proc is not None else 0
-            game_num = 0
+            if self._sf_bin is not None:
+                oracle_proc = _UciProcess([str(self._sf_bin)], {"Threads": "1", "Hash": "16"})
 
             while not self._stop_evt.is_set():
-                # Hot-reload Saccadion UCI whenever a newer `.saccnet` is exported by TPU!
                 mtime = self.weights_path.stat().st_mtime if self.weights_path.exists() else 0.0
-                if sacc_proc is None or mtime > self._last_weights_mtime:
+                if sacc_proc is None or mtime > last_mtime:
                     if sacc_proc is not None:
                         sacc_proc.close()
-                    sacc_proc = _UciProcess([str(rust_bin)], {"Hash": "32", "Threads": "2"})
+                    sacc_proc = _UciProcess(
+                        [str(rust_bin)],
+                        {"Hash": "32", "Threads": str(self.sacc_threads_per_worker)},
+                    )
                     sacc_proc.set_option("WeightsPath", str(self.weights_path))
-                    self._last_weights_mtime = mtime
+                    last_mtime = mtime
 
-                opp_name, opp_elo, sf_elo = OPPONENT_LADDER[level_idx]
-                if sf_elo is not None and sf_proc is None:
-                    level_idx = 0
-                    opp_name, opp_elo, sf_elo = OPPONENT_LADDER[0]
+                spec = self._pick_opponent(worker_id, local_game, rng)
+                opp_proc: Optional[_UciProcess] = None
+                if spec.cmd is not None:
+                    key = spec.family
+                    if key not in opp_procs:
+                        try:
+                            opp_procs[key] = _UciProcess(spec.cmd, spec.uci_options)
+                        except Exception:
+                            spec = self._gauntlet[0]
+                    if spec.cmd is not None and key in opp_procs:
+                        opp_proc = opp_procs[key]
+                        if spec.is_stockfish:
+                            opp_proc.set_option("UCI_LimitStrength", "true")
+                            opp_proc.set_option("UCI_Elo", str(min(3190, max(1320, spec.elo))))
+                        opp_proc.new_game()
 
-                if sf_proc is not None and sf_elo is not None:
-                    sf_proc.set_option("UCI_LimitStrength", "true")
-                    sf_proc.set_option("UCI_Elo", str(min(3190, max(1320, sf_elo))))
-                    sf_proc.new_game()
                 sacc_proc.new_game()
-
                 board = chess.Board()
-                for u in rng.choice(opening_lines):
+                for u in rng.choice(OPENING_LINES):
                     mv = chess.Move.from_uci(u)
                     if mv in board.legal_moves:
                         board.push(mv)
 
-                sacc_is_white = (game_num % 2) == 0
-                game_num += 1
+                sacc_is_white = ((local_game + worker_id) % 2) == 0
+                local_game += 1
                 sacc_positions: List[Tuple[str, int]] = []
-
-                with self._lock:
-                    self._status.opponent_name = opp_name
-                    self._status.opponent_elo = opp_elo
-                    self._status.level_idx = level_idx
-                    self._status.current_game_ply = 0
 
                 for ply in range(self.max_plies):
                     if self._stop_evt.is_set() or board.is_game_over():
                         break
-                    with self._lock:
-                        self._status.current_game_ply = ply + 1
+                    if worker_id == 0:
+                        with self._lock:
+                            self._status.current_game_ply = ply + 1
+                            self._status.opponent_name = spec.name
+                            self._status.opponent_elo = spec.elo
 
                     is_sacc_turn = (board.turn == chess.WHITE) == sacc_is_white
                     if is_sacc_turn:
                         mv_u, cp = sacc_proc.go(board.fen(), movetime_ms=self.movetime_ms)
                         sacc_positions.append((board.fen(), cp or 0))
                     else:
-                        if sf_elo is not None and sf_proc is not None:
-                            mv_u, _ = sf_proc.go(board.fen(), movetime_ms=max(25, self.movetime_ms // 2))
+                        if opp_proc is not None:
+                            opp_time = max(35, self.movetime_ms // 2) if spec.is_stockfish else max(40, self.movetime_ms // 2)
+                            mv_u, _ = opp_proc.go(board.fen(), movetime_ms=opp_time)
                         else:
                             mv_u = _baseline_d2_move(board, rng).uci()
 
@@ -567,7 +768,6 @@ class StockfishSparringArena:
                     except Exception:
                         break
 
-                # Adjudicate game result
                 outcome = board.outcome()
                 if outcome is not None:
                     if outcome.winner is None:
@@ -577,43 +777,31 @@ class StockfishSparringArena:
                     else:
                         score = 0.0
                 else:
-                    # Clean material adjudication on max-ply cutoff
                     w_mat = _material_eval_cp(board) * (1 if board.turn == chess.WHITE else -1)
                     sacc_mat = w_mat if sacc_is_white else -w_mat
                     score = 1.0 if sacc_mat >= 220 else (0.0 if sacc_mat <= -220 else 0.5)
 
-                # Harvest anti-Stockfish hard positions when Saccadion loses or draws a tough game
-                if score <= 0.5 and sf_proc is not None and sacc_positions:
-                    sf_proc.set_option("UCI_LimitStrength", "false")
-                    sample_fens = rng.sample(sacc_positions, min(4, len(sacc_positions)))
+                # Harvest anti-engine hard refutations from EVERY loss or draw against ANY engine!
+                new_recs: List[np.ndarray] = []
+                if score <= 0.5 and oracle_proc is not None and sacc_positions:
+                    oracle_proc.set_option("UCI_LimitStrength", "false")
+                    sample_fens = rng.sample(sacc_positions, min(5, len(sacc_positions)))
                     for fen_s, _ in sample_fens:
                         if self._stop_evt.is_set():
                             break
                         b_h = chess.Board(fen_s)
-                        best_ref, ref_cp = sf_proc.go(fen_s, movetime_ms=35)
+                        best_ref, ref_cp = oracle_proc.go(fen_s, movetime_ms=35)
                         if best_ref:
                             rec = self._pack_harvest_record(b_h, best_ref, ref_cp or 0)
                             if rec is not None:
-                                self._harvest_records.append(rec)
-                    self._flush_harvest()
-
-                self._results.append((opp_elo, score))
-                self._recent_level_scores.append(score)
-                real_elo, elo_ci = estimate_mle_elo(self._results[-60:])
-
-                # Adaptive opponent ladder promotion/demotion
-                if len(self._recent_level_scores) >= 4:
-                    avg = sum(self._recent_level_scores[-4:]) / 4.0
-                    max_lv = len(OPPONENT_LADDER) - 1 if sf_proc is not None else 0
-                    if avg >= 0.65 and level_idx < max_lv:
-                        level_idx += 1
-                        self._recent_level_scores.clear()
-                    elif avg <= 0.20 and level_idx > 0:
-                        level_idx -= 1
-                        self._recent_level_scores.clear()
+                                new_recs.append(rec)
 
                 res_txt = "WIN" if score == 1.0 else ("LOSS" if score == 0.0 else "DRAW")
                 with self._lock:
+                    self._game_counter += 1
+                    gnum = self._game_counter
+                    self._results.append((spec.elo, score))
+                    real_elo, elo_ci = estimate_mle_elo(self._results[-120:])
                     self._status.games_played += 1
                     if score == 1.0:
                         self._status.wins += 1
@@ -621,18 +809,29 @@ class StockfishSparringArena:
                         self._status.losses += 1
                     else:
                         self._status.draws += 1
+                    wdl_e = self._status.per_engine_wdl.setdefault(spec.family, [0, 0, 0])
+                    if score == 1.0:
+                        wdl_e[0] += 1
+                    elif score == 0.5:
+                        wdl_e[1] += 1
+                    else:
+                        wdl_e[2] += 1
                     self._status.real_elo = real_elo
                     self._status.elo_ci = elo_ci
-                    self._status.harvested_positions = len(self._harvest_records)
-                    self._status.last_result = f"G{game_num}: {res_txt} vs {opp_name} ({len(board.move_stack)} plies)"
+                    if new_recs:
+                        self._harvest_records.extend(new_recs)
+                        self._status.harvested_positions = len(self._harvest_records)
+                        if len(self._harvest_records) % 10 < len(new_recs) or len(self._harvest_records) <= 20:
+                            self._flush_harvest_locked()
+                    self._status.last_result = (
+                        f"G{gnum}[W{worker_id}]: {res_txt} vs {spec.name} ({len(board.move_stack)}p)"
+                    )
                 self._save_status()
-                # Yield politely so host OS stays responsive for TPU feeding
-                time.sleep(0.15)
+                time.sleep(0.08)
         finally:
             if sacc_proc is not None:
                 sacc_proc.close()
-            if sf_proc is not None:
-                sf_proc.close()
-            with self._lock:
-                self._status.active = False
-            self._save_status()
+            for p in opp_procs.values():
+                p.close()
+            if oracle_proc is not None:
+                oracle_proc.close()

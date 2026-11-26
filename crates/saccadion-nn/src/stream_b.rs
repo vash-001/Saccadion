@@ -11,7 +11,7 @@
 
 use crate::config::{AMACRINE_RANK, GRAPH_EDGE_TYPES, OPTIC_LAYERS};
 use crate::plasticity::DopaminePlasticityState;
-use crate::simd::{dot_f32, layer_norm, sigmoid, silu, softmax_inplace, softplus};
+use crate::simd::{add_inplace_f32, axpy_f32, dot_f32, layer_norm, matvec_f32, sigmoid, silu, softmax_inplace, softplus};
 use crate::stream_a::wdl_to_cp;
 use crate::weights::SaccadionWeights;
 use saccadion_chess::features::{extract_chess_graph_adj, extract_stream_b_board};
@@ -54,10 +54,9 @@ pub struct StreamBOutput {
     pub centrifugal_board_mask: [f32; 64],
 }
 
+#[inline(always)]
 fn matvec(w: &[f32], x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
-    for r in 0..rows {
-        out[r] = dot_f32(&w[r * cols..(r + 1) * cols], x);
-    }
+    matvec_f32(w, x, rows, cols, out);
 }
 
 /// FlyWire Dale's-Law Typed Directed Chess-Graph Message Passing (GNN) over live piece edges:
@@ -91,9 +90,7 @@ fn apply_flywire_gnn_hop(sq_state: &mut [f32], graph_adj: &[[u64; 64]; 4], w: &S
                 let v = v_sq.index();
                 in_deg[v] += 1.0;
                 let dst = &mut agg[v * d..(v + 1) * d];
-                for j in 0..d {
-                    dst[j] += xu[j];
-                }
+                add_inplace_f32(dst, xu);
             }
         }
         let wk = &w.b_gnn_w[k * d * d..(k + 1) * d * d];
@@ -109,9 +106,7 @@ fn apply_flywire_gnn_hop(sq_state: &mut [f32], graph_adj: &[[u64; 64]; 4], w: &S
             }
             matvec(wk, av, d, d, &mut proj);
             let dst = &mut signed_sum[v * d..(v + 1) * d];
-            for j in 0..d {
-                dst[j] += sign * proj[j];
-            }
+            axpy_f32(dst, &proj, sign);
         }
     }
 
@@ -261,9 +256,7 @@ pub fn evaluate_stream_b(
                 for v in 0..64 {
                     let a = attn_scores[v];
                     let vv = &lob_v[v * d + h_off..v * d + h_off + lob_hd];
-                    for j in 0..lob_hd {
-                        dst[j] += a * vv[j];
-                    }
+                    axpy_f32(dst, vv, a);
                 }
             }
         }
