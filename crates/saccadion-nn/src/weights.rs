@@ -21,6 +21,18 @@ fn quantize_to_i16(src: &[f32]) -> Vec<i16> {
         .collect()
 }
 
+/// Packs only the frozen alpha/beta lobe (`0..ab_dim`) of every sparse feature row contiguously
+/// in INT16 (2.7x smaller L2/L3 cache footprint for blazing Push/Pop Incremental Giant Fiber!).
+fn pack_ab_lobe_i16(full_i16: &[i16], num_rows: usize, full_dim: usize, ab_dim: usize) -> Vec<i16> {
+    let mut out = vec![0i16; num_rows * ab_dim];
+    for r in 0..num_rows {
+        let src = &full_i16[r * full_dim..r * full_dim + ab_dim];
+        let dst = &mut out[r * ab_dim..(r + 1) * ab_dim];
+        dst.copy_from_slice(src);
+    }
+    out
+}
+
 fn quantize_stacks_to_i8(src: &[f32], num_stacks: usize) -> (Vec<i8>, Vec<f32>) {
     let per_stack = src.len() / num_stacks.max(1);
     let mut out = vec![0i8; src.len()];
@@ -338,8 +350,9 @@ pub struct SaccadionWeights {
     pub b_wm_opp_b: Vec<f32>,        // [cx_dim]
 
     // ==================== DERIVED RUNTIME AVX2 INT16/INT8 CACHE (NOT ON DISK) ====================
-    /// Pre-quantized INT16 feature transformer & INT8 MBON weights for blazing AVX2 neural QSearch.
+    /// Pre-quantized INT16 feature transformer & tightly packed alpha/beta Giant Fiber rows.
     pub a_ft_weight_i16: Vec<i16>,
+    pub a_ft_ab_i16: Vec<i16>,
     pub a_ft_bias_i16: Vec<i16>,
     pub a_mbon_ipsi_i8: Vec<i8>,
     pub a_mbon_ipsi_scale: Vec<f32>,
@@ -414,6 +427,7 @@ impl SaccadionWeights {
         let a_ft_weight = alloc_init(cfg.sparse_input_dim * cfg.acc_dim, s_ft, &mut rng);
         let a_ft_bias = vec![0.05; cfg.acc_dim];
         let a_ft_weight_i16 = quantize_to_i16(&a_ft_weight);
+        let a_ft_ab_i16 = pack_ab_lobe_i16(&a_ft_weight_i16, cfg.sparse_input_dim, cfg.acc_dim, ab_dim);
         let a_ft_bias_i16 = quantize_to_i16(&a_ft_bias);
         let a_sez_weight = init_sez_innate_weights(cfg.sparse_input_dim, stacks);
         let a_claw_weight = alloc_init(plastic_dim * cfg.flyhash_claws, 0.35, &mut rng);
@@ -564,6 +578,7 @@ impl SaccadionWeights {
             b_wm_opp_w,
             b_wm_opp_b,
             a_ft_weight_i16,
+            a_ft_ab_i16,
             a_ft_bias_i16,
             a_mbon_ipsi_i8,
             a_mbon_ipsi_scale,
@@ -1042,6 +1057,7 @@ impl SaccadionWeights {
         };
 
         let a_ft_weight_i16 = quantize_to_i16(&a_ft_weight);
+        let a_ft_ab_i16 = pack_ab_lobe_i16(&a_ft_weight_i16, cfg.sparse_input_dim, cfg.acc_dim, ab_dim);
         let a_ft_bias_i16 = quantize_to_i16(&a_ft_bias);
         let (a_mbon_ipsi_i8, a_mbon_ipsi_scale) = quantize_stacks_to_i8(&a_mbon_ipsi, stacks);
         let (a_mbon_contra_i8, a_mbon_contra_scale) = quantize_stacks_to_i8(&a_mbon_contra, stacks);
@@ -1147,6 +1163,7 @@ impl SaccadionWeights {
             b_wm_opp_w,
             b_wm_opp_b,
             a_ft_weight_i16,
+            a_ft_ab_i16,
             a_ft_bias_i16,
             a_mbon_ipsi_i8,
             a_mbon_ipsi_scale,

@@ -10,9 +10,10 @@ pub mod weights;
 pub use config::ModelConfig;
 pub use plasticity::{DopaminePlasticityState, PlasticityParams, SparseActiveKc};
 pub use stream_a::{
-    evaluate_giant_fiber_cp, evaluate_stream_a, LateralHornVeto, StreamAOutput, StreamAWorkspace,
+    evaluate_giant_fiber_cp, evaluate_stream_a, fast_lateral_horn_alert, GiantFiberStack,
+    LateralHornVeto, StreamAOutput, StreamAWorkspace,
 };
-pub use stream_b::{evaluate_stream_b, PolicyMoveScore, StreamBOutput};
+pub use stream_b::{evaluate_stream_b, evaluate_stream_b_cancellable, PolicyMoveScore, StreamBOutput};
 pub use weights::SaccadionWeights;
 
 #[cfg(test)]
@@ -168,6 +169,63 @@ mod tests {
                 uci,
                 o_cached.slow_cp,
                 o_fresh.slow_cp
+            );
+        }
+    }
+
+    #[test]
+    fn test_giant_fiber_push_pop_stack_bit_exact() {
+        let cfg = ModelConfig::tiny();
+        let weights = SaccadionWeights::init_random(cfg, 2026);
+        let mut ws_stack = StreamAWorkspace::new(&weights);
+        let mut ws_fresh = StreamAWorkspace::new(&weights);
+
+        // Position featuring castling, en-passant, promotion, captures, and king bucket crossings!
+        let mut pos =
+            Position::from_fen("r3k2r/pPppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1")
+                .unwrap();
+        ws_stack.gf_stack.reset_root(&pos, &weights, &mut ws_stack.finny_i16);
+        assert_eq!(
+            ws_stack.gf_stack.evaluate_ply(0, &pos, &weights),
+            evaluate_giant_fiber_cp(&pos, &weights, &mut ws_fresh)
+        );
+
+        let moves = ["e1g1", "e8g8", "b7a8q", "c7c5", "d5c6", "b4c3", "f3f6", "g8h8"];
+        let mut undos = Vec::new();
+        for (ply, uci) in moves.iter().enumerate() {
+            let mv = saccadion_chess::movegen::parse_uci_move(&mut pos, uci)
+                .unwrap_or_else(|| panic!("illegal test move {} at ply {}", uci, ply));
+            let undo = pos.make_move(mv);
+            ws_stack.gf_stack.push_move(
+                ply,
+                mv,
+                undo.captured,
+                &pos,
+                &weights,
+                &mut ws_stack.finny_i16,
+            );
+            undos.push((mv, undo));
+            ws_fresh.finny_i16.clear();
+            let inc_cp = ws_stack.gf_stack.evaluate_ply(ply + 1, &pos, &weights);
+            let ref_cp = evaluate_giant_fiber_cp(&pos, &weights, &mut ws_fresh);
+            assert_eq!(
+                inc_cp, ref_cp,
+                "GiantFiberStack mismatch after {} at ply {}: inc={} vs fresh={}",
+                uci,
+                ply + 1,
+                inc_cp,
+                ref_cp
+            );
+        }
+
+        // Verify O(1) pop restores exact parent evaluations back to ply 0!
+        for ply in (0..moves.len()).rev() {
+            let (mv, undo) = undos.pop().unwrap();
+            pos.unmake_move(mv, undo);
+            ws_fresh.finny_i16.clear();
+            assert_eq!(
+                ws_stack.gf_stack.evaluate_ply(ply, &pos, &weights),
+                evaluate_giant_fiber_cp(&pos, &weights, &mut ws_fresh)
             );
         }
     }

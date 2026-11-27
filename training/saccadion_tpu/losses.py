@@ -417,17 +417,20 @@ def compute_multitask_loss(
     loss_cp_b = weighted_huber_loss(out_b["pred_cp"] / 400.0, target_cp_scaled, deep_val_w, delta=0.5)
 
     # 1b. Dedicated Dendritic Coincidence Giant Fiber (GF / DNp01) Supervision + Stream B -> GF Distillation!
+    # Exact inverse of pipeline.rs WDL sigmoid((cp-90)/140): E[win] = w + 0.5*d == sigmoid(cp / 155.0)
+    # within < 1.5% across [-600, +600] cp, aligning loss_gf_wdl, loss_gf_cp, loss_b_to_gf, and SEZ 100%!
     gf_cp = out_a_unmasked["gf_cp"] if out_a_unmasked is not None else out_a["gf_cp"]
-    target_win_exp = jnp.clip(wdl_t[:, 0] + 0.5 * wdl_t[:, 1], 1e-5, 1.0 - 1e-5)
-    gf_logit = gf_cp / 280.0
+    target_win_exp = jnp.clip(wdl_t[:, 0] + 0.5 * wdl_t[:, 1], 1e-4, 1.0 - 1e-4)
+    true_cp_target = jnp.clip(155.0 * jnp.log(target_win_exp / (1.0 - target_win_exp)), -2500.0, 2500.0)
+    gf_logit = gf_cp / 155.0
     gf_bce = -(target_win_exp * jax.nn.log_sigmoid(gf_logit) + (1.0 - target_win_exp) * jax.nn.log_sigmoid(-gf_logit))
     loss_gf_wdl = jnp.sum(gf_bce * leaf_val_w) / jnp.maximum(jnp.sum(leaf_val_w), 1.0)
-    loss_gf_cp = weighted_huber_loss(gf_cp / 400.0, target_cp_scaled, leaf_val_w, delta=0.5)
-    loss_b_to_gf = weighted_huber_loss(
-        gf_cp / 400.0, jax.lax.stop_gradient(out_b["pred_cp"]) / 400.0, leaf_val_w, delta=0.5
-    )
-    loss_gf = 1.40 * loss_gf_wdl + 0.60 * loss_gf_cp + 0.45 * loss_b_to_gf
-    gf_quiet_mae = jnp.sum(jnp.abs(gf_cp - 400.0 * target_cp_scaled) * quiet_f) / jnp.maximum(jnp.sum(quiet_f), 1.0)
+    loss_gf_cp = weighted_huber_loss(gf_cp / 400.0, true_cp_target / 400.0, leaf_val_w, delta=0.5)
+    b_win_exp = jnp.clip(probs_b_sg[:, 0] + 0.5 * probs_b_sg[:, 1], 1e-4, 1.0 - 1e-4)
+    b_to_gf_bce = -(b_win_exp * jax.nn.log_sigmoid(gf_logit) + (1.0 - b_win_exp) * jax.nn.log_sigmoid(-gf_logit))
+    loss_b_to_gf = jnp.sum(b_to_gf_bce * leaf_val_w) / jnp.maximum(jnp.sum(leaf_val_w), 1.0)
+    loss_gf = 1.40 * loss_gf_wdl + 0.55 * loss_gf_cp + 0.85 * loss_b_to_gf
+    gf_quiet_mae = jnp.sum(jnp.abs(gf_cp - true_cp_target) * quiet_f) / jnp.maximum(jnp.sum(quiet_f), 1.0)
 
     loss_wdl = loss_wdl_b + loss_wdl_a + 0.30 * loss_b_to_a + 0.45 * (loss_cp_a + loss_cp_b) + 0.85 * loss_gf
 

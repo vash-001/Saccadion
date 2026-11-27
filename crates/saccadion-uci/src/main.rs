@@ -452,7 +452,7 @@ fn main() {
         }
         match tokens[0] {
             "uci" => {
-                println!("id name Saccadion 8.0 (Drosophila Retrograde-Fischer-Graph+INT8)");
+                println!("id name Saccadion 8.2 (Drosophila Incremental-GF+Async-StreamB)");
                 println!("id author Saccadion Research Team");
                 println!("option name Hash type spin default {} min 1 max 4096", hash_mb);
                 println!("option name Threads type spin default {} min 1 max 64", default_threads);
@@ -464,6 +464,10 @@ fn main() {
                 println!("uciok");
             }
             "isready" => {
+                // Warm up lazy magic-bitboard OnceLock tables before the game clock starts!
+                let mut warm_pos = Position::startpos();
+                let mut warm_moves = MoveList::new();
+                generate_legal(&mut warm_pos, &mut warm_moves);
                 println!("readyok");
             }
             "ucinewgame" => {

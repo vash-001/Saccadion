@@ -21,6 +21,7 @@ use saccadion_chess::features::{extract_chess_graph_adj, extract_stream_b_board}
 use saccadion_chess::position::Position;
 use saccadion_chess::types::{Move, MoveList};
 use saccadion_chess::Bitboard;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Dale's-Law edge polarity & X-Ray attenuation across all 6 directed chess-graph channels:
 /// 0: STM Atk (+1.0), 1: STM Def (+1.0), 2: Opp Atk (-1.0), 3: Opp Def (-1.0),
@@ -261,6 +262,36 @@ pub fn evaluate_stream_b_fp32(
     )
 }
 
+/// Runs fast INT8 AVX2 Stream B with cooperative cancellation for non-blocking parallel blitz!
+/// Returns `None` immediately (< 5 ms) if `abort_flag` is signaled before deliberation finishes.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_stream_b_cancellable(
+    pos: &Position,
+    legal_moves: &MoveList,
+    w: &SaccadionWeights,
+    mbon_summary: &[f32],
+    sez_cp: f32,
+    plasticity: Option<&DopaminePlasticityState>,
+    novelty_score: f32,
+    serotonin: f32,
+    adaptive_halt: bool,
+    abort_flag: &AtomicBool,
+) -> Option<StreamBOutput> {
+    evaluate_stream_b_inner(
+        pos,
+        legal_moves,
+        w,
+        mbon_summary,
+        sez_cp,
+        plasticity,
+        novelty_score,
+        serotonin,
+        adaptive_halt,
+        true,
+        Some(abort_flag),
+    )
+}
+
 /// Internal Stream B Deep Strategic Brain supporting both fast INT8 AVX2 (`use_i8=true`)
 /// and exact FP32 reference (`use_i8=false`).
 #[allow(clippy::too_many_arguments)]
@@ -276,6 +307,37 @@ pub fn evaluate_stream_b_ex(
     adaptive_halt: bool,
     use_i8: bool,
 ) -> StreamBOutput {
+    evaluate_stream_b_inner(
+        pos,
+        legal_moves,
+        w,
+        mbon_summary,
+        sez_cp,
+        plasticity,
+        novelty_score,
+        serotonin,
+        adaptive_halt,
+        use_i8,
+        None,
+    )
+    .expect("unconditional Stream B evaluation cannot cancel")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_stream_b_inner(
+    pos: &Position,
+    legal_moves: &MoveList,
+    w: &SaccadionWeights,
+    mbon_summary: &[f32],
+    sez_cp: f32,
+    plasticity: Option<&DopaminePlasticityState>,
+    novelty_score: f32,
+    serotonin: f32,
+    adaptive_halt: bool,
+    use_i8: bool,
+    abort_flag: Option<&AtomicBool>,
+) -> Option<StreamBOutput> {
+    let is_aborted = || abort_flag.is_some_and(|f| f.load(Ordering::Relaxed));
     let cfg = &w.cfg;
     let d = cfg.stream_b_dim;
     let sq_in = cfg.sq_feat_dim;
@@ -343,6 +405,9 @@ pub fn evaluate_stream_b_ex(
     let mut ama_v = vec![0.0f32; 64 * ama_tot];
 
     for l in 0..OPTIC_LAYERS {
+        if is_aborted() {
+            return None;
+        }
         let ln1_g = &w.b_opt_ln1_g[l * d..(l + 1) * d];
         let ln1_b = &w.b_opt_ln1_b[l * d..(l + 1) * d];
         let wq = &w.b_opt_q[l * d * d..(l + 1) * d * d];
@@ -482,6 +547,9 @@ pub fn evaluate_stream_b_ex(
     // B2-B4. Weight-Tied Central Complex + Rich-Club Recurrent Deliberation Loop
     // -------------------------------------------------------------------------
     for tick in 0..cfg.cx_max_ticks {
+        if is_aborted() {
+            return None;
+        }
         ticks_used = tick + 1;
         prev_phasor.copy_from_slice(&cx_phasor);
 
@@ -891,7 +959,7 @@ pub fn evaluate_stream_b_ex(
         *x = sigmoid(*x);
     }
 
-    StreamBOutput {
+    Some(StreamBOutput {
         deep_cp,
         wdl_probs,
         pfl2_sharpness,
@@ -904,5 +972,5 @@ pub fn evaluate_stream_b_ex(
         centrifugal_kc_mask,
         centrifugal_board_mask: cent_board_mask,
         retro_goal_saliency,
-    }
+    })
 }

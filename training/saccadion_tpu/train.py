@@ -234,12 +234,13 @@ def build_freeze_thaw_schedule(
         fmap = {"GF+HalfKA": "THAWED 1.0x", "Optic+GNN": "THAWED 1.0x", "CX+World": "WARM 0.6x", "Meta-DA": "FROZEN 0.0x"}
     elif epoch <= p2_end:
         stage, name, ticks, apl_t, qat = 2, "P2:Causal-Blunder-Thaw", 4, 0.10, False
-        m_gf, m_ft, m_sez, m_optic, m_cx, m_wm, m_da = 0.25, 0.08, 0.05, 1.0, 1.0, 1.0, 0.0
-        fmap = {"GF+HalfKA": "ANCHORED 0.1x", "Optic+GNN": "THAWED 1.0x", "CX+World": "THAWED 1.0x", "Meta-DA": "FROZEN 0.0x"}
+        # Keep Giant Fiber & HalfKA actively learning and distilling from Stream B in P2!
+        m_gf, m_ft, m_sez, m_optic, m_cx, m_wm, m_da = 0.75, 0.35, 0.12, 1.0, 1.0, 1.0, 0.0
+        fmap = {"GF+HalfKA": "DISTILL 0.75x", "Optic+GNN": "THAWED 1.0x", "CX+World": "THAWED 1.0x", "Meta-DA": "FROZEN 0.0x"}
     elif epoch <= p3_end:
         stage, name, ticks, apl_t, qat = 3, "P3:Distill-Dopamine-Thaw", 4, 0.08, False
-        m_gf, m_ft, m_sez, m_optic, m_cx, m_wm, m_da = 1.0, 0.35, 0.15, 0.15, 0.40, 0.50, 1.0
-        fmap = {"GF+HalfKA": "THAWED 1.0x", "Optic+GNN": "ANCHORED 0.15x", "CX+World": "WARM 0.4x", "Meta-DA": "THAWED 1.0x"}
+        m_gf, m_ft, m_sez, m_optic, m_cx, m_wm, m_da = 1.0, 0.45, 0.18, 0.20, 0.45, 0.55, 1.0
+        fmap = {"GF+HalfKA": "THAWED 1.0x", "Optic+GNN": "WARM 0.2x", "CX+World": "WARM 0.45x", "Meta-DA": "THAWED 1.0x"}
     else:
         stage, name, ticks, apl_t, qat = 4, "P4:Apex-Polish+QAT" if qat_active else "P4:Apex-Polish", 4, 0.08, qat_active
         m_gf, m_ft, m_sez, m_optic, m_cx, m_wm, m_da = 0.35, 0.20, 0.10, 0.25, 0.35, 0.35, 0.40
@@ -625,13 +626,18 @@ def train_saccadion_smart(
 
     async_ckpt = _AsyncCheckpointSaver()
 
-    # Start Background CPU Stockfish Sparring & Real-Elo Arena using BEST generalizing weights!
+    # Start Isolated Subprocess CPU Stockfish Sparring & Real-Elo Arena (ZERO GIL / ZERO Drive FUSE stalls!)
     arena: Optional[StockfishSparringArena] = None
     if enable_cpu_arena:
+        local_arena_status = (
+            Path("/content/_sacc_arena_status.json")
+            if Path("/content").exists()
+            else (checkpoint_dir / "arena_status.json")
+        )
         arena = StockfishSparringArena(
             weights_path=export_dir / "saccadion_best.saccnet",
             harvest_shard_path=sparring_shard,
-            status_json_path=checkpoint_dir / "arena_status.json",
+            status_json_path=local_arena_status,
             movetime_ms=250,
         )
         arena.start()

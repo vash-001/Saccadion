@@ -18,13 +18,16 @@ Exploits ALL idle CPU cores in parallel while the TPU trains:
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
 import random
 import shutil
+import signal
 import struct
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -520,6 +523,7 @@ class StockfishSparringArena:
         movetime_ms: int = 150,
         max_plies: int = 130,
         num_workers: Optional[int] = None,
+        use_subprocess: bool = True,
     ):
         self.weights_path = weights_path
         self.harvest_shard_path = harvest_shard_path
@@ -527,6 +531,7 @@ class StockfishSparringArena:
         self.rust_uci_binary = rust_uci_binary
         self.movetime_ms = movetime_ms
         self.max_plies = max_plies
+        self.use_subprocess = use_subprocess
 
         n_cpu = os.cpu_count() or 2
         if num_workers is None:
@@ -540,6 +545,9 @@ class StockfishSparringArena:
         self._stop_evt = threading.Event()
         self._manager_thread: Optional[threading.Thread] = None
         self._worker_threads: List[threading.Thread] = []
+        self._child_proc: Optional[subprocess.Popen] = None
+        self._cached_status_mtime = 0.0
+        self._cached_status_dict: Optional[Dict[str, Any]] = None
         self._status = ArenaStatus(parallel_workers=self.num_workers)
         self._results: List[Tuple[int, float]] = []
         self._harvest_records: List[np.ndarray] = []
@@ -549,6 +557,35 @@ class StockfishSparringArena:
         self._sf_bin: Optional[Path] = None
 
     def start(self) -> None:
+        if self.use_subprocess:
+            if self._child_proc is not None and self._child_proc.poll() is None:
+                return
+            train_pkg_root = str(Path(__file__).resolve().parents[1])
+            env = os.environ.copy()
+            prev_pp = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{train_pkg_root}{os.pathsep}{prev_pp}" if prev_pp else train_pkg_root
+            cmd = [
+                sys.executable,
+                "-m",
+                "saccadion_tpu.cpu_arena_sparring",
+                "--weights",
+                str(self.weights_path),
+                "--harvest",
+                str(self.harvest_shard_path),
+                "--status",
+                str(self.status_json_path),
+                "--movetime",
+                str(self.movetime_ms),
+                "--max-plies",
+                str(self.max_plies),
+                "--workers",
+                str(self.num_workers),
+            ]
+            if self.rust_uci_binary is not None:
+                cmd.extend(["--rust-bin", str(self.rust_uci_binary)])
+            self._child_proc = subprocess.Popen(cmd, env=env)
+            return
+
         if self._manager_thread is not None and self._manager_thread.is_alive():
             return
         self._stop_evt.clear()
@@ -558,6 +595,19 @@ class StockfishSparringArena:
         self._manager_thread.start()
 
     def stop(self) -> None:
+        if self._child_proc is not None:
+            try:
+                self._child_proc.terminate()
+                self._child_proc.wait(timeout=4.0)
+            except Exception:
+                try:
+                    self._child_proc.kill()
+                    self._child_proc.wait(timeout=2.0)
+                except Exception:
+                    pass
+            self._child_proc = None
+            return
+
         self._stop_evt.set()
         for t in self._worker_threads:
             t.join(timeout=3.0)
@@ -565,6 +615,22 @@ class StockfishSparringArena:
             self._manager_thread.join(timeout=3.0)
 
     def get_status(self) -> Dict[str, Any]:
+        if self.use_subprocess:
+            try:
+                if self.status_json_path.exists():
+                    mt = self.status_json_path.stat().st_mtime
+                    if self._cached_status_dict is None or mt > self._cached_status_mtime:
+                        data = json.loads(self.status_json_path.read_text(encoding="utf-8"))
+                        if isinstance(data, dict):
+                            self._cached_status_dict = data
+                            self._cached_status_mtime = mt
+                    if self._cached_status_dict is not None:
+                        return dict(self._cached_status_dict)
+            except Exception:
+                if self._cached_status_dict is not None:
+                    return dict(self._cached_status_dict)
+            return self._status.to_dict()
+
         with self._lock:
             return self._status.to_dict()
 
@@ -575,6 +641,7 @@ class StockfishSparringArena:
         for cand in [
             repo_root / "target" / "release" / "saccadion",
             repo_root / "target" / "release" / "saccadion.exe",
+            Path("/content/drive/MyDrive/Saccadion_TPU/bin_v15/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v14/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v13/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v12/saccadion"),
@@ -671,7 +738,11 @@ class StockfishSparringArena:
     def _save_status(self) -> None:
         try:
             self.status_json_path.parent.mkdir(parents=True, exist_ok=True)
-            self.status_json_path.write_text(json.dumps(self.get_status(), indent=2), encoding="utf-8")
+            with self._lock:
+                payload = json.dumps(self._status.to_dict())
+            tmp = self.status_json_path.with_suffix(".json.tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(self.status_json_path)
         except Exception:
             pass
 
@@ -771,12 +842,12 @@ class StockfishSparringArena:
                     )
                     sacc_proc.set_option("WeightsPath", str(self.weights_path))
                     last_mtime = mtime
-                    # Trim stale older-epoch Elo history aggressively when newer best weights arrive
+                    # Keep a statistically stable rolling window when newer best weights arrive
                     with self._lock:
                         if mtime > self._latest_weights_mtime:
                             self._latest_weights_mtime = mtime
-                            if len(self._results) > 8:
-                                self._results = self._results[-8:]
+                            if len(self._results) > 20:
+                                self._results = self._results[-20:]
 
                 spec = self._pick_opponent(worker_id, local_game, rng)
                 opp_proc: Optional[_UciProcess] = None
@@ -806,6 +877,7 @@ class StockfishSparringArena:
                 sacc_positions: List[Tuple[str, int]] = []
                 recent_ucis: List[str] = [m.uci() for m in board.move_stack[-6:]]
                 last_sacc_cp = 0
+                last_live_flush = time.time()
 
                 for ply in range(self.max_plies):
                     if self._stop_evt.is_set() or board.is_game_over():
@@ -826,6 +898,9 @@ class StockfishSparringArena:
                             "last_cp": last_sacc_cp,
                             "recent_moves": list(recent_ucis[-8:]),
                         }
+                    if worker_id == 0 and (time.time() - last_live_flush) >= 1.5:
+                        self._save_status()
+                        last_live_flush = time.time()
 
                     is_sacc_turn = (board.turn == chess.WHITE) == sacc_is_white
                     if is_sacc_turn:
@@ -873,7 +948,7 @@ class StockfishSparringArena:
                     self._game_counter += 1
                     gnum = self._game_counter
                     self._results.append((spec.elo, score))
-                    real_elo, elo_ci = estimate_mle_elo(self._results[-48:])
+                    real_elo, elo_ci = estimate_mle_elo(self._results[-64:])
                     self._status.games_played += 1
                     if score == 1.0:
                         self._status.wins += 1
@@ -925,3 +1000,41 @@ class StockfishSparringArena:
                 p.close()
             if oracle_proc is not None:
                 oracle_proc.close()
+
+
+def _main_cli() -> None:
+    parser = argparse.ArgumentParser(description="Isolated Zero-GIL Multi-Engine CPU Arena Process")
+    parser.add_argument("--weights", required=True)
+    parser.add_argument("--harvest", required=True)
+    parser.add_argument("--status", required=True)
+    parser.add_argument("--rust-bin", default=None)
+    parser.add_argument("--movetime", type=int, default=250)
+    parser.add_argument("--max-plies", type=int, default=130)
+    parser.add_argument("--workers", type=int, default=None)
+    args = parser.parse_args()
+
+    arena = StockfishSparringArena(
+        weights_path=Path(args.weights),
+        harvest_shard_path=Path(args.harvest),
+        status_json_path=Path(args.status),
+        rust_uci_binary=Path(args.rust_bin) if args.rust_bin else None,
+        movetime_ms=args.movetime,
+        max_plies=args.max_plies,
+        num_workers=args.workers,
+        use_subprocess=False,
+    )
+
+    def _handle_sig(_signum, _frame):
+        arena._stop_evt.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handle_sig)
+        except Exception:
+            pass
+
+    arena._bootstrap_and_run()
+
+
+if __name__ == "__main__":
+    _main_cli()

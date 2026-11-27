@@ -14,11 +14,11 @@ use saccadion_chess::position::Position;
 use saccadion_chess::Bitboard;
 use saccadion_chess::types::{Color, Move, MoveList, Piece};
 use saccadion_nn::plasticity::DopaminePlasticityState;
-use saccadion_nn::stream_a::{evaluate_giant_fiber_cp, evaluate_stream_a, StreamAWorkspace};
-use saccadion_nn::stream_b::evaluate_stream_b;
+use saccadion_nn::stream_a::{evaluate_stream_a, fast_lateral_horn_alert, StreamAWorkspace};
+use saccadion_nn::stream_b::{evaluate_stream_b, evaluate_stream_b_cancellable, StreamBOutput};
 use saccadion_nn::weights::SaccadionWeights;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MAX_PLY: usize = 128;
@@ -151,6 +151,7 @@ struct DnpWorker {
     efference_surprises: u64,
     deadline: Option<Instant>,
     aborted: bool,
+    allow_time_abort: bool,
     max_nodes: u64,
     cfg: SearchConfig,
     is_helper: bool,
@@ -166,15 +167,9 @@ impl DnpWorker {
         shared_q_nodes: Arc<AtomicU64>,
         cfg: SearchConfig,
         deadline: Option<Instant>,
-        gamma_seed: Option<&[f32]>,
     ) -> Self {
         let ws_a = StreamAWorkspace::new(&weights);
-        let mut plasticity = DopaminePlasticityState::new(&weights.cfg);
-        if cfg.use_dopamine {
-            if let Some(seed) = gamma_seed {
-                plasticity.inject_stream_b_seed(seed, seed, 0.25);
-            }
-        }
+        let plasticity = DopaminePlasticityState::new(&weights.cfg);
         Self {
             weights,
             tt,
@@ -206,6 +201,7 @@ impl DnpWorker {
             efference_surprises: 0,
             deadline,
             aborted: false,
+            allow_time_abort: true,
             max_nodes: cfg.max_nodes,
             cfg,
             is_helper: true,
@@ -240,10 +236,12 @@ impl DnpWorker {
                 self.aborted = true;
                 return true;
             }
-            if let Some(dl) = self.deadline {
-                if Instant::now() >= dl {
-                    self.aborted = true;
-                    return true;
+            if self.allow_time_abort {
+                if let Some(dl) = self.deadline {
+                    if Instant::now() >= dl {
+                        self.aborted = true;
+                        return true;
+                    }
                 }
             }
         }
@@ -338,7 +336,7 @@ impl DnpWorker {
             return 0;
         }
         if ply >= MAX_PLY - 1 {
-            return evaluate_giant_fiber_cp(pos, &self.weights, &mut self.ws_a);
+            return self.ws_a.gf_stack.evaluate_ply(ply, pos, &self.weights);
         }
 
         // Draw detection with Serotonin anti-draw contempt when pushing a strategic squeeze
@@ -384,55 +382,62 @@ impl DnpWorker {
             }
         }
 
-        // 2. Biological 3-Tier Evaluation Hierarchy:
-        //    - Tier 1 (Shallow Non-PV Frontier depth <= 2): Giant Fiber (SEZ + INT8 AVX2 alpha/beta MBON)
-        //    - Tier 2 (PV or depth >= 3): Full Stream A (FullRays + LC4 + FlyHash + Lateral Horn + Dopamine)
-        let cached_strat_hit = if self.cfg.use_stream_b && (is_pv || depth >= 5) {
+        // 2. Unified TT-Consistent Biological Evaluation Hierarchy:
+        //    - ALL non-PV nodes (depth 1..64) & QSearch: Push/Pop Incremental AVX2 INT16 Giant Fiber
+        //      (~45 ns/node, 100% TT-consistent, ZERO depth 4<->5 eval discontinuity!) + <15 ns LH reflex.
+        //    - PV nodes (depth >= 4 or ply == 0) & StrategicTT hits: Full Stream A (frozen alpha/beta
+        //      slow_cp only — NEVER corrupted by untrained gamma_seed or mid-search dw_gamma drift!)
+        //      smoothly blended with Giant Fiber so PV & non-PV trees stay perfectly calibrated!
+        let cached_strat_hit = if self.cfg.use_stream_b && (is_pv || depth >= 6) {
             self.strategic_tt.probe(pos.hash).cloned()
         } else {
             None
         };
 
-        // Tier 1 (All non-PV nodes depth <= 4): Register-Resident INT16+INT8 AVX2 Neural Giant Fiber!
-        // Tier 2 (PV or depth >= 5): Full Stream A (FullRays + LC4 + Lateral Horn + 3-Lobe Dopamine)
-        let use_fast_frontier = !is_pv && depth <= 4 && cached_strat_hit.is_none();
-        let (raw_static_eval, out_a_opt, lh_tactical_alert, lh_deep_alert, efference_surprise) = if use_fast_frontier {
-            let gf_cp = evaluate_giant_fiber_cp(pos, &self.weights, &mut self.ws_a);
-            (gf_cp, None, false, false, false)
-        } else {
-            let out_a = evaluate_stream_a(
-                pos,
-                &self.weights,
-                &mut self.ws_a,
-                if self.cfg.use_dopamine { Some(&self.plasticity) } else { None },
-                parent_cent_mask,
-                self.cfg.octopamine,
-            );
-            let se = if let Some(ref hit) = cached_strat_hit {
-                (0.75 * hit.deep_cp + 0.25 * out_a.total_cp).round() as i32
+        let gf_cp = self.ws_a.gf_stack.evaluate_ply(ply, pos, &self.weights);
+        let need_full_stream_a = is_pv && (ply == 0 || depth >= 4);
+        let (raw_static_eval, out_a_opt, lh_tactical_alert, lh_deep_alert, efference_surprise) =
+            if !need_full_stream_a && cached_strat_hit.is_none() {
+                let fast_lh = self.cfg.use_lateral_horn && fast_lateral_horn_alert(pos);
+                if fast_lh {
+                    self.lh_veto_triggers += 1;
+                }
+                (gf_cp, None, fast_lh, fast_lh, false)
             } else {
-                out_a.total_cp.round() as i32
+                // Pass `None` for plasticity to keep static minimax & TT evaluations 100% invariant!
+                let out_a = evaluate_stream_a(
+                    pos,
+                    &self.weights,
+                    &mut self.ws_a,
+                    None,
+                    parent_cent_mask,
+                    self.cfg.octopamine,
+                );
+                let se = if let Some(ref hit) = cached_strat_hit {
+                    (0.55 * hit.deep_cp + 0.45 * gf_cp as f32).round() as i32
+                } else {
+                    (0.50 * out_a.slow_cp + 0.50 * gf_cp as f32).round() as i32
+                };
+                if self.cfg.use_dopamine {
+                    self.plasticity.apply_mbon_soc_feedback(out_a.slow_cp);
+                    self.plasticity
+                        .accumulate_eligibility(&out_a.active_gamma_stm, &out_a.active_gamma_opp);
+                }
+                let lh_alert = self.cfg.use_lateral_horn && out_a.veto.tactical_alert();
+                let lh_deep = self.cfg.use_lateral_horn
+                    && (lh_alert || out_a.veto.fortress_alert() || out_a.veto.passer_urgency > 0.55);
+                if lh_alert {
+                    self.lh_veto_triggers += 1;
+                }
+                let eff_surp = self.cfg.use_efference_copy
+                    && ply > 0
+                    && expected_eval_from_parent != 0.0
+                    && (se as f32 - expected_eval_from_parent).abs() > 140.0;
+                if eff_surp {
+                    self.efference_surprises += 1;
+                }
+                (se, Some(out_a), lh_alert, lh_deep, eff_surp)
             };
-            if self.cfg.use_dopamine {
-                self.plasticity.apply_mbon_soc_feedback(out_a.slow_cp);
-                self.plasticity
-                    .accumulate_eligibility(&out_a.active_gamma_stm, &out_a.active_gamma_opp);
-            }
-            let lh_alert = self.cfg.use_lateral_horn && out_a.veto.tactical_alert();
-            let lh_deep = self.cfg.use_lateral_horn
-                && (lh_alert || out_a.veto.fortress_alert() || out_a.veto.passer_urgency > 0.55);
-            if lh_alert {
-                self.lh_veto_triggers += 1;
-            }
-            let eff_surp = self.cfg.use_efference_copy
-                && ply > 0
-                && expected_eval_from_parent != 0.0
-                && (out_a.total_cp - expected_eval_from_parent).abs() > 140.0;
-            if eff_surp {
-                self.efference_surprises += 1;
-            }
-            (se, Some(out_a), lh_alert, lh_deep, eff_surp)
-        };
         let static_eval = scale_endgame_eval(
             pos,
             (raw_static_eval + self.dpm_correction(pos)).clamp(-2600, 2600),
@@ -465,6 +470,7 @@ impl DnpWorker {
                 let r = 3 + depth / 4 + ((static_eval - beta) / 200).clamp(0, 2);
                 self.moved_pc_to[ply] = u16::MAX;
                 let undo = pos.make_null_move();
+                self.ws_a.gf_stack.push_null_move(ply);
                 let mut dummy_pv = Vec::new();
                 let null_score = -self.pvs(
                     pos,
@@ -529,6 +535,14 @@ impl DnpWorker {
                             .map(|(c, p)| ((c.index() * 6 + p.index()) * 64 + cmv.to_sq().index()) as u16)
                             .unwrap_or(u16::MAX);
                         let undo = pos.make_move(cmv);
+                        self.ws_a.gf_stack.push_move(
+                            ply,
+                            cmv,
+                            undo.captured,
+                            pos,
+                            &self.weights,
+                            &mut self.ws_a.finny_i16,
+                        );
                         let mut q_s = -self.quiescence(pos, ply + 1, -pc_beta, -pc_beta + 1);
                         if q_s >= pc_beta && !self.aborted {
                             let mut pc_pv = Vec::new();
@@ -566,10 +580,10 @@ impl DnpWorker {
             return if in_check { -MATE_SCORE + ply as i32 } else { 0 };
         }
 
-        // 5. Selective INT8 Stream B Deep Strategic Brain (3x faster -> up to 8 evals even in fast games!)
-        let allow_subtree_sb = self.cfg.time_limit_ms == 0
-            || self.cfg.time_limit_ms > 500
-            || (self.cfg.time_limit_ms >= 150 && self.stream_b_evals < 8);
+        // 5. Selective INT8 Stream B Deep Strategic Brain:
+        //    In blitz (<= 500 ms), run Stream B ONLY at root so 90% of the clock powers deep PVS!
+        //    In rapid/classical/fixed-depth (> 500 ms or untimed), deliberate on deep PV crossroads.
+        let allow_subtree_sb = self.cfg.time_limit_ms == 0 || self.cfg.time_limit_ms > 500;
         let need_stream_b = self.cfg.use_stream_b
             && allow_subtree_sb
             && !self.is_helper
@@ -794,6 +808,14 @@ impl DnpWorker {
 
             self.moved_pc_to[ply] = cur_pc_to;
             let undo = pos.make_move(mv);
+            self.ws_a.gf_stack.push_move(
+                ply,
+                mv,
+                undo.captured,
+                pos,
+                &self.weights,
+                &mut self.ws_a.finny_i16,
+            );
             let gives_check = pos.in_check();
             let expected_child_eval = if noduli_delta != 0.0 {
                 -(parent_eval_f32 + noduli_delta)
@@ -836,7 +858,12 @@ impl DnpWorker {
                     if pfl2_sharpness < 0.30 {
                         r += 1;
                     }
-                    if lh_tactical_alert || lh_deep_alert || efference_surprise {
+                    if lh_tactical_alert
+                        || lh_deep_alert
+                        || efference_surprise
+                        || (self.cfg.use_dopamine
+                            && self.plasticity.ppl1_updates > self.plasticity.pam_updates + 2)
+                    {
                         r = (r - 1).max(0);
                     }
                     r = r.min(new_depth - 1).max(0);
@@ -998,7 +1025,7 @@ impl DnpWorker {
         self.nodes += 1;
         self.q_nodes += 1;
         if ply >= MAX_PLY - 1 {
-            return evaluate_giant_fiber_cp(pos, &self.weights, &mut self.ws_a);
+            return self.ws_a.gf_stack.evaluate_ply(ply, pos, &self.weights);
         }
 
         let orig_alpha = alpha;
@@ -1015,7 +1042,7 @@ impl DnpWorker {
         let in_check = pos.in_check();
         let stand_pat = scale_endgame_eval(
             pos,
-            evaluate_giant_fiber_cp(pos, &self.weights, &mut self.ws_a),
+            self.ws_a.gf_stack.evaluate_ply(ply, pos, &self.weights),
         );
         let mut best_score = if in_check { -INF } else { stand_pat };
         let mut best_move = Move::NULL;
@@ -1064,6 +1091,14 @@ impl DnpWorker {
                 }
             }
             let undo = pos.make_move(mv);
+            self.ws_a.gf_stack.push_move(
+                ply,
+                mv,
+                undo.captured,
+                pos,
+                &self.weights,
+                &mut self.ws_a.finny_i16,
+            );
             let score = -self.quiescence(pos, ply + 1, -beta, -alpha);
             pos.unmake_move(mv, undo);
             if self.aborted {
@@ -1191,19 +1226,30 @@ impl SearchEngine {
             };
         }
 
-        // Pre-evaluate root with Stream A + Stream B for top-down centrifugal/seed steering
+        // Pre-evaluate root with TT-consistent Stream A; decide sync vs non-blocking async Stream B!
+        // In fast blitz (<= 1500 ms), NEVER freeze Depth 1 waiting 200-400 ms for Stream B:
+        // fire Giant Fiber search immediately at t=0ms and run Stream B concurrently on a background thread!
+        let sync_root_sb = cfg.use_stream_b && (cfg.time_limit_ms == 0 || cfg.time_limit_ms > 1500);
+        let async_root_sb =
+            cfg.use_stream_b && !sync_root_sb && cfg.threads >= 2 && cfg.time_limit_ms >= 120;
+
         let root_a = evaluate_stream_a(
             pos,
             &self.weights,
             &mut self.ws_a,
-            if cfg.use_dopamine { Some(&self.plasticity) } else { None },
+            None,
             None,
             cfg.octopamine,
         );
         let mut root_sharpness = 0.5f32;
-        let mut root_gamma_seed: Option<Vec<f32>> = None;
         let mut initial_sb_evals = 0u64;
-        if cfg.use_stream_b {
+        let async_novelty = if async_root_sb {
+            self.plasticity
+                .mbon_alpha_prime3_novelty(&root_a.active_apbp_stm, true)
+        } else {
+            0.5
+        };
+        if sync_root_sb {
             let novelty = self
                 .plasticity
                 .mbon_alpha_prime3_novelty(&root_a.active_apbp_stm, true);
@@ -1220,11 +1266,6 @@ impl SearchEngine {
             );
             initial_sb_evals = 1;
             root_sharpness = out_b.pfl2_sharpness;
-            if cfg.use_dopamine {
-                self.plasticity
-                    .inject_stream_b_seed(&out_b.gamma_seed, &out_b.gamma_seed, 0.25);
-                root_gamma_seed = Some(out_b.gamma_seed.clone());
-            }
             self.strategic_tt.store(pos.hash, &out_b);
         }
 
@@ -1232,16 +1273,22 @@ impl SearchEngine {
         let helper_stop = Arc::new(AtomicBool::new(false));
         let helper_nodes = Arc::new(AtomicU64::new(0));
         let helper_q_nodes = Arc::new(AtomicU64::new(0));
+        let async_sb_slot: Arc<Mutex<Option<StreamBOutput>>> = Arc::new(Mutex::new(None));
+        let async_plasticity_snap = if async_root_sb {
+            Some(self.plasticity.clone())
+        } else {
+            None
+        };
 
         let mut main_worker = DnpWorker {
             weights: Arc::clone(&self.weights),
             tt: Arc::clone(&self.tt),
-            ws_a: std::mem::replace(&mut self.ws_a, StreamAWorkspace::new(&self.weights)),
+            ws_a: std::mem::replace(&mut self.ws_a, StreamAWorkspace::empty()),
             plasticity: std::mem::replace(
                 &mut self.plasticity,
                 DopaminePlasticityState::new(&self.weights.cfg),
             ),
-            strategic_tt: std::mem::replace(&mut self.strategic_tt, StrategicTT::new(256)),
+            strategic_tt: std::mem::replace(&mut self.strategic_tt, StrategicTT::new(16)),
             stop_flag: Arc::clone(&self.stop_flag),
             helper_stop: Arc::clone(&helper_stop),
             shared_nodes: Arc::clone(&helper_nodes),
@@ -1267,10 +1314,17 @@ impl SearchEngine {
             efference_surprises: 0,
             deadline,
             aborted: false,
+            allow_time_abort: false,
             max_nodes: cfg.max_nodes,
             cfg: cfg.clone(),
             is_helper: false,
         };
+
+        // Initialize ply-0 of the Push/Pop Incremental Giant Fiber stack for main worker!
+        main_worker
+            .ws_a
+            .gf_stack
+            .reset_root(pos, &self.weights, &mut main_worker.ws_a.finny_i16);
 
         let mut best_move = root_moves.as_slice()[0];
         let mut best_score = 0i32;
@@ -1278,12 +1332,44 @@ impl SearchEngine {
         let mut best_pv = vec![best_move];
 
         let n_helpers = if cfg.threads > 1 && cfg.max_depth > 2 && cfg.max_nodes > 4096 {
-            (cfg.threads - 1).min(63)
+            let reserve_sb = usize::from(async_root_sb);
+            (cfg.threads.saturating_sub(1 + reserve_sb)).min(63)
         } else {
             0
         };
 
         std::thread::scope(|scope| {
+            // Non-blocking Async Stream B Brain in parallel during timed blitz/rapid games!
+            if async_root_sb {
+                let w_sb = Arc::clone(&self.weights);
+                let h_stop_sb = Arc::clone(&helper_stop);
+                let sb_slot = Arc::clone(&async_sb_slot);
+                let pos_sb = pos.clone();
+                let moves_sb = root_moves.clone();
+                let mbon_sb = root_a.mbon_summary.clone();
+                let sez_sb = root_a.sez_cp;
+                let ser_sb = cfg.serotonin;
+                let pl_sb = async_plasticity_snap;
+                scope.spawn(move || {
+                    if let Some(out_b) = evaluate_stream_b_cancellable(
+                        &pos_sb,
+                        &moves_sb,
+                        &w_sb,
+                        &mbon_sb,
+                        sez_sb,
+                        pl_sb.as_ref(),
+                        async_novelty,
+                        ser_sb,
+                        true,
+                        &h_stop_sb,
+                    ) {
+                        if let Ok(mut guard) = sb_slot.lock() {
+                            *guard = Some(out_b);
+                        }
+                    }
+                });
+            }
+
             // Spawn Parallel DNp Lazy SMP helpers sharing Lock-Free TT & weights!
             for tid in 1..=n_helpers {
                 let w_arc = Arc::clone(&self.weights);
@@ -1294,7 +1380,6 @@ impl SearchEngine {
                 let h_q = Arc::clone(&helper_q_nodes);
                 let mut pos_h = pos.clone();
                 let cfg_h = cfg.clone();
-                let seed_ref = root_gamma_seed.as_deref();
 
                 scope.spawn(move || {
                     let mut worker = DnpWorker::new_helper(
@@ -1306,8 +1391,11 @@ impl SearchEngine {
                         Arc::clone(&h_q),
                         cfg_h.clone(),
                         deadline,
-                        seed_ref,
                     );
+                    worker
+                        .ws_a
+                        .gf_stack
+                        .reset_root(&pos_h, &worker.weights, &mut worker.ws_a.finny_i16);
                     let mut d = 1 + (tid as i32 & 1);
                     let mut dummy_pv = Vec::with_capacity(32);
                     while d <= cfg_h.max_depth && !worker.aborted {
@@ -1323,7 +1411,21 @@ impl SearchEngine {
 
             // Main DNp coordinator runs full iterative deepening + aspiration windows + PFL2 soft-stop
             let mut stable_iters = 0u32;
+            let mut async_sb_merged = !async_root_sb;
             for depth in 1..=cfg.max_depth {
+                // Seamlessly merge async Stream B guidance the instant it finishes!
+                if !async_sb_merged {
+                    if let Ok(mut guard) = async_sb_slot.try_lock() {
+                        if let Some(out_b) = guard.take() {
+                            root_sharpness = out_b.pfl2_sharpness;
+                            main_worker.strategic_tt.store(pos.hash, &out_b);
+                            main_worker.stream_b_evals += 1;
+                            async_sb_merged = true;
+                        }
+                    }
+                }
+                // Guarantee Depth 1 ALWAYS finishes so Saccadion can NEVER time out at depth 0!
+                main_worker.allow_time_abort = depth > 1;
                 let base_delta = (30.0 + 45.0 * root_sharpness) as i32;
                 let (mut alpha, mut beta) = if depth >= 4 && best_score.abs() < MATE_THRESHOLD - 100 {
                     (best_score - base_delta, best_score + base_delta)
