@@ -208,12 +208,15 @@ def forward_stream_a(
     qat: bool = False,
     dropout_key: Any | None = None,
     kc_drop_rate: float = 0.0,
+    sparse_drop_rate: float = 0.0,
+    gf_drop_rate: float = 0.0,
 ) -> Dict[str, jnp.ndarray]:
     """Batched Stream A forward pass on TPU matching `crates/saccadion-nn/src/stream_a.rs`."""
     ab_dim, gamma_dim, _ = cfg.lobe_dims_per_hemi()
     half_mbon = cfg.mbon_dim // 2
 
     # 1. Isolated Bilateral Feature Accumulation + SEZ Innate Survival Valence (padded -1 masked out)
+    # Optional Sparse HalfKA Feature Dropout during training ONLY prevents 13.9M-param table memorization!
     ft_w = ste_quantize(params["a_ft_weight"], bits=16, enabled=qat)
     ft_pad = jnp.concatenate([ft_w, jnp.zeros((1, cfg.acc_dim), dtype=ft_w.dtype)], axis=0)
     sez_w = params["a_sez_weight"]
@@ -221,8 +224,25 @@ def forward_stream_a(
     pad_idx = cfg.sparse_input_dim
     idx_s = jnp.where(sparse_stm >= 0, sparse_stm, pad_idx)
     idx_o = jnp.where(sparse_opp >= 0, sparse_opp, pad_idx)
-    acc_stm = jnp.sum(ft_pad[idx_s], axis=1) + params["a_ft_bias"]
-    acc_opp = jnp.sum(ft_pad[idx_o], axis=1) + params["a_ft_bias"]
+
+    k_kc = dropout_key
+    if dropout_key is not None and (sparse_drop_rate > 0.0 or gf_drop_rate > 0.0):
+        k_sp1, k_sp2, k_gf, k_kc = jax.random.split(dropout_key, 4)
+        if sparse_drop_rate > 0.0:
+            keep_sp = 1.0 - sparse_drop_rate
+            ms = jax.random.uniform(k_sp1, idx_s.shape) < keep_sp
+            mo = jax.random.uniform(k_sp2, idx_o.shape) < keep_sp
+            idx_s_ft = jnp.where(ms, idx_s, pad_idx)
+            idx_o_ft = jnp.where(mo, idx_o, pad_idx)
+            sp_scale = 1.0 / keep_sp
+        else:
+            idx_s_ft, idx_o_ft, sp_scale = idx_s, idx_o, 1.0
+    else:
+        k_gf = None
+        idx_s_ft, idx_o_ft, sp_scale = idx_s, idx_o, 1.0
+
+    acc_stm = jnp.sum(ft_pad[idx_s_ft], axis=1) * sp_scale + params["a_ft_bias"]
+    acc_opp = jnp.sum(ft_pad[idx_o_ft], axis=1) * sp_scale + params["a_ft_bias"]
 
     bsz = sparse_stm.shape[0]
     row_arange = jnp.arange(bsz)
@@ -230,14 +250,16 @@ def forward_stream_a(
     sez_opp = jnp.sum(sez_pad[idx_o], axis=1)[row_arange, phase_bucket]
     sez_cp = (sez_stm - sez_opp) * 50.0
 
-    # 1b. Saccadion-7 Dedicated Dendritic Coincidence Giant Fiber (GF / DNp01):
+    # 1b. Saccadion-7/8 Dedicated Dendritic Coincidence Giant Fiber (GF / DNp01):
     #     Pure HalfKA-only (< HALFKA_DIM) frozen alpha/beta lobe -> Pairwise Coincidence CReLU -> 8 stacks!
     #     Matches Rust AVX2 INT16 `evaluate_giant_fiber_cp` 100% identically (< 250ns/node on CPU!).
     idx_s_hk = jnp.where((sparse_stm >= 0) & (sparse_stm < HALFKA_DIM), sparse_stm, pad_idx)
     idx_o_hk = jnp.where((sparse_opp >= 0) & (sparse_opp < HALFKA_DIM), sparse_opp, pad_idx)
+    idx_s_hk_ft = jnp.where((idx_s_ft >= 0) & (idx_s_ft < HALFKA_DIM), idx_s_ft, pad_idx)
+    idx_o_hk_ft = jnp.where((idx_o_ft >= 0) & (idx_o_ft < HALFKA_DIM), idx_o_ft, pad_idx)
     ft_ab = ft_pad[:, :ab_dim]
-    gf_acc_s = jnp.sum(ft_ab[idx_s_hk], axis=1) + params["a_ft_bias"][:ab_dim]
-    gf_acc_o = jnp.sum(ft_ab[idx_o_hk], axis=1) + params["a_ft_bias"][:ab_dim]
+    gf_acc_s = jnp.sum(ft_ab[idx_s_hk_ft], axis=1) * sp_scale + params["a_ft_bias"][:ab_dim]
+    gf_acc_o = jnp.sum(ft_ab[idx_o_hk_ft], axis=1) * sp_scale + params["a_ft_bias"][:ab_dim]
     gf_sez_s = jnp.sum(sez_pad[idx_s_hk], axis=1)[row_arange, phase_bucket]
     gf_sez_o = jnp.sum(sez_pad[idx_o_hk], axis=1)[row_arange, phase_bucket]
     gf_sez_cp = (gf_sez_s - gf_sez_o) * 50.0
@@ -245,6 +267,10 @@ def forward_stream_a(
     cs = jnp.clip(gf_acc_s, 0.0, 1.0)
     co = jnp.clip(gf_acc_o, 0.0, 1.0)
     gf_feat = jnp.concatenate([cs[:, :half_ab] * cs[:, half_ab:], co[:, :half_ab] * co[:, half_ab:]], axis=-1)
+    if k_gf is not None and gf_drop_rate > 0.0:
+        keep_gf = 1.0 - gf_drop_rate
+        gf_mask = (jax.random.uniform(k_gf, gf_feat.shape) < keep_gf).astype(jnp.float32) / keep_gf
+        gf_feat = gf_feat * gf_mask
     if "a_gf_w" in params:
         gf_w = params["a_gf_w"][phase_bucket]  # [B, ab_dim]
         gf_b = params["a_gf_b"][phase_bucket]  # [B]
@@ -279,8 +305,8 @@ def forward_stream_a(
     active_kc_ratio = 0.5 * (jnp.mean((kc_stm > 0.0).astype(jnp.float32)) + jnp.mean((kc_opp > 0.0).astype(jnp.float32)))
 
     # Optional structured KC dropout during training only (prevents table memorization!)
-    if dropout_key is not None and kc_drop_rate > 0.0:
-        k1, k2 = jax.random.split(dropout_key)
+    if k_kc is not None and kc_drop_rate > 0.0:
+        k1, k2 = jax.random.split(k_kc)
         keep = 1.0 - kc_drop_rate
         m1 = (jax.random.uniform(k1, kc_stm.shape) < keep).astype(jnp.float32) / keep
         m2 = (jax.random.uniform(k2, kc_opp.shape) < keep).astype(jnp.float32) / keep
@@ -387,6 +413,7 @@ def forward_stream_b(
     serotonin: float = 1.0,
     qat: bool = False,
     causal_drop_key: Any | None = None,
+    drop_rate: float = 0.0,
 ) -> Dict[str, Any]:
     """Batched Stream B Deep Strategic Brain matching `crates/saccadion-nn/src/stream_b.rs`."""
     bsz = board_feats.shape[0]
@@ -395,6 +422,16 @@ def forward_stream_b(
     sectors = cfg.cx_sectors
     cx_d = cfg.cx_dim
     inv_sqrt_d = float(1.0 / (d ** 0.5))
+
+    _dr_key = causal_drop_key
+    def _apply_drop(x: jnp.ndarray, rate: float) -> jnp.ndarray:
+        nonlocal _dr_key
+        if _dr_key is None or rate <= 0.0:
+            return x
+        _dr_key, sub = jax.random.split(_dr_key)
+        keep = 1.0 - rate
+        m = (jax.random.uniform(sub, x.shape) < keep).astype(x.dtype) / keep
+        return x * m
 
     # B1. T4/T5 Shunting Inhibition Optic Encoder (computed safely in float32)
     w_exc = ste_quantize(params["b_shunt_exc"], 8, qat)
@@ -437,7 +474,7 @@ def forward_stream_b(
         agg = jnp.einsum("bkuv,bud->bkvd", adj_norm, x_g, preferred_element_type=jnp.bfloat16)
         k_use = agg.shape[1]
         proj = jnp.einsum("bkvd,ked->bkve", agg, w_gnn[:k_use], preferred_element_type=jnp.float32)
-        return cur_sq + jax.nn.silu(_combine_6ch(proj))
+        return cur_sq + _apply_drop(jax.nn.silu(_combine_6ch(proj)), drop_rate)
 
     def apply_retrograde_gnn_hop(cur_sq: jnp.ndarray, goal_sq: jnp.ndarray) -> jnp.ndarray:
         if adj_t_norm is None:
@@ -447,7 +484,7 @@ def forward_stream_b(
         agg_b = jnp.einsum("bkuv,bvd->bkud", adj_t_norm, x_r, preferred_element_type=jnp.bfloat16)
         k_use = agg_b.shape[1]
         proj = jnp.einsum("bkud,ked->bkue", agg_b, w_retro[:k_use], preferred_element_type=jnp.float32)
-        return cur_sq + jax.nn.silu(_combine_6ch(proj))
+        return cur_sq + _apply_drop(jax.nn.silu(_combine_6ch(proj)), drop_rate)
 
     # Hop 1: immediate 1-hop attack/defense/X-ray synaptic propagation right after T4/T5 Shunting
     sq_state = apply_flywire_gnn_hop(sq_state)
@@ -511,7 +548,7 @@ def forward_stream_b(
         l_attn = jax.nn.softmax(l_scores, axis=-1)
         lob_focus = jnp.mean(jnp.max(l_attn, axis=-1))
         l_ctx = jnp.einsum("bhuv,bvhd->buhd", l_attn.astype(jnp.bfloat16), lv, preferred_element_type=jnp.bfloat16).reshape((bsz, 64, d))
-        sq_state = sq_state + jnp.einsum("bse,de->bsd", l_ctx, wo_l, preferred_element_type=jnp.float32)
+        sq_state = sq_state + _apply_drop(jnp.einsum("bse,de->bsd", l_ctx, wo_l, preferred_element_type=jnp.float32), drop_rate)
 
         x2_bf = layer_norm(sq_state, params["b_opt_ln2_g"][l_idx], params["b_opt_ln2_b"][l_idx]).astype(jnp.bfloat16)
         wfg_l = ste_quantize(params["b_opt_fg"][l_idx], 8, qat).astype(jnp.bfloat16)
@@ -519,7 +556,7 @@ def forward_stream_b(
         wfd_l = ste_quantize(params["b_opt_fd"][l_idx], 8, qat).astype(jnp.bfloat16)
         fg = jax.nn.silu(jnp.einsum("bsd,fd->bsf", x2_bf, wfg_l, preferred_element_type=jnp.float32)).astype(jnp.bfloat16)
         fu = jnp.einsum("bsd,fd->bsf", x2_bf, wfu_l, preferred_element_type=jnp.bfloat16)
-        sq_state = sq_state + jnp.einsum("bsf,df->bsd", fg * fu, wfd_l, preferred_element_type=jnp.float32)
+        sq_state = sq_state + _apply_drop(jnp.einsum("bsf,df->bsd", fg * fu, wfd_l, preferred_element_type=jnp.float32), drop_rate)
         # Alternating Bi-Directional Retrograde Fischer-Graph Hops:
         # L0 -> Forward 2-hop (A), L1 -> FC2 Goal Saliency + Retrograde Hop 1 (A^T), L2 -> Retrograde Hop 2 (A^T)
         if l_idx == 0:
@@ -613,9 +650,10 @@ def forward_stream_b(
     eff_goal = committed_goal + 0.5 * conj_steer
 
     # PFL3 99% Contralateral Bilinear Policy Logits [B, 64, 64] -> flattened [B, 4096]
-    q_sq = jnp.einsum("bsd,cd->bsc", sq_state, params["b_pfl3_q"])
-    k_sq = jnp.einsum("bsd,cd->bsc", sq_state, params["b_pfl3_k"])
-    o_sq = jnp.einsum("bsd,cd->bsc", sq_state, params["b_pfl3_opp"])
+    sq_pol = _apply_drop(sq_state, drop_rate)
+    q_sq = jnp.einsum("bsd,cd->bsc", sq_pol, params["b_pfl3_q"])
+    k_sq = jnp.einsum("bsd,cd->bsc", sq_pol, params["b_pfl3_k"])
+    o_sq = jnp.einsum("bsd,cd->bsc", sq_pol, params["b_pfl3_opp"])
     aligned_q = q_sq * (1.0 + eff_goal[:, None, :])
     contra_k = k_sq - 0.99 * o_sq
     inv_sqrt_cx = float(1.0 / (cx_d ** 0.5))

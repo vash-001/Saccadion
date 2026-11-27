@@ -30,6 +30,7 @@ import json
 import math
 import pickle
 import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -122,14 +123,14 @@ def build_muon_adamw_optimizer(
         peak_value=lr_muon_peak,
         warmup_steps=warmup_steps,
         decay_steps=decay_steps,
-        end_value=lr_muon_peak * 0.05,
+        end_value=lr_muon_peak * 0.01,
     )
     sched_adamw = optax.warmup_cosine_decay_schedule(
         init_value=lr_adamw_peak * 0.05,
         peak_value=lr_adamw_peak,
         warmup_steps=warmup_steps,
         decay_steps=decay_steps,
-        end_value=lr_adamw_peak * 0.05,
+        end_value=lr_adamw_peak * 0.01,
     )
 
     sched_sez = optax.warmup_cosine_decay_schedule(
@@ -137,7 +138,7 @@ def build_muon_adamw_optimizer(
         peak_value=lr_adamw_peak * 0.25,
         warmup_steps=warmup_steps,
         decay_steps=decay_steps,
-        end_value=lr_adamw_peak * 0.02,
+        end_value=lr_adamw_peak * 0.01,
     )
 
     labels = {}
@@ -154,7 +155,7 @@ def build_muon_adamw_optimizer(
     if hasattr(optax, "contrib") and hasattr(optax.contrib, "muon"):
         muon_tx = optax.chain(
             optax.contrib.muon(learning_rate=sched_muon, beta=0.95),
-            _signed_decoupled_weight_decay(sched_muon, weight_decay=0.008),
+            _signed_decoupled_weight_decay(sched_muon, weight_decay=0.025),
         )
     else:
         def init_fn(p):
@@ -172,14 +173,14 @@ def build_muon_adamw_optimizer(
 
         muon_tx = optax.chain(
             optax.GradientTransformation(init_fn, update_fn),
-            _signed_decoupled_weight_decay(sched_muon, weight_decay=0.008),
+            _signed_decoupled_weight_decay(sched_muon, weight_decay=0.025),
         )
 
-    # Stronger decoupled weight decay (1.5e-2) on `a_ft_weight` stops sparse-table memorization
-    # on compact datasets while SEZ refines neural PSQTs gently around Queen=900!
-    adamw_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=5.0e-3)
-    sparse_ft_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=1.5e-2)
-    sez_tx = optax.adamw(learning_rate=sched_sez, weight_decay=1.0e-4)
+    # Strong anti-overfit decoupled weight decay: prevents 13.9M HalfKA table & 4.5M Stream B
+    # from memorizing static games and drives Val GF Quiet MAE down cleanly!
+    adamw_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=1.5e-2)
+    sparse_ft_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=4.5e-2)
+    sez_tx = optax.adamw(learning_rate=sched_sez, weight_decay=2.0e-4)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.multi_transform(
@@ -653,19 +654,19 @@ def train_saccadion_smart(
                 cur_p, cfg, claws_idx,
                 batch_f["sparse_stm"], batch_f["sparse_opp"],
                 batch_f["lh_feat"], batch_f["phase_bucket"],
-                qat=qat, dropout_key=k1, kc_drop_rate=0.08,
+                qat=qat, dropout_key=k1, kc_drop_rate=0.12, sparse_drop_rate=0.08, gf_drop_rate=0.22,
             )
             out_b = forward_stream_b(
                 cur_p, cfg, batch_f["board_feats"], out_a["mbon_summary"],
                 num_ticks=num_ticks, sez_cp=out_a["sez_cp"],
                 graph_adj_u32=batch_f.get("graph_adj"),
-                qat=qat, causal_drop_key=k3,
+                qat=qat, causal_drop_key=k3, drop_rate=0.12,
             )
             out_a_steered = forward_stream_a(
                 cur_p, cfg, claws_idx,
                 batch_f["sparse_stm"], batch_f["sparse_opp"],
                 batch_f["lh_feat"], batch_f["phase_bucket"],
-                cent_mask=out_b["cent_kc_mask"], qat=qat, dropout_key=k2, kc_drop_rate=0.08,
+                cent_mask=out_b["cent_kc_mask"], qat=qat, dropout_key=k2, kc_drop_rate=0.12, sparse_drop_rate=0.08, gf_drop_rate=0.22,
             )
             return compute_multitask_loss(
                 out_a_steered, out_b, batch_f, apl_target_active=apl_target, apl_weight=apl_w, params=cur_p, out_a_unmasked=out_a
@@ -972,6 +973,51 @@ def train_saccadion_smart(
 
             # Unwrap single-host copy for clean held-out Validation (BOTH Live & Polyak EMA!)
             replay_batches_run = 0
+            # Live Zero-Teacher dFB Self-Discovery Burst (starting Epoch 5, every 2 epochs):
+            # Generates brand-new self-played quiet positions using Saccadion's OWN best weights
+            # so the model breaks past static-dataset memorization and discovers original tactics!
+            best_saccnet_path = export_dir / "saccadion_best.saccnet"
+            rust_uci_bin = arena._find_rust_uci() if arena is not None else None
+            if epoch >= 5 and (epoch % 2 == 1) and best_saccnet_path.exists() and rust_uci_bin is not None:
+                sp_out = fast_cache_dir / f"dfb_selfplay_ep{epoch}.sacc"
+                try:
+                    sp_res = subprocess.run(
+                        [str(rust_uci_bin), "selfplay", str(best_saccnet_path), str(sp_out), "48", "5"],
+                        capture_output=True,
+                        text=True,
+                        timeout=75,
+                        check=False,
+                    )
+                    if sp_res.returncode == 0 and sp_out.exists() and sp_out.stat().st_size > 16 + 128 * eff_bsz:
+                        sp_ds = SaccShardDataset([sp_out], cache_dir=None, split_name=f"sp_ep{epoch}")
+                        if len(sp_ds) >= eff_bsz:
+                            sp_scales = jax.tree_util.tree_map(lambda s: s * jnp.float32(0.35), grad_scales)
+                            for sp_b in sp_ds.iter_batches(eff_bsz, seed=epoch * 313, mirror_prob=0.5):
+                                if train_ds._cached and getattr(train_ds, "_bd_is_i8", False):
+                                    sp_b["board_feats"] = np.clip(
+                                        np.rint(sp_b["board_feats"] * 127.0), -127, 127
+                                    ).astype(np.int8)
+                                jax_rng, sp_key = jax.random.split(jax_rng)
+                                if use_pmap:
+                                    b_sp = _shard_batch_for_pmap(sp_b, n_dev)
+                                    params_dev, ema_dev, opt_dev, _ = train_fn(
+                                        params_dev, ema_dev, opt_dev, b_sp, apl_target, apl_weight, jax.random.split(sp_key, n_dev), sp_scales
+                                    )
+                                else:
+                                    b_sp = {k: jnp.asarray(v) for k, v in sp_b.items()}
+                                    params_dev, ema_dev, opt_dev, _ = train_fn(
+                                        params_dev, ema_dev, opt_dev, b_sp, apl_target, apl_weight, sp_key, sp_scales
+                                    )
+                                replay_batches_run += 1
+                                if replay_batches_run >= 12:
+                                    break
+                            print(f"  [dFB Self-Discovery] Trained {replay_batches_run} zero-teacher batches from {len(sp_ds):,} fresh Saccadion positions!", flush=True)
+                except Exception:
+                    pass
+                finally:
+                    if sp_out.exists():
+                        sp_out.unlink(missing_ok=True)
+
             host_params = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
             host_ema = jax.tree_util.tree_map(lambda x: x[0], ema_dev) if use_pmap else ema_dev
             host_opt = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev

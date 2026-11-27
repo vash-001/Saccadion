@@ -30,12 +30,12 @@ from pathlib import Path
 REPO_URL = "https://github.com/vash-001/Saccadion.git"
 MODEL_TIER = "pro"           # "tiny" (smoke test) | "nano" (fast ablation) | "pro" (full 58MB)
 DATA_SOURCE = "auto"         # "auto" (75% Fishtest + 25% Lichess 2000+ [%eval] + Diverse Puzzles + Survival)
-MAX_GAMES = 14000            # Compact high-concept dataset (~1.5M pos + 45k Causal Puzzles + 100k Blunder/Looming — ZERO 15M bloat!)
+MAX_GAMES = 20000            # Compact diverse dataset (~2.0M pos + 45k Causal Puzzles + 100k Blunder/Looming — 100% RAM-hot!)
 MAX_CAUSAL_PUZZLES = 45000   # Balanced across ALL 16 diverse causal/tactical/endgame concepts!
-EPOCHS = 20                  # Saccadion-8 Retrograde Fischer-Graph (6ch X-Ray + Backward A^T + 2-Ply Minimax WM + INT8)
+EPOCHS = 15                  # Crisp anti-overfit schedule + live Zero-Teacher dFB Self-Discovery from Ep 5+!
 BATCH_SIZE = 512             # Optimal for PRO on TPU v5e-1
-LR_MUON = 3.5e-3             # Calibrated Muon peak LR
-LR_ADAMW = 5.0e-4            # Calibrated AdamW peak LR
+LR_MUON = 3.0e-3             # Calibrated Muon peak LR with 0.025 weight decay
+LR_ADAMW = 4.5e-4            # Calibrated AdamW peak LR with 0.045 HalfKA weight decay
 BUILD_RUST_TOOLS = True      # Builds Pure-Rust pre-decoder + UCI engine once & caches on Drive!
 ENABLE_CPU_ARENA = True      # Background Stockfish sparring on idle CPU cores -> REAL ELO!
 LIVE_HUD_HZ = 2.0            # Silky 2 Hz Zorynto Hakuji x Akane cockpit (zero Colab WebSocket lag!)
@@ -145,7 +145,7 @@ def main() -> None:
     print("JAX version:", jax.__version__, "| Devices:", jax.devices())
 
     # 6. Download & organize compact diverse chess dataset (NO 15M Stockfish bloat — concept-rich + puzzles + contrastive!)
-    data_dir = persist_root / "data_v8_retro"
+    data_dir = persist_root / "data_v8_1_retro"
     shard_dir = data_dir / "shards"
     if not list(shard_dir.glob("train_random_*.sacc")):
         shard_dir = fetch_and_prepare(
@@ -174,8 +174,8 @@ def main() -> None:
         "pro": SaccadionConfig.pro,
     }[MODEL_TIER]()
 
-    ckpt_dir = persist_root / f"checkpoints_{MODEL_TIER}_v8_retro"
-    export_dir = persist_root / f"exports_{MODEL_TIER}_v8_retro"
+    ckpt_dir = persist_root / f"checkpoints_{MODEL_TIER}_v8_1_retro"
+    export_dir = persist_root / f"exports_{MODEL_TIER}_v8_1_retro"
     fast_cache = Path("/content/sacc_cache") if in_colab else (data_dir / "cache")
 
     _, history = train_saccadion_smart(

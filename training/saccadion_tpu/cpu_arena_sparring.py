@@ -256,14 +256,15 @@ def discover_and_install_multi_engines() -> Tuple[List[EngineSpec], Optional[Pat
             ["gnuchess", "/usr/games/gnuchess", "/usr/bin/gnuchess"],
             ["--uci"],
             {},
-            [("GNUChess-d3", 1650, 3), ("GNUChess-d4", 1950, 4), ("GNUChess-Full", 2300, None)],
+            # GNUChess 6.2 ignores `depth` when paired with `movetime` -> only use calibrated Full tier!
+            [("GNUChess-Full", 2550, None)],
         ),
         (
             "Fruit",
             ["fruit", "/usr/games/fruit", "/usr/bin/fruit"],
             [],
             {"Hash": "16"},
-            [("Fruit-d3", 1700, 3), ("Fruit-d4", 2000, 4), ("Fruit-d5", 2300, 5), ("Fruit-2.1", 2680, None)],
+            [("Fruit-d3", 1700, 3), ("Fruit-d4", 2050, 4), ("Fruit-d5", 2320, 5), ("Fruit-2.1", 2680, None)],
         ),
         (
             "Glaurung",
@@ -398,7 +399,8 @@ class _UciProcess:
     def go(self, fen: str, movetime_ms: int = 80, depth: Optional[int] = None) -> Tuple[Optional[str], Optional[int]]:
         self._send(f"position fen {fen}")
         if depth is not None:
-            self._send(f"go depth {depth} movetime {max(movetime_ms, 150)}")
+            # Pure `go depth D` (NEVER append movetime — some UCI engines ignore depth if movetime is present!)
+            self._send(f"go depth {depth}")
         else:
             self._send(f"go movetime {movetime_ms}")
         lines = self._read_until("bestmove", timeout_s=max(5.0, movetime_ms / 1000.0 + 4.0))
@@ -573,6 +575,7 @@ class StockfishSparringArena:
         for cand in [
             repo_root / "target" / "release" / "saccadion",
             repo_root / "target" / "release" / "saccadion.exe",
+            Path("/content/drive/MyDrive/Saccadion_TPU/bin_v14/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v13/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v12/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v11/saccadion"),
@@ -768,12 +771,12 @@ class StockfishSparringArena:
                     )
                     sacc_proc.set_option("WeightsPath", str(self.weights_path))
                     last_mtime = mtime
-                    # Trim stale older-epoch Elo history when newer best weights arrive
+                    # Trim stale older-epoch Elo history aggressively when newer best weights arrive
                     with self._lock:
                         if mtime > self._latest_weights_mtime:
                             self._latest_weights_mtime = mtime
-                            if len(self._results) > 16:
-                                self._results = self._results[-16:]
+                            if len(self._results) > 8:
+                                self._results = self._results[-8:]
 
                 spec = self._pick_opponent(worker_id, local_game, rng)
                 opp_proc: Optional[_UciProcess] = None
@@ -870,7 +873,7 @@ class StockfishSparringArena:
                     self._game_counter += 1
                     gnum = self._game_counter
                     self._results.append((spec.elo, score))
-                    real_elo, elo_ci = estimate_mle_elo(self._results[-60:])
+                    real_elo, elo_ci = estimate_mle_elo(self._results[-48:])
                     self._status.games_played += 1
                     if score == 1.0:
                         self._status.wins += 1
