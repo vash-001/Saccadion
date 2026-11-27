@@ -127,8 +127,8 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
     let mut sp_opp = vec![-1i16; n * MAX_SPARSE_CACHE];
     // FastCache v7: compact INT8 [-127, 127] board_feats cuts disk/RAM/PCIe by 2x (fits 100% hot in RAM!)
     let mut board_i8 = vec![0i8; n * 64 * STREAM_B_SQ_FEAT_DIM];
-    // Bit-packed 4-channel FlyWire Chess-Graph adjacency: [n, 4, 64, 2] u32 (lo/hi 32 bits of u64)
-    let mut graph_adj_u32 = vec![0u32; n * 4 * 64 * 2];
+    // Bit-packed 6-channel FlyWire X-Ray Chess-Graph adjacency: [n, 6, 64, 2] u32 (lo/hi 32 bits of u64)
+    let mut graph_adj_u32 = vec![0u32; n * 6 * 64 * 2];
     let mut lh_feat = vec![0.0f32; n * LATERAL_HORN_DIM];
     let mut phase = vec![0u8; n];
     let mut wdl = vec![0.0f32; n * 3];
@@ -172,7 +172,7 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
             rem_sp_o = rest;
             let (c_bd, rest) = rem_bd.split_at_mut(len * 64 * STREAM_B_SQ_FEAT_DIM);
             rem_bd = rest;
-            let (c_gadj, rest) = rem_gadj.split_at_mut(len * 4 * 64 * 2);
+            let (c_gadj, rest) = rem_gadj.split_at_mut(len * 6 * 64 * 2);
             rem_gadj = rest;
             let (c_lh, rest) = rem_lh.split_at_mut(len * LATERAL_HORN_DIM);
             rem_lh = rest;
@@ -219,8 +219,8 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
                     }
 
                     let gadj = extract_chess_graph_adj(&pos);
-                    let dst_g = &mut c_gadj[i * 512..(i + 1) * 512];
-                    for k in 0..4 {
+                    let dst_g = &mut c_gadj[i * 768..(i + 1) * 768];
+                    for k in 0..6 {
                         for u in 0..64 {
                             let bits = gadj[k][u];
                             let off = (k * 64 + u) * 2;
@@ -279,7 +279,7 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
     write_raw_slice(&out_cache_dir.join("contrast.u32"), &all_contrast).expect("write contrast");
 
     let meta_json = format!(
-        "{{\"count\": {}, \"max_sparse\": {}, \"version\": 7, \"num_shards\": {}}}",
+        "{{\"count\": {}, \"max_sparse\": {}, \"version\": 8, \"num_shards\": {}}}",
         n,
         MAX_SPARSE_CACHE,
         shard_paths.len()

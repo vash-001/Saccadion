@@ -130,12 +130,41 @@ def _attack_map(colors: np.ndarray, pieces: np.ndarray, side: int) -> int:
     return mask
 
 
-def extract_chess_graph_adj_py(colors: np.ndarray, pieces: np.ndarray, stm: int) -> np.ndarray:
-    """Exact 4-channel STM-oriented FlyWire Chess-Graph Adjacency [4, 64, 2] uint32 (lo/hi).
+def _piece_xray_attacks_from(colors: np.ndarray, p: int, sq: int) -> int:
+    """Exact 64-bit X-Ray Through-Blocker bitmask for sliders (Bishop=2, Rook=3, Queen=4).
+    Matches Rust `slider_attacks(sq, all_occ & !first_atks) & !first_atks` bit-for-bit!"""
+    if p not in (2, 3, 4):
+        return 0
+    mask = 0
+    f0, r0 = sq & 7, sq >> 3
+    dirs = (
+        SLIDING_DIRS[1::2]
+        if p == 2
+        else (SLIDING_DIRS[0::2] if p == 3 else SLIDING_DIRS)
+    )
+    for df, dr in dirs:
+        f, r = f0 + df, r0 + dr
+        blockers = 0
+        while 0 <= f < 8 and 0 <= r < 8:
+            tsq = r * 8 + f
+            if blockers == 1:
+                mask |= 1 << tsq
+            if colors[tsq] != -1:
+                blockers += 1
+                if blockers >= 2:
+                    break
+            f += df
+            r += dr
+    return mask
 
+
+def extract_chess_graph_adj_py(colors: np.ndarray, pieces: np.ndarray, stm: int) -> np.ndarray:
+    """Exact 6-channel STM-oriented FlyWire X-Ray Chess-Graph Adjacency [6, 64, 2] uint32 (lo/hi).
+
+    Channels: 0=STM Atk, 1=STM Def, 2=Opp Atk, 3=Opp Def, 4=STM X-Ray, 5=Opp X-Ray.
     Matches Rust `crates/saccadion-chess/src/features.rs::extract_chess_graph_adj` bit-for-bit!
     """
-    adj = np.zeros((4, 64, 2), dtype=np.uint32)
+    adj = np.zeros((6, 64, 2), dtype=np.uint32)
     stm_occ = 0
     opp_occ = 0
     for sq in range(64):
@@ -154,21 +183,28 @@ def extract_chess_graph_adj_py(colors: np.ndarray, pieces: np.ndarray, stm: int)
             continue
         p = int(pieces[sq])
         atks = _piece_attacks_from(colors, c, p, sq)
+        xray = _piece_xray_attacks_from(colors, p, sq)
         rel_u = sq if stm == 0 else (sq ^ 56)
         if c == stm:
             b0 = orient_bb(atks & (~stm_occ & 0xFFFF_FFFF_FFFF_FFFF))
             b1 = orient_bb(atks & stm_occ)
+            b4 = orient_bb(xray)
             adj[0, rel_u, 0] = b0 & 0xFFFF_FFFF
             adj[0, rel_u, 1] = (b0 >> 32) & 0xFFFF_FFFF
             adj[1, rel_u, 0] = b1 & 0xFFFF_FFFF
             adj[1, rel_u, 1] = (b1 >> 32) & 0xFFFF_FFFF
+            adj[4, rel_u, 0] = b4 & 0xFFFF_FFFF
+            adj[4, rel_u, 1] = (b4 >> 32) & 0xFFFF_FFFF
         else:
             b2 = orient_bb(atks & (~opp_occ & 0xFFFF_FFFF_FFFF_FFFF))
             b3 = orient_bb(atks & opp_occ)
+            b5 = orient_bb(xray)
             adj[2, rel_u, 0] = b2 & 0xFFFF_FFFF
             adj[2, rel_u, 1] = (b2 >> 32) & 0xFFFF_FFFF
             adj[3, rel_u, 0] = b3 & 0xFFFF_FFFF
             adj[3, rel_u, 1] = (b3 >> 32) & 0xFFFF_FFFF
+            adj[5, rel_u, 0] = b5 & 0xFFFF_FFFF
+            adj[5, rel_u, 1] = (b5 >> 32) & 0xFFFF_FFFF
     return adj
 
 
@@ -632,7 +668,7 @@ def _decode_chunk_worker(
     sp_s = np.full((n, max_sparse), -1, dtype=np.int16)
     sp_o = np.full((n, max_sparse), -1, dtype=np.int16)
     bd = np.zeros((n, 64, STREAM_B_SQ_FEAT_DIM), dtype=np.float16)
-    ga = np.zeros((n, 4, 64, 2), dtype=np.uint32)
+    ga = np.zeros((n, 6, 64, 2), dtype=np.uint32)
     lh = np.zeros((n, LATERAL_HORN_DIM), dtype=np.float32)
     ph = np.zeros((n,), dtype=np.uint8)
     for i in range(n):
@@ -651,6 +687,7 @@ def _find_rust_data_binary() -> Optional[Path]:
     for cand in [
         repo_root / "target" / "release" / "saccadion-data",
         repo_root / "target" / "release" / "saccadion-data.exe",
+        Path("/content/drive/MyDrive/Saccadion_TPU/bin_v14/saccadion-data"),
         Path("/content/drive/MyDrive/Saccadion_TPU/bin_v13/saccadion-data"),
         Path("/content/drive/MyDrive/Saccadion_TPU/bin_v12/saccadion-data"),
         Path("/content/drive/MyDrive/Saccadion_TPU/bin_v11/saccadion-data"),
@@ -709,12 +746,12 @@ def build_or_open_memmap_cache(
     if not shard_paths:
         return None
     fp = _shards_fingerprint(shard_paths)
-    cdir = cache_root / f"{split_name}_v7_{fp}"
+    cdir = cache_root / f"{split_name}_v8_{fp}"
     meta_file = cdir / "meta.json"
     if meta_file.exists():
         try:
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
-            if meta.get("version") == 7 and int(meta.get("count", 0)) > 0:
+            if meta.get("version") == 8 and int(meta.get("count", 0)) > 0:
                 return cdir
         except Exception:
             pass
@@ -722,7 +759,7 @@ def build_or_open_memmap_cache(
     cdir.mkdir(parents=True, exist_ok=True)
     rust_bin = _find_rust_data_binary()
     if rust_bin is not None:
-        print(f"[FastCache v7] Rust multi-threaded INT8 pre-decoding `{split_name}` ({len(shard_paths)} shards, 2x smaller RAM)...")
+        print(f"[FastCache v8] Rust multi-threaded INT8+6ch-XRay pre-decoding `{split_name}` ({len(shard_paths)} shards)...")
         res = subprocess.run(
             [str(rust_bin), "predecode", str(cdir)] + [str(p) for p in shard_paths],
             capture_output=True,
@@ -732,7 +769,7 @@ def build_or_open_memmap_cache(
         if res.returncode == 0 and meta_file.exists():
             try:
                 m_chk = json.loads(meta_file.read_text(encoding="utf-8"))
-                if m_chk.get("version") == 7:
+                if m_chk.get("version") == 8:
                     print(" ", res.stdout.strip())
                     return cdir
             except Exception:
@@ -775,7 +812,7 @@ def build_or_open_memmap_cache(
     sp_s = np.memmap(cdir / "sparse_stm.i16", dtype="<i2", mode="w+", shape=(n, max_sparse))
     sp_o = np.memmap(cdir / "sparse_opp.i16", dtype="<i2", mode="w+", shape=(n, max_sparse))
     bd = np.memmap(cdir / "board_feats.i8", dtype=np.int8, mode="w+", shape=(n, 64, STREAM_B_SQ_FEAT_DIM))
-    ga = np.memmap(cdir / "graph_adj.u32", dtype="<u4", mode="w+", shape=(n, 4, 64, 2))
+    ga = np.memmap(cdir / "graph_adj.u32", dtype="<u4", mode="w+", shape=(n, 6, 64, 2))
     lh = np.memmap(cdir / "lh_feat.f32", dtype="<f4", mode="w+", shape=(n, LATERAL_HORN_DIM))
     ph = np.memmap(cdir / "phase.u8", dtype=np.uint8, mode="w+", shape=(n,))
 
@@ -839,7 +876,7 @@ def build_or_open_memmap_cache(
     np.ascontiguousarray(contrast_ori, dtype="<u4").tofile(cdir / "contrast.u32")
 
     meta_file.write_text(
-        json.dumps({"count": n, "max_sparse": max_sparse, "version": 7, "num_shards": len(shard_paths)}),
+        json.dumps({"count": n, "max_sparse": max_sparse, "version": 8, "num_shards": len(shard_paths)}),
         encoding="utf-8",
     )
     dt = max(1e-3, time.time() - t0)
@@ -915,7 +952,8 @@ class SaccShardDataset:
         else:
             self._bd_is_i8 = False
             self._bd = np.memmap(cdir / "board_feats.f16", dtype="<f2", mode="r", shape=(n, 64, STREAM_B_SQ_FEAT_DIM))
-        self._ga = np.memmap(cdir / "graph_adj.u32", dtype="<u4", mode="r", shape=(n, 4, 64, 2))
+        g_ch = 6 if int(meta.get("version", 7)) >= 8 else 4
+        self._ga = np.memmap(cdir / "graph_adj.u32", dtype="<u4", mode="r", shape=(n, g_ch, 64, 2))
         self._lh = np.memmap(cdir / "lh_feat.f32", dtype="<f4", mode="r", shape=(n, LATERAL_HORN_DIM))
         self._ph = np.memmap(cdir / "phase.u8", dtype=np.uint8, mode="r", shape=(n,))
         self._wdl = np.memmap(cdir / "wdl.f32", dtype="<f4", mode="r", shape=(n, 3))
@@ -968,7 +1006,7 @@ class SaccShardDataset:
         sp_s = np.full((bsz, self.max_sparse), -1, dtype=np.int32)
         sp_o = np.full((bsz, self.max_sparse), -1, dtype=np.int32)
         board = np.zeros((bsz, 64, STREAM_B_SQ_FEAT_DIM), dtype=np.float32)
-        gadj = np.zeros((bsz, 4, 64, 2), dtype=np.uint32)
+        gadj = np.zeros((bsz, 6, 64, 2), dtype=np.uint32)
         lh = np.zeros((bsz, LATERAL_HORN_DIM), dtype=np.float32)
         phase = np.zeros((bsz,), dtype=np.int32)
         wdl = np.zeros((bsz, 3), dtype=np.float32)

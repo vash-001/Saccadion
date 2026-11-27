@@ -161,6 +161,14 @@ def init_saccadion_params(cfg: SaccadionConfig, seed: int = 42) -> Dict[str, jnp
         # Saccadion-7 Dedicated Dendritic Coincidence Giant Fiber (GF/DNp01) Head (exported to v7!)
         "a_gf_w": u((stacks, ab_dim), float((1.0 / ab_dim) ** 0.5 * 0.1)),
         "a_gf_b": jnp.zeros((stacks,), dtype=jnp.float32),
+        # Saccadion-8 Retrograde Fischer-Graph (Bi-Directional A^T + 6ch X-Ray) + 2-Ply Minimax WM (v8!)
+        "b_retro_goal_w": u((d,), s_d),
+        "b_retro_goal_b": jnp.array(0.0, dtype=jnp.float32),
+        "b_retro_ln_g": jnp.ones((d,), dtype=jnp.float32),
+        "b_retro_ln_b": jnp.zeros((d,), dtype=jnp.float32),
+        "b_retro_w": u((GRAPH_EDGE_TYPES, d, d), s_d * 0.5),
+        "b_wm_opp_w": u((cx, d + cx), s_d * 0.5),
+        "b_wm_opp_b": jnp.zeros((cx,), dtype=jnp.float32),
         # Training-only AOTU -> LAL -> SMP 16-Causal-Concept Effectome Head (zero Rust latency!)
         "aux_causal_w": u((NUM_CAUSAL_CONCEPTS, d + cx), s_d),
         "aux_causal_b": jnp.full((NUM_CAUSAL_CONCEPTS,), -0.5, dtype=jnp.float32),
@@ -398,31 +406,53 @@ def forward_stream_b(
     lc = jnp.einsum("bsf,df->bsd", board_feats, w_lc)
     sq_state = (exc.astype(jnp.float32) / (leak + inh.astype(jnp.float32))) + lc + params["b_optic_b"]
 
-    # B1a. FlyWire Typed Directed Chess-Graph GNN (Dale's Law +ACh STM vs -GABA Opp)
+    # B1a. FlyWire 6-Channel Bi-Directional X-Ray Chess-Graph GNN (Forward A + Backward Retrograde A^T)
     # Uses TPU MXU BF16 matrix units with FP32 accumulation (4x faster on TPU v5e-1!)
     if graph_adj_u32 is not None:
         bit_shifts = jnp.arange(32, dtype=jnp.uint32)
         lo_bits = ((graph_adj_u32[..., 0:1] >> bit_shifts) & jnp.uint32(1)).astype(jnp.bfloat16)
         hi_bits = ((graph_adj_u32[..., 1:2] >> bit_shifts) & jnp.uint32(1)).astype(jnp.bfloat16)
-        adj_f = jnp.concatenate([lo_bits, hi_bits], axis=-1)  # [B, 4, 64, 64] bf16
+        adj_f = jnp.concatenate([lo_bits, hi_bits], axis=-1)  # [B, 6, 64, 64] bf16
         in_deg = jnp.sum(adj_f, axis=2, keepdims=True, dtype=jnp.float32)
         adj_norm = (adj_f.astype(jnp.float32) / (in_deg + 1.0)).astype(jnp.bfloat16)
+        out_deg = jnp.sum(adj_f, axis=3, keepdims=True, dtype=jnp.float32)
+        adj_t_norm = (adj_f.astype(jnp.float32) / (out_deg + 1.0)).astype(jnp.bfloat16)
     else:
         adj_norm = None
+        adj_t_norm = None
 
     w_gnn = ste_quantize(params["b_gnn_w"], 8, qat).astype(jnp.bfloat16)
+    w_retro = ste_quantize(params["b_retro_w"], 8, qat).astype(jnp.bfloat16)
+
+    def _combine_6ch(proj: jnp.ndarray) -> jnp.ndarray:
+        base = proj[:, 0] + proj[:, 1] - proj[:, 2] - proj[:, 3]
+        if proj.shape[1] >= 6:
+            return base + 0.7 * proj[:, 4] - 0.7 * proj[:, 5]
+        return base
 
     def apply_flywire_gnn_hop(cur_sq: jnp.ndarray) -> jnp.ndarray:
         if adj_norm is None:
             return cur_sq
         x_g = layer_norm(cur_sq, params["b_gnn_ln_g"], params["b_gnn_ln_b"]).astype(jnp.bfloat16)
         agg = jnp.einsum("bkuv,bud->bkvd", adj_norm, x_g, preferred_element_type=jnp.bfloat16)
-        proj = jnp.einsum("bkvd,ked->bkve", agg, w_gnn, preferred_element_type=jnp.float32)
-        signed = proj[:, 0] + proj[:, 1] - proj[:, 2] - proj[:, 3]
-        return cur_sq + jax.nn.silu(signed)
+        k_use = agg.shape[1]
+        proj = jnp.einsum("bkvd,ked->bkve", agg, w_gnn[:k_use], preferred_element_type=jnp.float32)
+        return cur_sq + jax.nn.silu(_combine_6ch(proj))
 
-    # Hop 1: immediate 1-hop attack/defense synaptic propagation right after T4/T5 Shunting
+    def apply_retrograde_gnn_hop(cur_sq: jnp.ndarray, goal_sq: jnp.ndarray) -> jnp.ndarray:
+        if adj_t_norm is None:
+            return cur_sq
+        x_r = layer_norm(cur_sq, params["b_retro_ln_g"], params["b_retro_ln_b"])
+        x_r = (x_r * (0.25 + goal_sq[:, :, None])).astype(jnp.bfloat16)
+        agg_b = jnp.einsum("bkuv,bvd->bkud", adj_t_norm, x_r, preferred_element_type=jnp.bfloat16)
+        k_use = agg_b.shape[1]
+        proj = jnp.einsum("bkud,ked->bkue", agg_b, w_retro[:k_use], preferred_element_type=jnp.float32)
+        return cur_sq + jax.nn.silu(_combine_6ch(proj))
+
+    # Hop 1: immediate 1-hop attack/defense/X-ray synaptic propagation right after T4/T5 Shunting
     sq_state = apply_flywire_gnn_hop(sq_state)
+    retro_goal_logits = jnp.zeros((bsz, 64), dtype=jnp.float32)
+    retro_goal_sq = jnp.full((bsz, 64), 0.5, dtype=jnp.float32)
 
     hubs = jnp.broadcast_to(params["b_hub_init"][None, :, :], (bsz, n_int + cfg.num_broadcasters, d))
     cx_phasor = jnp.zeros((bsz, sectors, cx_d), dtype=jnp.float32)
@@ -490,9 +520,18 @@ def forward_stream_b(
         fg = jax.nn.silu(jnp.einsum("bsd,fd->bsf", x2_bf, wfg_l, preferred_element_type=jnp.float32)).astype(jnp.bfloat16)
         fu = jnp.einsum("bsd,fd->bsf", x2_bf, wfu_l, preferred_element_type=jnp.bfloat16)
         sq_state = sq_state + jnp.einsum("bsf,df->bsd", fg * fu, wfd_l, preferred_element_type=jnp.float32)
-        # Hop 2 after Layer 0: 2-hop transitive battery/pin/overload propagation across chess graph!
+        # Alternating Bi-Directional Retrograde Fischer-Graph Hops:
+        # L0 -> Forward 2-hop (A), L1 -> FC2 Goal Saliency + Retrograde Hop 1 (A^T), L2 -> Retrograde Hop 2 (A^T)
         if l_idx == 0:
             sq_state = apply_flywire_gnn_hop(sq_state)
+        elif l_idx == 1:
+            retro_goal_logits = (
+                jnp.einsum("bsd,d->bs", sq_state, params["b_retro_goal_w"]) + params["b_retro_goal_b"]
+            )
+            retro_goal_sq = jax.nn.sigmoid(retro_goal_logits)
+            sq_state = apply_retrograde_gnn_hop(sq_state, retro_goal_sq)
+        elif l_idx == 2:
+            sq_state = apply_retrograde_gnn_hop(sq_state, retro_goal_sq)
 
     # Weight-tied Central Complex + Rich-Club deliberation loop
     sez_vec = sez_cp if sez_cp is not None else jnp.zeros((bsz,), dtype=jnp.float32)
@@ -635,6 +674,8 @@ def forward_stream_b(
         "global_latent": global_vec,  # Used by Action-Conditioned hDelta World Model!
         "aligned_q": aligned_q,       # [B, 64, cx_d] used by hDelta World Model
         "contra_k": contra_k,         # [B, 64, cx_d] used by hDelta World Model
+        "retro_goal_logits": retro_goal_logits,  # [B, 64] FC2 Retrograde Target-Square Goal Saliency logits
+        "retro_goal_saliency": retro_goal_sq,    # [B, 64] sigmoid goal saliency
         "cent_board_mask": cent_mask_64,
         "gamma_seed": gamma_seed,
         "cent_kc_mask": cent_kc_mask,
@@ -654,8 +695,8 @@ def predict_action_world_model(
     out_b: Dict[str, jnp.ndarray],
     move_u16: jnp.ndarray,  # [B] int32 packed (u << 6) | v
 ) -> jnp.ndarray:
-    """Action-Conditioned hDelta Latent World Model: predicts future global_latent z_{t+2}
-    conditioned on current latent z_t and the played action embedding do(m_t)!"""
+    """Action-Conditioned hDelta Latent World Model (Ply 1): predicts post-move latent z_1
+    conditioned on current latent z_0 and played action embedding do(m_1)!"""
     bsz = move_u16.shape[0]
     row = jnp.arange(bsz)
     u = (move_u16 >> 6) & 63
@@ -664,6 +705,21 @@ def predict_action_world_model(
     wm_in = jnp.concatenate([out_b["global_latent"], act_emb], axis=-1)
     h = jax.nn.silu(jnp.einsum("bi,hi->bh", wm_in, params["b_wm_w1"]) + params["b_wm_b1"])
     return out_b["global_latent"] + jnp.einsum("bh,oh->bo", h, params["b_wm_w2"])
+
+
+def predict_minimax_world_model(
+    params: Dict[str, jnp.ndarray],
+    out_b: Dict[str, jnp.ndarray],
+    move_u16: jnp.ndarray,  # [B] int32 packed (u << 6) | v
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Saccadion-8 2-Ply Counterfactual Latent Minimax World Model:
+    Returns (z_1 after STM move do(m_1), z_2 after opponent's sharpest counter-action do(m_2_opp))!"""
+    z_1 = predict_action_world_model(params, out_b, move_u16)
+    opp_act = jnp.tanh(jnp.einsum("bg,cg->bc", z_1, params["b_wm_opp_w"]) + params["b_wm_opp_b"])
+    wm2_in = jnp.concatenate([z_1, -opp_act], axis=-1)
+    h2 = jax.nn.silu(jnp.einsum("bi,hi->bh", wm2_in, params["b_wm_w1"]) + params["b_wm_b1"])
+    z_2 = z_1 + jnp.einsum("bh,oh->bo", h2, params["b_wm_w2"])
+    return z_1, z_2
 
 
 def meta_dopamine_trajectory_scan(

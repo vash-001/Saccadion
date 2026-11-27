@@ -111,6 +111,13 @@ SACCNET_TENSOR_ORDER = [
     "b_wm_w2",
     "a_gf_w",
     "a_gf_b",
+    "b_retro_goal_w",
+    "b_retro_goal_b",
+    "b_retro_ln_g",
+    "b_retro_ln_b",
+    "b_retro_w",
+    "b_wm_opp_w",
+    "b_wm_opp_b",
 ]
 
 
@@ -249,6 +256,13 @@ def init_numpy_params(cfg: SaccadionConfig, seed: int = 1234) -> Dict[str, np.nd
         "b_wm_w2": u((d + cx, d + cx), s_d * 0.5),
         "a_gf_w": u((stacks, ab_dim), (1.0 / ab_dim) ** 0.5 * 0.1),
         "a_gf_b": np.zeros((stacks,), dtype=np.float32),
+        "b_retro_goal_w": u((d,), s_d),
+        "b_retro_goal_b": np.array(0.0, dtype=np.float32),
+        "b_retro_ln_g": np.ones((d,), dtype=np.float32),
+        "b_retro_ln_b": np.zeros((d,), dtype=np.float32),
+        "b_retro_w": u((GRAPH_EDGE_TYPES, d, d), s_d * 0.5),
+        "b_wm_opp_w": u((cx, d + cx), s_d * 0.5),
+        "b_wm_opp_b": np.zeros((cx,), dtype=np.float32),
     }
 
 
@@ -352,21 +366,31 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
     leak = np.log1p(np.exp(params["b_shunt_leak"])) + 0.5
     sq_state = exc / (leak + inh) + board @ params["b_lc_w"].T + params["b_optic_b"]
 
-    # B1a. FlyWire Typed Directed Chess-Graph GNN (Dale's Law +ACh STM vs -GABA Opp)
+    # B1a. FlyWire 6-Channel Bi-Directional X-Ray Chess-Graph GNN (Forward A + Backward Retrograde A^T)
     shifts32 = np.arange(32, dtype=np.uint32)
     lo_b = ((graph_adj[..., 0:1] >> shifts32) & np.uint32(1)).astype(np.float32)
     hi_b = ((graph_adj[..., 1:2] >> shifts32) & np.uint32(1)).astype(np.float32)
-    adj_f = np.concatenate([lo_b, hi_b], axis=-1)  # [4, 64, 64]
+    adj_f = np.concatenate([lo_b, hi_b], axis=-1)  # [6, 64, 64]
     adj_norm = adj_f / (np.sum(adj_f, axis=1, keepdims=True) + 1.0)
+    adj_t_norm = adj_f / (np.sum(adj_f, axis=2, keepdims=True) + 1.0)
+
+    def _combine_6ch(proj: np.ndarray) -> np.ndarray:
+        return proj[0] + proj[1] - proj[2] - proj[3] + 0.7 * proj[4] - 0.7 * proj[5]
 
     def _apply_gnn_hop(cur_sq: np.ndarray) -> np.ndarray:
         x_g = _ln(cur_sq, params["b_gnn_ln_g"], params["b_gnn_ln_b"])
         agg = np.einsum("kuv,ud->kvd", adj_norm, x_g)
         proj = np.einsum("kvd,ked->kve", agg, params["b_gnn_w"])
-        signed = proj[0] + proj[1] - proj[2] - proj[3]
-        return cur_sq + _silu(signed)
+        return cur_sq + _silu(_combine_6ch(proj))
+
+    def _apply_retro_hop(cur_sq: np.ndarray, goal_sq: np.ndarray) -> np.ndarray:
+        x_r = _ln(cur_sq, params["b_retro_ln_g"], params["b_retro_ln_b"]) * (0.25 + goal_sq[:, None])
+        agg = np.einsum("kuv,vd->kud", adj_t_norm, x_r)
+        proj = np.einsum("kud,ked->kue", agg, params["b_retro_w"])
+        return cur_sq + _silu(_combine_6ch(proj))
 
     sq_state = _apply_gnn_hop(sq_state)
+    retro_goal_py = np.full((64,), 0.5, dtype=np.float32)
     hubs = params["b_hub_init"].copy()
     cx_p = np.zeros((sectors, cx_d), dtype=np.float32)
     inv_sd = 1.0 / np.sqrt(d)
@@ -399,6 +423,11 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
         sq_state = sq_state + (fg * fu) @ params["b_opt_fd"][l_idx].T
         if l_idx == 0:
             sq_state = _apply_gnn_hop(sq_state)
+        elif l_idx == 1:
+            retro_goal_py = _sigmoid(sq_state @ params["b_retro_goal_w"] + params["b_retro_goal_b"])
+            sq_state = _apply_retro_hop(sq_state, retro_goal_py)
+        elif l_idx == 2:
+            sq_state = _apply_retro_hop(sq_state, retro_goal_py)
 
     for _ in range(cfg.cx_max_ticks):
         int_h = hubs[:n_int]
@@ -455,10 +484,14 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
     rust_b_cp = float(kv["stream_b_deep_cp"])
     rust_pfl2 = float(kv["pfl2"])
     rust_press = np.array([float(x) for x in kv["press"].split(",")], dtype=np.float32)
+    rust_retro_mean = float(kv["retro_goal_mean"])
+    rust_sb_i8_cp = float(kv["stream_b_i8_cp"])
+    py_retro_mean = float(np.mean(retro_goal_py))
 
     print(f"Giant Fiber FP32: Python={gf_cp_py:.6f} | Rust={rust_gf_fp32:.6f} | diff={abs(gf_cp_py - rust_gf_fp32):.2e} | INT16={rust_gf_i16}")
     print(f"Stream A slow_cp: Python={slow_cp_py:.6f} | Rust={rust_a_cp:.6f} | diff={abs(slow_cp_py - rust_a_cp):.2e}")
-    print(f"Stream B deep_cp: Python={deep_cp_py:.6f} | Rust={rust_b_cp:.6f} | diff={abs(deep_cp_py - rust_b_cp):.2e}")
+    print(f"Stream B deep_cp: Python={deep_cp_py:.6f} | Rust={rust_b_cp:.6f} | diff={abs(deep_cp_py - rust_b_cp):.2e} | INT8={rust_sb_i8_cp:.2f}")
+    print(f"Retrograde Goal : Python={py_retro_mean:.6f} | Rust={rust_retro_mean:.6f} | diff={abs(py_retro_mean - rust_retro_mean):.2e}")
     print(f"Stream B PFL2   : Python={pfl2_py:.6f} | Rust={rust_pfl2:.6f} | diff={abs(pfl2_py - rust_pfl2):.2e}")
     print(f"Pressure maxdiff: {np.max(np.abs(press_py - rust_press)):.2e}")
 
@@ -466,9 +499,10 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
     assert abs(gf_cp_py - rust_gf_i16) < 3.0, "Giant Fiber INT16 parity mismatch"
     assert abs(slow_cp_py - rust_a_cp) < 1e-4, "Stream A cp parity mismatch"
     assert abs(deep_cp_py - rust_b_cp) < 1e-4, "Stream B cp parity mismatch"
+    assert abs(py_retro_mean - rust_retro_mean) < 1e-5, "Retrograde Goal parity mismatch"
     assert abs(pfl2_py - rust_pfl2) < 1e-5, "PFL2 parity mismatch"
     assert np.max(np.abs(press_py - rust_press)) < 1e-5, "Strategic Pressure parity mismatch"
-    print("EXACT PYTHON <-> RUST .SACCNET PARITY VERIFIED TO < 1e-4!")
+    print("EXACT PYTHON <-> RUST .SACCNET v8 PARITY VERIFIED TO < 1e-4!")
 
 
 if __name__ == "__main__":

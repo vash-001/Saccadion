@@ -262,6 +262,7 @@ class LiveTrainingHUD:
         br_t3 = ex.get("bril_top3_pct", last.get("bril_top3_pct", 0.0))
         bl_seen = int(ex.get("blunder_seen", 0))
         br_seen = int(ex.get("bril_seen", 0))
+        retro_rec = float(ex.get("retro_goal_recall", last.get("val_retro_recall", 0.0) * 100.0))
 
         est_raw = f"{last['est_raw_elo']:.0f}" if "est_raw_elo" in last else "--"
         est_pvs = f"{last['est_search_elo']:.0f}" if "est_search_elo" in last else "--"
@@ -484,7 +485,7 @@ class LiveTrainingHUD:
             _cbadge("03. Push-Pull MBON 2:1", f"E/I {c_mbon:.2f}", c_mbon > 0.01),
             _cbadge("04. Lateral Horn 98%-I", f"veto {c_lh:.2f}", c_lh > 0.001),
             _cbadge("05. T4/T5 Shunting", f"gain {c_shunt:.2f}", c_shunt > 0.01),
-            _cbadge("06. 3L Optic + FlyGNN", f"foc {c_lob:.2f}", c_lob > 0.02),
+            _cbadge("06. 3L Optic + 6ch RetroGNN", f"R@8 {retro_rec:.0f}% f {c_lob:.2f}", c_lob > 0.02 or retro_rec > 1.0),
             _cbadge("07. Rich-Club 16I+16B", f"||h|| {c_rc:.2f}", c_rc > 0.1),
             _cbadge("08. CX Phasor 16-Sec", f"||cx|| {c_cx:.2f}", c_cx > 0.05),
             _cbadge("09. Centrifugal 72%-I", f"std {c_cent:.2f}", c_cent > 0.005),
@@ -515,7 +516,7 @@ background:{Z_PAPER};color:{Z_INK};padding:16px;border-radius:26px;border:1px so
       </div>
       <div>
         <div style="font-size:15px;font-weight:900;letter-spacing:-0.02em;color:{Z_INK};">
-          SACCADION-7 NEURO-APEX
+          SACCADION-8 RETROGRADE FISCHER-GRAPH
           <span style="margin-left:6px;padding:2px 9px;border-radius:999px;background:{Z_INK};color:{Z_PAPER};font-size:10.5px;font-weight:800;">{html.escape(stage_name)}</span>
         </div>
         <div style="font-size:10.5px;color:{Z_UMBER};letter-spacing:0.06em;">
@@ -565,7 +566,7 @@ background:{Z_PAPER};color:{Z_INK};padding:16px;border-radius:26px;border:1px so
     <!-- 3. Causal, Blunder & Brilliant (!!) Mastery -->
     <div style="background:{Z_BONE};padding:12px 14px;border-radius:16px;border:1px solid {Z_LINE_SUB};">
       <div style="display:flex;justify-content:space-between;font-size:10px;letter-spacing:0.12em;color:{Z_UMBER};font-weight:700;">
-        <span>CAUSAL BLUNDER / !!</span><span>16-F1 {causal_f1_str}</span>
+        <span>CAUSAL / RETRO / !!</span><span>R@8 {retro_rec:4.1f}% | F1 {causal_f1_str}</span>
       </div>
       <div style="font-size:20px;font-weight:900;letter-spacing:-0.03em;color:{Z_AKANE};margin:2px 0;">Avoid {bl_avoid:4.1f}%</div>
       <div style="font-size:11px;color:{Z_UMBER};">WM-Drop <b>{wm_bl:4.1f}%</b> | !! T1 {br_t1:4.1f}% / T3 <b>{br_t3:4.1f}%</b></div>

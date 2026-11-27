@@ -11,7 +11,8 @@
 use crate::tt::{score_from_tt, Bound, StrategicEntry, StrategicTT, TranspositionTable, MATE_SCORE, MATE_THRESHOLD};
 use saccadion_chess::movegen::{generate_legal, generate_legal_tactical};
 use saccadion_chess::position::Position;
-use saccadion_chess::types::{Move, MoveList};
+use saccadion_chess::Bitboard;
+use saccadion_chess::types::{Color, Move, MoveList, Piece};
 use saccadion_nn::plasticity::DopaminePlasticityState;
 use saccadion_nn::stream_a::{evaluate_giant_fiber_cp, evaluate_stream_a, StreamAWorkspace};
 use saccadion_nn::stream_b::evaluate_stream_b;
@@ -25,6 +26,42 @@ const INF: i32 = 32_000;
 const DPM_CORR_SIZE: usize = 16_384;
 const DPM_CORR_MASK: usize = DPM_CORR_SIZE - 1;
 const CONT_DIM: usize = 12 * 64; // 768 (piece_color_idx * 64 + to_sq)
+
+/// Endgame Drawishness & 50-Move Rule Scaling:
+/// Dampens static eval smoothly when approaching the 50-move draw or in dead-drawn
+/// opposite-colored bishop endgames without major pieces (prevents fortress hallucinations!).
+#[inline(always)]
+fn scale_endgame_eval(pos: &Position, mut eval: i32) -> i32 {
+    if eval.abs() >= MATE_THRESHOLD {
+        return eval;
+    }
+    let wb = pos.piece_bb(Color::White, Piece::Bishop);
+    let bb = pos.piece_bb(Color::Black, Piece::Bishop);
+    if wb.count() == 1 && bb.count() == 1 {
+        let opp_color =
+            (wb & Bitboard::LIGHT_SQUARES).non_empty() != (bb & Bitboard::LIGHT_SQUARES).non_empty();
+        if opp_color {
+            let majors = pos.piece_bb(Color::White, Piece::Queen)
+                | pos.piece_bb(Color::Black, Piece::Queen)
+                | pos.piece_bb(Color::White, Piece::Rook)
+                | pos.piece_bb(Color::Black, Piece::Rook);
+            if majors.is_empty() {
+                let knights = pos.piece_bb(Color::White, Piece::Knight)
+                    | pos.piece_bb(Color::Black, Piece::Knight);
+                eval = if knights.is_empty() {
+                    (eval * 62) / 100
+                } else {
+                    (eval * 82) / 100
+                };
+            }
+        }
+    }
+    if pos.halfmove_clock >= 30 {
+        let rem = (115 - pos.halfmove_clock as i32).clamp(15, 85);
+        eval = (eval * rem) / 85;
+    }
+    eval
+}
 
 #[derive(Clone, Debug)]
 pub struct SearchConfig {
@@ -97,6 +134,8 @@ struct DnpWorker {
     cont_hist: Vec<i16>,
     /// Capture History table [12 piece_colors][64 to_sq][6 victim_pieces].
     cap_hist: [[[i32; 6]; 64]; 12],
+    /// Backward Causal Refutation-Threat table [from_sq][to_sq] boosting deep forcing moves.
+    threat_hist: [[i32; 64]; 64],
     countermoves: [[Move; 64]; 64],
     /// Multi-Scale DPM Structural Correction History (Pawn + White Non-Pawn + Black Non-Pawn).
     dpm_pawn_corr: Vec<[i32; 2]>,
@@ -152,6 +191,7 @@ impl DnpWorker {
             history: [[[0; 64]; 64]; 2],
             cont_hist: vec![0i16; CONT_DIM * CONT_DIM],
             cap_hist: [[[0; 6]; 64]; 12],
+            threat_hist: [[0; 64]; 64],
             countermoves: [[Move::NULL; 64]; 64],
             dpm_pawn_corr: vec![[0; 2]; DPM_CORR_SIZE],
             dpm_np_w_corr: vec![[0; 2]; DPM_CORR_SIZE],
@@ -287,6 +327,7 @@ impl DnpWorker {
         mut alpha: i32,
         beta: i32,
         is_pv: bool,
+        allow_nmp: bool,
         prev_move: Move,
         excluded_move: Move,
         parent_cent_mask: Option<&[f32]>,
@@ -392,7 +433,10 @@ impl DnpWorker {
             }
             (se, Some(out_a), lh_alert, lh_deep, eff_surp)
         };
-        let static_eval = (raw_static_eval + self.dpm_correction(pos)).clamp(-2600, 2600);
+        let static_eval = scale_endgame_eval(
+            pos,
+            (raw_static_eval + self.dpm_correction(pos)).clamp(-2600, 2600),
+        );
         self.static_evals[ply] = static_eval;
         let improving = !in_check && ply >= 2 && static_eval > self.static_evals[ply - 2];
         let parent_eval_f32 = out_a_opt
@@ -417,7 +461,7 @@ impl DnpWorker {
             let non_pawn = pos.color_occ[us.index()]
                 ^ pos.piece_bb(us, saccadion_chess::types::Piece::Pawn)
                 ^ pos.piece_bb(us, saccadion_chess::types::Piece::King);
-            if depth >= 3 && static_eval >= beta && non_pawn.non_empty() {
+            if allow_nmp && depth >= 3 && static_eval >= beta && non_pawn.non_empty() {
                 let r = 3 + depth / 4 + ((static_eval - beta) / 200).clamp(0, 2);
                 self.moved_pc_to[ply] = u16::MAX;
                 let undo = pos.make_null_move();
@@ -428,6 +472,7 @@ impl DnpWorker {
                     ply + 1,
                     -beta,
                     -beta + 1,
+                    false,
                     false,
                     Move::NULL,
                     Move::NULL,
@@ -440,7 +485,32 @@ impl DnpWorker {
                     return 0;
                 }
                 if null_score >= beta && null_score < MATE_THRESHOLD {
-                    return beta;
+                    // Null-Move Verification Search at depth >= 12 eliminates Endgame Zugzwang blindspots!
+                    if depth >= 12 {
+                        let mut ver_pv = Vec::new();
+                        let ver_score = self.pvs(
+                            pos,
+                            (depth - r).max(1),
+                            ply,
+                            beta - 1,
+                            beta,
+                            false,
+                            false,
+                            prev_move,
+                            Move::NULL,
+                            parent_cent_mask,
+                            expected_eval_from_parent,
+                            &mut ver_pv,
+                        );
+                        if self.aborted {
+                            return 0;
+                        }
+                        if ver_score >= beta {
+                            return beta;
+                        }
+                    } else {
+                        return beta;
+                    }
                 }
             }
             // ProbCut: if a winning capture easily beats `beta + 190` at reduced depth, prune early!
@@ -469,6 +539,7 @@ impl DnpWorker {
                                 -pc_beta,
                                 -pc_beta + 1,
                                 false,
+                                true,
                                 cmv,
                                 Move::NULL,
                                 parent_cent_mask,
@@ -495,10 +566,10 @@ impl DnpWorker {
             return if in_check { -MATE_SCORE + ply as i32 } else { 0 };
         }
 
-        // 5. Selective Stream B Deep Strategic Brain (enabled even in fast 150-250ms games with cap!)
+        // 5. Selective INT8 Stream B Deep Strategic Brain (3x faster -> up to 8 evals even in fast games!)
         let allow_subtree_sb = self.cfg.time_limit_ms == 0
             || self.cfg.time_limit_ms > 500
-            || (self.cfg.time_limit_ms >= 150 && self.stream_b_evals < 4);
+            || (self.cfg.time_limit_ms >= 150 && self.stream_b_evals < 8);
         let need_stream_b = self.cfg.use_stream_b
             && allow_subtree_sb
             && !self.is_helper
@@ -538,13 +609,13 @@ impl DnpWorker {
             depth -= 1;
         }
 
-        // PFL2 Sharpness-driven depth extension on critical turning points
+        // Depth-30 Causal Laser: PFL2 Sharpness-driven extension on critical turning points (up to ply 30!)
         let pfl2_sharpness = local_strat.as_ref().map(|s| s.pfl2_sharpness).unwrap_or(0.5);
-        if is_pv && pfl2_sharpness > 0.78 && !in_check && ply < 16 && depth >= 3 {
+        if is_pv && pfl2_sharpness > 0.72 && !in_check && ply < 30 && depth >= 3 {
             depth += 1;
         }
 
-        // 6. Zero-Allocation Stack Move Scoring + Lazy Best-Move Selection (O(N) on move-0 beta cutoffs!)
+        // 6. Zero-Allocation Stack Move Scoring + Retrograde Goal Saliency + Lazy Best-Move Selection
         let counter_mv = if !prev_move.is_null() {
             self.countermoves[prev_move.from_sq().index()][prev_move.to_sq().index()]
         } else {
@@ -553,7 +624,8 @@ impl DnpWorker {
         let mut scored_moves: [(Move, i32, usize, f32, u16, u8); 256] =
             [(Move::NULL, 0, usize::MAX, 0.0, u16::MAX, 0); 256];
         let mut n_moves = 0usize;
-        let stm_idx = pos.side_to_move.index();
+        let stm_color = pos.side_to_move;
+        let stm_idx = stm_color.index();
         for &mv in moves.as_slice() {
             if mv == excluded_move {
                 continue;
@@ -576,6 +648,12 @@ impl DnpWorker {
                     noduli_delta = pm.expected_delta_cp;
                     priority += 450_000 + (pm.prob * 500_000.0) as i32;
                 }
+                // Retrograde Fischer-Graph target-square goal saliency boost!
+                let rel_to = mv.to_sq().relative_to(stm_color).index();
+                let gs = st.retro_goal_saliency[rel_to];
+                if gs > 0.62 {
+                    priority += ((gs - 0.5) * 180_000.0) as i32;
+                }
             }
             if mv.is_capture() {
                 let vic = vic_piece.map(|p| p.cp_value()).unwrap_or(100);
@@ -593,7 +671,8 @@ impl DnpWorker {
                 priority += 350_000;
             } else {
                 priority += self.history[stm_idx][mv.from_sq().index()][mv.to_sq().index()]
-                    + self.get_cont_history(ply, cur_pc_to);
+                    + self.get_cont_history(ply, cur_pc_to)
+                    + self.threat_hist[mv.from_sq().index()][mv.to_sq().index()] / 2;
             }
             scored_moves[n_moves] = (mv, priority, pfl3_rank, noduli_delta, cur_pc_to, vic_idx);
             n_moves += 1;
@@ -660,12 +739,13 @@ impl DnpWorker {
                 }
             }
 
-            // Singular Extension (PFL2/LAL Commitment Lock-In):
-            // If TT move is much better than all alternatives at depth >= 7, extend it by +1 ply!
+            // Depth-30 Causal Laser Extensions:
+            // 1) Singular & Double-Singular Extension (diving cleanly up to ply 36-44!)
+            // 2) 7th-Rank Passed-Pawn Laser Extension
             let mut ext = 0i32;
             if depth >= 7
                 && ply > 0
-                && ply < 32
+                && ply < 44
                 && excluded_move.is_null()
                 && mv == tt_move
                 && tt_depth_val >= depth - 3
@@ -682,6 +762,7 @@ impl DnpWorker {
                     s_beta - 1,
                     s_beta,
                     false,
+                    true,
                     prev_move,
                     mv,
                     parent_cent_mask,
@@ -692,10 +773,15 @@ impl DnpWorker {
                     return 0;
                 }
                 if s_score < s_beta {
-                    ext = if !is_pv && ply < 24 && s_score < s_beta - 25 { 2 } else { 1 };
+                    ext = if !is_pv && ply < 36 && s_score < s_beta - 25 { 2 } else { 1 };
                 } else if s_beta >= beta {
                     return s_beta;
                 }
+            } else if ply < 36
+                && pos.piece_at(mv.from_sq()).map(|(_, p)| p == Piece::Pawn).unwrap_or(false)
+                && mv.to_sq().relative_to(stm_color).rank() == 6
+            {
+                ext = 1;
             }
 
             if is_quiet && n_quiets_tried < 64 {
@@ -725,6 +811,7 @@ impl DnpWorker {
                     -beta,
                     -alpha,
                     is_pv,
+                    true,
                     mv,
                     Move::NULL,
                     child_cent_mask,
@@ -762,6 +849,7 @@ impl DnpWorker {
                     -alpha - 1,
                     -alpha,
                     false,
+                    true,
                     mv,
                     Move::NULL,
                     child_cent_mask,
@@ -777,6 +865,7 @@ impl DnpWorker {
                         -alpha - 1,
                         -alpha,
                         false,
+                        true,
                         mv,
                         Move::NULL,
                         child_cent_mask,
@@ -792,6 +881,7 @@ impl DnpWorker {
                         ply + 1,
                         -beta,
                         -alpha,
+                        true,
                         true,
                         mv,
                         Move::NULL,
@@ -830,6 +920,10 @@ impl DnpWorker {
                                 self.countermoves[prev_move.from_sq().index()][prev_move.to_sq().index()] = mv;
                             }
                             self.update_history(stm_idx, mv, bonus);
+                            if depth >= 4 {
+                                let th = &mut self.threat_hist[mv.from_sq().index()][mv.to_sq().index()];
+                                *th = (*th + bonus - (*th * bonus) / 16_384).clamp(-16_384, 16_384);
+                            }
                             if ply >= 1 {
                                 self.update_cont_history(self.moved_pc_to[ply - 1], cur_pc_to, bonus);
                             }
@@ -919,7 +1013,10 @@ impl DnpWorker {
         }
 
         let in_check = pos.in_check();
-        let stand_pat = evaluate_giant_fiber_cp(pos, &self.weights, &mut self.ws_a);
+        let stand_pat = scale_endgame_eval(
+            pos,
+            evaluate_giant_fiber_cp(pos, &self.weights, &mut self.ws_a),
+        );
         let mut best_score = if in_check { -INF } else { stand_pat };
         let mut best_move = Move::NULL;
         if !in_check {
@@ -1155,6 +1252,7 @@ impl SearchEngine {
             history: self.history,
             cont_hist: std::mem::take(&mut self.cont_hist),
             cap_hist: self.cap_hist,
+            threat_hist: [[0; 64]; 64],
             countermoves: [[Move::NULL; 64]; 64],
             dpm_pawn_corr: std::mem::take(&mut self.dpm_pawn_corr),
             dpm_np_w_corr: std::mem::take(&mut self.dpm_np_w_corr),
@@ -1214,7 +1312,7 @@ impl SearchEngine {
                     let mut dummy_pv = Vec::with_capacity(32);
                     while d <= cfg_h.max_depth && !worker.aborted {
                         dummy_pv.clear();
-                        let _ = worker.pvs(&mut pos_h, d, 0, -INF, INF, true, Move::NULL, Move::NULL, None, 0.0, &mut dummy_pv);
+                        let _ = worker.pvs(&mut pos_h, d, 0, -INF, INF, true, true, Move::NULL, Move::NULL, None, 0.0, &mut dummy_pv);
                         // Slight depth diversity across parallel DNp channels
                         d += if d >= 4 && ((tid + d as usize) & 1) == 0 { 2 } else { 1 };
                     }
@@ -1237,7 +1335,7 @@ impl SearchEngine {
                 let mut pv_line = Vec::with_capacity(depth as usize + 4);
                 let score = loop {
                     pv_line.clear();
-                    let s = main_worker.pvs(pos, depth, 0, alpha, beta, true, Move::NULL, Move::NULL, None, 0.0, &mut pv_line);
+                    let s = main_worker.pvs(pos, depth, 0, alpha, beta, true, true, Move::NULL, Move::NULL, None, 0.0, &mut pv_line);
                     if main_worker.aborted {
                         break s;
                     }

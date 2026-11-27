@@ -174,6 +174,7 @@ pub struct StrategicEntry {
     pub gamma_seed: Vec<f32>,
     pub centrifugal_kc_mask: Vec<f32>,
     pub committed_goal: Vec<f32>,
+    pub retro_goal_saliency: [f32; 64],
 }
 
 pub struct StrategicTT {
@@ -218,6 +219,7 @@ impl StrategicTT {
             gamma_seed: out.gamma_seed.clone(),
             centrifugal_kc_mask: out.centrifugal_kc_mask.clone(),
             committed_goal: out.committed_goal.clone(),
+            retro_goal_saliency: out.retro_goal_saliency,
         });
     }
 }

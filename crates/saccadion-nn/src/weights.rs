@@ -39,6 +39,135 @@ fn quantize_stacks_to_i8(src: &[f32], num_stacks: usize) -> (Vec<i8>, Vec<f32>) 
     (out, scales)
 }
 
+/// Per-row symmetrically quantized INT8 matrix for fast L2-resident AVX2 Stream B matvecs.
+#[derive(Clone, Debug)]
+pub struct QuantizedMatrixI8 {
+    pub data: Vec<i8>,
+    pub scales: Vec<f32>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl QuantizedMatrixI8 {
+    pub fn from_f32(src: &[f32], rows: usize, cols: usize) -> Self {
+        debug_assert_eq!(src.len(), rows * cols);
+        let mut data = vec![0i8; rows * cols];
+        let mut scales = vec![1.0f32; rows];
+        for r in 0..rows {
+            let row = &src[r * cols..(r + 1) * cols];
+            let max_abs = row.iter().fold(1e-6f32, |m, &v| m.max(v.abs()));
+            scales[r] = max_abs / 127.0;
+            let inv = 127.0 / max_abs;
+            let dst = &mut data[r * cols..(r + 1) * cols];
+            for c in 0..cols {
+                dst[c] = (row[c] * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+        Self { data, scales, rows, cols }
+    }
+}
+
+/// Pre-quantized runtime INT8 cache for Stream B's large dense matrices (4x smaller L2 footprint).
+#[derive(Clone, Debug)]
+pub struct StreamBQuantCache {
+    pub gnn_w: Vec<QuantizedMatrixI8>,
+    pub retro_w: Vec<QuantizedMatrixI8>,
+    pub opt_q: Vec<QuantizedMatrixI8>,
+    pub opt_k: Vec<QuantizedMatrixI8>,
+    pub opt_v: Vec<QuantizedMatrixI8>,
+    pub opt_o: Vec<QuantizedMatrixI8>,
+    pub opt_fg: Vec<QuantizedMatrixI8>,
+    pub opt_fu: Vec<QuantizedMatrixI8>,
+    pub opt_fd: Vec<QuantizedMatrixI8>,
+    pub int_q: QuantizedMatrixI8,
+    pub int_k: QuantizedMatrixI8,
+    pub int_v: QuantizedMatrixI8,
+    pub int_o: QuantizedMatrixI8,
+    pub rc_mix1: QuantizedMatrixI8,
+    pub rc_mix2: QuantizedMatrixI8,
+    pub broad_to_sq: QuantizedMatrixI8,
+    pub sq_upd: QuantizedMatrixI8,
+    pub wm_w1: QuantizedMatrixI8,
+    pub wm_w2: QuantizedMatrixI8,
+}
+
+impl StreamBQuantCache {
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        d: usize,
+        cx: usize,
+        b_gnn_w: &[f32],
+        b_retro_w: &[f32],
+        b_opt_q: &[f32],
+        b_opt_k: &[f32],
+        b_opt_v: &[f32],
+        b_opt_o: &[f32],
+        b_opt_fg: &[f32],
+        b_opt_fu: &[f32],
+        b_opt_fd: &[f32],
+        b_int_q: &[f32],
+        b_int_k: &[f32],
+        b_int_v: &[f32],
+        b_int_o: &[f32],
+        b_rc_mix1: &[f32],
+        b_rc_mix2: &[f32],
+        b_broad_to_sq: &[f32],
+        b_sq_upd: &[f32],
+        b_wm_w1: &[f32],
+        b_wm_w2: &[f32],
+    ) -> Self {
+        let gnn_w = (0..GRAPH_EDGE_TYPES)
+            .map(|k| QuantizedMatrixI8::from_f32(&b_gnn_w[k * d * d..(k + 1) * d * d], d, d))
+            .collect();
+        let retro_w = (0..GRAPH_EDGE_TYPES)
+            .map(|k| QuantizedMatrixI8::from_f32(&b_retro_w[k * d * d..(k + 1) * d * d], d, d))
+            .collect();
+        let ffn_d = 2 * d;
+        let opt_q = (0..OPTIC_LAYERS)
+            .map(|l| QuantizedMatrixI8::from_f32(&b_opt_q[l * d * d..(l + 1) * d * d], d, d))
+            .collect();
+        let opt_k = (0..OPTIC_LAYERS)
+            .map(|l| QuantizedMatrixI8::from_f32(&b_opt_k[l * d * d..(l + 1) * d * d], d, d))
+            .collect();
+        let opt_v = (0..OPTIC_LAYERS)
+            .map(|l| QuantizedMatrixI8::from_f32(&b_opt_v[l * d * d..(l + 1) * d * d], d, d))
+            .collect();
+        let opt_o = (0..OPTIC_LAYERS)
+            .map(|l| QuantizedMatrixI8::from_f32(&b_opt_o[l * d * d..(l + 1) * d * d], d, d))
+            .collect();
+        let opt_fg = (0..OPTIC_LAYERS)
+            .map(|l| QuantizedMatrixI8::from_f32(&b_opt_fg[l * ffn_d * d..(l + 1) * ffn_d * d], ffn_d, d))
+            .collect();
+        let opt_fu = (0..OPTIC_LAYERS)
+            .map(|l| QuantizedMatrixI8::from_f32(&b_opt_fu[l * ffn_d * d..(l + 1) * ffn_d * d], ffn_d, d))
+            .collect();
+        let opt_fd = (0..OPTIC_LAYERS)
+            .map(|l| QuantizedMatrixI8::from_f32(&b_opt_fd[l * d * ffn_d..(l + 1) * d * ffn_d], d, ffn_d))
+            .collect();
+        Self {
+            gnn_w,
+            retro_w,
+            opt_q,
+            opt_k,
+            opt_v,
+            opt_o,
+            opt_fg,
+            opt_fu,
+            opt_fd,
+            int_q: QuantizedMatrixI8::from_f32(b_int_q, d, d),
+            int_k: QuantizedMatrixI8::from_f32(b_int_k, d, d),
+            int_v: QuantizedMatrixI8::from_f32(b_int_v, d, d),
+            int_o: QuantizedMatrixI8::from_f32(b_int_o, d, d),
+            rc_mix1: QuantizedMatrixI8::from_f32(b_rc_mix1, d, d),
+            rc_mix2: QuantizedMatrixI8::from_f32(b_rc_mix2, d, d),
+            broad_to_sq: QuantizedMatrixI8::from_f32(b_broad_to_sq, d, d),
+            sq_upd: QuantizedMatrixI8::from_f32(b_sq_upd, d, d),
+            wm_w1: QuantizedMatrixI8::from_f32(b_wm_w1, d + cx, d + 2 * cx),
+            wm_w2: QuantizedMatrixI8::from_f32(b_wm_w2, d + cx, d + cx),
+        }
+    }
+}
+
 /// All static (frozen after TPU training) weights of Stream A + Stream B.
 #[derive(Clone, Debug)]
 pub struct SaccadionWeights {
@@ -195,6 +324,19 @@ pub struct SaccadionWeights {
     pub a_gf_w: Vec<f32>,            // [num_phase_stacks * ab_dim]
     pub a_gf_b: Vec<f32>,            // [num_phase_stacks]
 
+    // ==================== SACCADION-8 RETROGRADE FISCHER-GRAPH + 2-PLY MINIMAX WM ====================
+    /// FC2 Retrograde Target-Square Goal Saliency predictor: predicts which squares v are future goals!
+    pub b_retro_goal_w: Vec<f32>,    // [stream_b_dim]
+    pub b_retro_goal_b: f32,
+    /// Backward Reverse-Edge (A^T) 6-Channel X-Ray Goal-Backpropagation GNN:
+    pub b_retro_ln_g: Vec<f32>,      // [stream_b_dim]
+    pub b_retro_ln_b: Vec<f32>,      // [stream_b_dim]
+    pub b_retro_w: Vec<f32>,         // [GRAPH_EDGE_TYPES * stream_b_dim * stream_b_dim]
+    /// 2-Ply Counterfactual Latent Minimax Opponent Refutation predictor:
+    /// Predicts opponent's sharpest counter-action embedding from post-move latent z_1!
+    pub b_wm_opp_w: Vec<f32>,        // [cx_dim * (stream_b_dim + cx_dim)]
+    pub b_wm_opp_b: Vec<f32>,        // [cx_dim]
+
     // ==================== DERIVED RUNTIME AVX2 INT16/INT8 CACHE (NOT ON DISK) ====================
     /// Pre-quantized INT16 feature transformer & INT8 MBON weights for blazing AVX2 neural QSearch.
     pub a_ft_weight_i16: Vec<i16>,
@@ -203,6 +345,8 @@ pub struct SaccadionWeights {
     pub a_mbon_ipsi_scale: Vec<f32>,
     pub a_mbon_contra_i8: Vec<i8>,
     pub a_mbon_contra_scale: Vec<f32>,
+    /// Pre-quantized per-row INT8 cache for blazing L2-resident Stream B AVX2 matvecs.
+    pub sb_i8: StreamBQuantCache,
 }
 
 fn rand_uniform_scaled(rng: &mut u64, scale: f32) -> f32 {
@@ -289,6 +433,37 @@ impl SaccadionWeights {
         let a_smp_w = alloc_init(stacks * 3 * smp_in, (1.0 / smp_in as f32).sqrt() * 0.3, &mut rng);
         let a_smp_b = vec![0.0; stacks * 3];
 
+        let b_int_q = alloc_init(d * d, s_d, &mut rng);
+        let b_int_k = alloc_init(d * d, s_d, &mut rng);
+        let b_int_v = alloc_init(d * d, s_d, &mut rng);
+        let b_int_o = alloc_init(d * d, s_d, &mut rng);
+        let b_rc_mix1 = alloc_init(d * d, s_d, &mut rng);
+        let b_rc_mix2 = alloc_init(d * d, s_d, &mut rng);
+        let b_broad_to_sq = alloc_init(d * d, s_d, &mut rng);
+        let b_sq_upd = alloc_init(d * d, s_d, &mut rng);
+        let b_opt_q = alloc_init(OPTIC_LAYERS * d * d, s_d, &mut rng);
+        let b_opt_k = alloc_init(OPTIC_LAYERS * d * d, s_d, &mut rng);
+        let b_opt_v = alloc_init(OPTIC_LAYERS * d * d, s_d, &mut rng);
+        let b_opt_o = alloc_init(OPTIC_LAYERS * d * d, s_d * 0.5, &mut rng);
+        let b_opt_fg = alloc_init(OPTIC_LAYERS * (2 * d) * d, s_d, &mut rng);
+        let b_opt_fu = alloc_init(OPTIC_LAYERS * (2 * d) * d, s_d, &mut rng);
+        let b_opt_fd = alloc_init(OPTIC_LAYERS * d * (2 * d), s_d * 0.5, &mut rng);
+        let b_gnn_w = alloc_init(GRAPH_EDGE_TYPES * d * d, s_d * 0.5, &mut rng);
+        let b_wm_w1 = alloc_init((d + cx) * (d + 2 * cx), s_d, &mut rng);
+        let b_wm_w2 = alloc_init((d + cx) * (d + cx), s_d * 0.5, &mut rng);
+        let b_retro_goal_w = alloc_init(d, s_d, &mut rng);
+        let b_retro_goal_b = 0.0f32;
+        let b_retro_ln_g = vec![1.0; d];
+        let b_retro_ln_b = vec![0.0; d];
+        let b_retro_w = alloc_init(GRAPH_EDGE_TYPES * d * d, s_d * 0.5, &mut rng);
+        let b_wm_opp_w = alloc_init(cx * (d + cx), s_d * 0.5, &mut rng);
+        let b_wm_opp_b = vec![0.0; cx];
+        let sb_i8 = StreamBQuantCache::build(
+            d, cx, &b_gnn_w, &b_retro_w, &b_opt_q, &b_opt_k, &b_opt_v, &b_opt_o,
+            &b_opt_fg, &b_opt_fu, &b_opt_fd, &b_int_q, &b_int_k, &b_int_v, &b_int_o,
+            &b_rc_mix1, &b_rc_mix2, &b_broad_to_sq, &b_sq_upd, &b_wm_w1, &b_wm_w2,
+        );
+
         Self {
             flyhash_claws,
             a_ft_weight,
@@ -314,12 +489,12 @@ impl SaccadionWeights {
             b_optic_b: vec![0.0; d],
 
             b_hub_init: alloc_init((cfg.num_integrators + cfg.num_broadcasters) * d, s_d, &mut rng),
-            b_int_q: alloc_init(d * d, s_d, &mut rng),
-            b_int_k: alloc_init(d * d, s_d, &mut rng),
-            b_int_v: alloc_init(d * d, s_d, &mut rng),
-            b_int_o: alloc_init(d * d, s_d, &mut rng),
-            b_rc_mix1: alloc_init(d * d, s_d, &mut rng),
-            b_rc_mix2: alloc_init(d * d, s_d, &mut rng),
+            b_int_q,
+            b_int_k,
+            b_int_v,
+            b_int_o,
+            b_rc_mix1,
+            b_rc_mix2,
             b_rc_ln_g: vec![1.0; d],
             b_rc_ln_b: vec![0.0; d],
 
@@ -333,8 +508,8 @@ impl SaccadionWeights {
 
             b_cent_w: alloc_init(64 * d, s_d, &mut rng),
             b_cent_b: vec![0.5; 64],
-            b_broad_to_sq: alloc_init(d * d, s_d, &mut rng),
-            b_sq_upd: alloc_init(d * d, s_d, &mut rng),
+            b_broad_to_sq,
+            b_sq_upd,
             b_sq_ln_g: vec![1.0; d],
             b_sq_ln_b: vec![0.0; d],
 
@@ -356,16 +531,16 @@ impl SaccadionWeights {
             b_seed_to_cent: alloc_init(cfg.acc_dim * cfg.seed_rank, 0.1, &mut rng),
             b_opt_ln1_g: vec![1.0; OPTIC_LAYERS * d],
             b_opt_ln1_b: vec![0.0; OPTIC_LAYERS * d],
-            b_opt_q: alloc_init(OPTIC_LAYERS * d * d, s_d, &mut rng),
-            b_opt_k: alloc_init(OPTIC_LAYERS * d * d, s_d, &mut rng),
-            b_opt_v: alloc_init(OPTIC_LAYERS * d * d, s_d, &mut rng),
-            b_opt_o: alloc_init(OPTIC_LAYERS * d * d, s_d * 0.5, &mut rng),
+            b_opt_q,
+            b_opt_k,
+            b_opt_v,
+            b_opt_o,
             b_opt_rel: vec![0.0; OPTIC_LAYERS * 4 * 64 * 64],
             b_opt_ln2_g: vec![1.0; OPTIC_LAYERS * d],
             b_opt_ln2_b: vec![0.0; OPTIC_LAYERS * d],
-            b_opt_fg: alloc_init(OPTIC_LAYERS * (2 * d) * d, s_d, &mut rng),
-            b_opt_fu: alloc_init(OPTIC_LAYERS * (2 * d) * d, s_d, &mut rng),
-            b_opt_fd: alloc_init(OPTIC_LAYERS * d * (2 * d), s_d * 0.5, &mut rng),
+            b_opt_fg,
+            b_opt_fu,
+            b_opt_fd,
             a_plastic_to_mbon: alloc_init(mbon * PLASTIC_RANK, 0.15, &mut rng),
             b_ama_u: alloc_init(OPTIC_LAYERS * (4 * AMACRINE_RANK) * d, s_d * 0.5, &mut rng),
             b_ama_v: alloc_init(OPTIC_LAYERS * (4 * AMACRINE_RANK) * d, s_d * 0.5, &mut rng),
@@ -375,18 +550,26 @@ impl SaccadionWeights {
             b_fc2_conj: alloc_init(cx * (2 * cx), s_cx * 0.5, &mut rng),
             b_gnn_ln_g: vec![1.0; d],
             b_gnn_ln_b: vec![0.0; d],
-            b_gnn_w: alloc_init(GRAPH_EDGE_TYPES * d * d, s_d * 0.5, &mut rng),
-            b_wm_w1: alloc_init((d + cx) * (d + 2 * cx), s_d, &mut rng),
+            b_gnn_w,
+            b_wm_w1,
             b_wm_b1: vec![0.0; d + cx],
-            b_wm_w2: alloc_init((d + cx) * (d + cx), s_d * 0.5, &mut rng),
+            b_wm_w2,
             a_gf_w: alloc_init(stacks * ab_dim, (1.0 / ab_dim as f32).sqrt() * 0.1, &mut rng),
             a_gf_b: vec![0.0; stacks],
+            b_retro_goal_w,
+            b_retro_goal_b,
+            b_retro_ln_g,
+            b_retro_ln_b,
+            b_retro_w,
+            b_wm_opp_w,
+            b_wm_opp_b,
             a_ft_weight_i16,
             a_ft_bias_i16,
             a_mbon_ipsi_i8,
             a_mbon_ipsi_scale,
             a_mbon_contra_i8,
             a_mbon_contra_scale,
+            sb_i8,
             cfg,
         }
     }
@@ -475,7 +658,14 @@ impl SaccadionWeights {
             + self.b_wm_b1.len()
             + self.b_wm_w2.len()
             + self.a_gf_w.len()
-            + self.a_gf_b.len();
+            + self.a_gf_b.len()
+            + self.b_retro_goal_w.len()
+            + 1
+            + self.b_retro_ln_g.len()
+            + self.b_retro_ln_b.len()
+            + self.b_retro_w.len()
+            + self.b_wm_opp_w.len()
+            + self.b_wm_opp_b.len();
         (sparse, dense)
     }
 
@@ -603,6 +793,13 @@ impl SaccadionWeights {
         write_slice(&mut w, &self.b_wm_w2)?;
         write_slice(&mut w, &self.a_gf_w)?;
         write_slice(&mut w, &self.a_gf_b)?;
+        write_slice(&mut w, &self.b_retro_goal_w)?;
+        write_slice(&mut w, &[self.b_retro_goal_b])?;
+        write_slice(&mut w, &self.b_retro_ln_g)?;
+        write_slice(&mut w, &self.b_retro_ln_b)?;
+        write_slice(&mut w, &self.b_retro_w)?;
+        write_slice(&mut w, &self.b_wm_opp_w)?;
+        write_slice(&mut w, &self.b_wm_opp_b)?;
 
         w.flush()
     }
@@ -780,10 +977,19 @@ impl SaccadionWeights {
             };
 
         let (b_gnn_ln_g, b_gnn_ln_b, b_gnn_w, b_wm_w1, b_wm_b1, b_wm_w2) = if ver >= 6 {
+            let g_ln_g = read_vec(&mut r, d)?;
+            let g_ln_b = read_vec(&mut r, d)?;
+            let g_w = if ver >= 8 {
+                read_vec(&mut r, GRAPH_EDGE_TYPES * d * d)?
+            } else {
+                let mut w4 = read_vec(&mut r, 4 * d * d)?;
+                w4.resize(GRAPH_EDGE_TYPES * d * d, 0.0);
+                w4
+            };
             (
-                read_vec(&mut r, d)?,
-                read_vec(&mut r, d)?,
-                read_vec(&mut r, GRAPH_EDGE_TYPES * d * d)?,
+                g_ln_g,
+                g_ln_b,
+                g_w,
                 read_vec(&mut r, (d + cx) * (d + 2 * cx))?,
                 read_vec(&mut r, d + cx)?,
                 read_vec(&mut r, (d + cx) * (d + cx))?,
@@ -805,10 +1011,45 @@ impl SaccadionWeights {
             (vec![0.0; stacks * ab_dim], vec![0.0; stacks])
         };
 
+        let (
+            b_retro_goal_w,
+            b_retro_goal_b,
+            b_retro_ln_g,
+            b_retro_ln_b,
+            b_retro_w,
+            b_wm_opp_w,
+            b_wm_opp_b,
+        ) = if ver >= 8 {
+            (
+                read_vec(&mut r, d)?,
+                read_vec(&mut r, 1)?[0],
+                read_vec(&mut r, d)?,
+                read_vec(&mut r, d)?,
+                read_vec(&mut r, GRAPH_EDGE_TYPES * d * d)?,
+                read_vec(&mut r, cx * (d + cx))?,
+                read_vec(&mut r, cx)?,
+            )
+        } else {
+            (
+                vec![0.0; d],
+                0.0,
+                vec![1.0; d],
+                vec![0.0; d],
+                vec![0.0; GRAPH_EDGE_TYPES * d * d],
+                vec![0.0; cx * (d + cx)],
+                vec![0.0; cx],
+            )
+        };
+
         let a_ft_weight_i16 = quantize_to_i16(&a_ft_weight);
         let a_ft_bias_i16 = quantize_to_i16(&a_ft_bias);
         let (a_mbon_ipsi_i8, a_mbon_ipsi_scale) = quantize_stacks_to_i8(&a_mbon_ipsi, stacks);
         let (a_mbon_contra_i8, a_mbon_contra_scale) = quantize_stacks_to_i8(&a_mbon_contra, stacks);
+        let sb_i8 = StreamBQuantCache::build(
+            d, cx, &b_gnn_w, &b_retro_w, &b_opt_q, &b_opt_k, &b_opt_v, &b_opt_o,
+            &b_opt_fg, &b_opt_fu, &b_opt_fd, &b_int_q, &b_int_k, &b_int_v, &b_int_o,
+            &b_rc_mix1, &b_rc_mix2, &b_broad_to_sq, &b_sq_upd, &b_wm_w1, &b_wm_w2,
+        );
 
         Ok(Self {
             cfg,
@@ -898,12 +1139,20 @@ impl SaccadionWeights {
             b_wm_w2,
             a_gf_w,
             a_gf_b,
+            b_retro_goal_w,
+            b_retro_goal_b,
+            b_retro_ln_g,
+            b_retro_ln_b,
+            b_retro_w,
+            b_wm_opp_w,
+            b_wm_opp_b,
             a_ft_weight_i16,
             a_ft_bias_i16,
             a_mbon_ipsi_i8,
             a_mbon_ipsi_scale,
             a_mbon_contra_i8,
             a_mbon_contra_scale,
+            sb_i8,
         })
     }
 }

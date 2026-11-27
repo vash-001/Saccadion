@@ -30,9 +30,9 @@ from pathlib import Path
 REPO_URL = "https://github.com/vash-001/Saccadion.git"
 MODEL_TIER = "pro"           # "tiny" (smoke test) | "nano" (fast ablation) | "pro" (full 58MB)
 DATA_SOURCE = "auto"         # "auto" (75% Fishtest + 25% Lichess 2000+ [%eval] + Diverse Puzzles + Survival)
-MAX_GAMES = 24000            # ~2.4M high-Elo positions (18k Fishtest 3600+ + 6k Lichess 2000+ [%eval] + Puzzles + Contrastive!)
+MAX_GAMES = 14000            # Compact high-concept dataset (~1.5M pos + 45k Causal Puzzles + 100k Blunder/Looming — ZERO 15M bloat!)
 MAX_CAUSAL_PUZZLES = 45000   # Balanced across ALL 16 diverse causal/tactical/endgame concepts!
-EPOCHS = 20                  # Saccadion-7 Neuro-Apex (Dendritic GF + FlyWire GNN + 3500-PVS + Quiet Masking)
+EPOCHS = 20                  # Saccadion-8 Retrograde Fischer-Graph (6ch X-Ray + Backward A^T + 2-Ply Minimax WM + INT8)
 BATCH_SIZE = 512             # Optimal for PRO on TPU v5e-1
 LR_MUON = 3.5e-3             # Calibrated Muon peak LR
 LR_ADAMW = 5.0e-4            # Calibrated AdamW peak LR
@@ -120,9 +120,9 @@ def main() -> None:
     # 3. Install lightweight Python packages
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "optax", "python-chess", "zstandard", "matplotlib"])
 
-    # 4. Build or restore Pure-Rust tools (v13 = Saccadion-7 Apex + FastCache v7 INT8 + 3500-PVS!)
+    # 4. Build or restore Pure-Rust tools (v14 = Saccadion-8 Retrograde Fischer-Graph + INT8 Stream B + Depth-30 Laser!)
     if in_colab and BUILD_RUST_TOOLS:
-        _ensure_rust_binaries(work_root, persist_root / "bin_v13")
+        _ensure_rust_binaries(work_root, persist_root / "bin_v14")
 
     # 5. Purge any stale in-memory `saccadion_tpu.*` submodules before importing!
     train_pkg_root = str(work_root / "training")
@@ -144,8 +144,8 @@ def main() -> None:
 
     print("JAX version:", jax.__version__, "| Devices:", jax.devices())
 
-    # 6. Download & organize compact diverse chess dataset (92/8 clean evals + 16-theme balanced puzzles + survival)
-    data_dir = persist_root / "data_v7_apex"
+    # 6. Download & organize compact diverse chess dataset (NO 15M Stockfish bloat — concept-rich + puzzles + contrastive!)
+    data_dir = persist_root / "data_v8_retro"
     shard_dir = data_dir / "shards"
     if not list(shard_dir.glob("train_random_*.sacc")):
         shard_dir = fetch_and_prepare(
@@ -174,8 +174,8 @@ def main() -> None:
         "pro": SaccadionConfig.pro,
     }[MODEL_TIER]()
 
-    ckpt_dir = persist_root / f"checkpoints_{MODEL_TIER}_v7_apex"
-    export_dir = persist_root / f"exports_{MODEL_TIER}_v7_apex"
+    ckpt_dir = persist_root / f"checkpoints_{MODEL_TIER}_v8_retro"
+    export_dir = persist_root / f"exports_{MODEL_TIER}_v8_retro"
     fast_cache = Path("/content/sacc_cache") if in_colab else (data_dir / "cache")
 
     _, history = train_saccadion_smart(

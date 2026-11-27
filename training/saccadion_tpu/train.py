@@ -60,7 +60,7 @@ from .model import (
     forward_stream_b,
     init_saccadion_params,
     meta_dopamine_trajectory_scan,
-    predict_action_world_model,
+    predict_minimax_world_model,
 )
 
 
@@ -256,7 +256,7 @@ def build_freeze_thaw_schedule(
             s = m_da
         elif k.startswith("b_wm_"):
             s = m_wm
-        elif k.startswith(("b_shunt", "b_lc", "b_optic", "b_opt_", "b_ama_", "b_gnn_")):
+        elif k.startswith(("b_shunt", "b_lc", "b_optic", "b_opt_", "b_ama_", "b_gnn_", "b_retro_")):
             s = m_optic
         elif k.startswith("a_"):
             s = max(m_gf, 0.35)
@@ -372,7 +372,7 @@ def _save_metrics_and_dashboard(history: List[Dict[str, Any]], ckpt_dir: Path) -
 
         epochs = [r.get("epoch", i + 1) for i, r in enumerate(history)]
         fig, axes = plt.subplots(2, 3, figsize=(16, 9))
-        fig.suptitle("Saccadion-7 NEURO-APEX (Dendritic-GF+FlyWire-GNN+WorldModel) TPU Telemetry", fontsize=14, fontweight="bold")
+        fig.suptitle("Saccadion-8 RETROGRADE FISCHER-GRAPH (6ch-XRay+A^T+2Ply-WM+INT8) TPU Telemetry", fontsize=14, fontweight="bold")
 
         # Panel 1: Total Train vs Val Loss
         ax = axes[0, 0]
@@ -480,9 +480,9 @@ def _print_epoch_banner(row: Dict[str, Any], is_best: bool) -> None:
         f"Policy={row['val_policy']:.4f} | Press(10-20ply)={row['val_pressure']:.4f} | LH={row['val_lh']:.4f}"
     )
     print(
-        f"  CAUSAL  : 16-Concept F1={row['val_causal_f1']*100:5.1f}% | BlunderAvoid={row.get('blunder_avoid_pct', 0.0):5.1f}% | "
-        f"WM-Collapse={row.get('wm_blunder_pct', 0.0):5.1f}% | Brilliant!! Top3={row.get('bril_top3_pct', 0.0):5.1f}% | "
-        f"NoduliGap={row['val_noduli_margin']:+.3f} | Imb={row.get('val_imbalance', 0.0):.4f}"
+        f"  CAUSAL  : 16-Concept F1={row['val_causal_f1']*100:5.1f}% | RetroGoal@8={row.get('val_retro_recall', 0.0)*100:5.1f}% | "
+        f"BlunderAvoid={row.get('blunder_avoid_pct', 0.0):5.1f}% | WM-Collapse={row.get('wm_blunder_pct', 0.0):5.1f}% | "
+        f"Brilliant!! Top3={row.get('bril_top3_pct', 0.0):5.1f}% | NoduliGap={row['val_noduli_margin']:+.3f}"
     )
     print(
         f"  CHESS   : Move Top-1={row['val_top1_acc']:5.2f}% | Move Top-3={row['val_top3_acc']:5.2f}% | "
@@ -563,7 +563,7 @@ def train_saccadion_smart(
     total_steps = steps_per_epoch * epochs
     dev_label = f"{n_dev}x {jax.devices()[0].platform.upper()}"
 
-    print(f"=== SACCADION-7 NEURO-APEX (DENDRITIC-GF+FLYWIRE-GNN+3500-PVS) SMART TPU TRAINER ===")
+    print(f"=== SACCADION-8 RETROGRADE FISCHER-GRAPH (6CH-XRAY+A^T+2PLY-WM+INT8) SMART TPU TRAINER ===")
     print(f"Devices      : {dev_label} (pmap={use_pmap})")
     print(f"Model Tier   : tier_id={cfg.tier_id} (acc_dim={cfg.acc_dim}, D={cfg.stream_b_dim}, CX={cfg.cx_dim}, T_max={cfg.cx_max_ticks})")
     print(f"Dataset      : train={len(train_ds):,} pos | val={len(val_ds):,} pos | traj={len(traj_ds)//12:,} windows")
@@ -795,8 +795,8 @@ def train_saccadion_smart(
                 num_ticks=2, sez_cp=out_a4["sez_cp"],
                 graph_adj_u32=gadj_t[:, 4] if gadj_t is not None else None, qat=False,
             )
-            pred_z2 = predict_action_world_model(cur_p, out_b0, tbatch["top4_moves"][:, 0, 0])
-            pred_z4 = predict_action_world_model(cur_p, out_b2, tbatch["top4_moves"][:, 2, 0])
+            _, pred_z2 = predict_minimax_world_model(cur_p, out_b0, tbatch["top4_moves"][:, 0, 0])
+            _, pred_z4 = predict_minimax_world_model(cur_p, out_b2, tbatch["top4_moves"][:, 2, 0])
             loss_jepa = 0.5 * (
                 jepa_vicreg_loss(pred_z2, out_b2["global_latent"])
                 + jepa_vicreg_loss(pred_z4, out_b4["global_latent"])
@@ -921,6 +921,7 @@ def train_saccadion_smart(
                         "blunder_seen": int(ep_blunder_cnt),
                         "bril_seen": int(ep_bril_cnt),
                         "gf_quiet_mae_live": _sc("gf_quiet_mae"),
+                        "retro_goal_recall": _sc("retro_goal_recall") * 100.0,
                         "best_val_loss": best_val_loss if best_val_loss < 1e8 else None,
                     }
                     hud.update(
@@ -977,7 +978,7 @@ def train_saccadion_smart(
 
             val_keys = [
                 "total", "wdl_b", "wdl_a", "gf_loss", "gf_quiet_mae", "policy", "pressure", "lh", "orth",
-                "noduli", "noduli_margin", "causal", "causal_f1", "vnc2", "imbalance",
+                "noduli", "noduli_margin", "causal", "causal_f1", "vnc2", "imbalance", "retro_goal_recall",
                 "active_kc_ratio", "top1_acc", "top3_acc", "wdl_acc", "cp_mae",
                 "shunt_gain", "lob_focus", "mbon_ei_ratio", "lh_veto_mean",
                 "rc_hub_norm", "cx_phasor_norm", "cent_focus", "plan_entropy", "pfl2_mean",
@@ -1080,6 +1081,7 @@ def train_saccadion_smart(
                 "val_causal_f1": v_mean["causal_f1"],
                 "val_vnc2": v_mean["vnc2"],
                 "val_imbalance": v_mean["imbalance"],
+                "val_retro_recall": v_mean["retro_goal_recall"],
                 "blunder_avoid_pct": blunder_avoid_pct,
                 "wm_blunder_pct": wm_blunder_pct,
                 "bril_top1_pct": bril_top1_pct,
@@ -1150,6 +1152,7 @@ def train_saccadion_smart(
                     "blunder_seen": int(ep_blunder_cnt),
                     "bril_seen": int(ep_bril_cnt),
                     "gf_quiet_mae_live": v_mean["gf_quiet_mae"],
+                    "retro_goal_recall": v_mean["retro_goal_recall"] * 100.0,
                     "used_ema": used_ema,
                     "best_val_loss": best_val_loss,
                 },

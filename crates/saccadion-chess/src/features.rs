@@ -211,14 +211,16 @@ fn piece_attacks_from(pos: &Position, c: Color, p: Piece, sq: Square, occ: Bitbo
     }
 }
 
-/// Extracts the exact 4-channel FlyWire Typed Directed Chess-Graph Adjacency Matrix (STM-oriented):
-/// - Channel 0: STM Attack Edge (STM piece u -> empty or enemy square v)  [+ACh Excitatory]
-/// - Channel 1: STM Defend Edge (STM piece u -> own STM piece v)          [+ACh Excitatory]
-/// - Channel 2: Opp Attack Edge (Opp piece u -> empty or STM square v)    [-GABA Inhibitory]
-/// - Channel 3: Opp Defend Edge (Opp piece u -> own Opp piece v)          [-GABA Inhibitory]
+/// Extracts the exact 6-channel FlyWire Bi-Directional X-Ray Chess-Graph Adjacency Matrix (STM-oriented):
+/// - Channel 0: STM Attack Edge (STM piece u -> empty or enemy square v)                [+ACh Excitatory]
+/// - Channel 1: STM Defend Edge (STM piece u -> own STM piece v)                        [+ACh Excitatory]
+/// - Channel 2: Opp Attack Edge (Opp piece u -> empty or STM square v)                  [-GABA Inhibitory]
+/// - Channel 3: Opp Defend Edge (Opp piece u -> own Opp piece v)                        [-GABA Inhibitory]
+/// - Channel 4: STM X-Ray Through-Blocker (STM slider u --[1st blocker]--> square v)    [+ACh X-Ray]
+/// - Channel 5: Opp X-Ray Through-Blocker (Opp slider u --[1st blocker]--> square v)    [-GABA X-Ray]
 /// Each entry `adj[k][rel_u]` is a 64-bit bitmask of destination squares `rel_v` in STM orientation.
-pub fn extract_chess_graph_adj(pos: &Position) -> [[u64; 64]; 4] {
-    let mut adj = [[0u64; 64]; 4];
+pub fn extract_chess_graph_adj(pos: &Position) -> [[u64; 64]; 6] {
+    let mut adj = [[0u64; 64]; 6];
     let stm = pos.side_to_move;
     let opp = stm.flip();
     let all_occ = pos.all_occ;
@@ -234,17 +236,28 @@ pub fn extract_chess_graph_adj(pos: &Position) -> [[u64; 64]; 4] {
     };
 
     for p in Piece::ALL {
+        let is_slider = matches!(p, Piece::Bishop | Piece::Rook | Piece::Queen);
         for u in pos.piece_bb(stm, p) {
             let atks = piece_attacks_from(pos, stm, p, u, all_occ);
             let rel_u = u.relative_to(stm).index();
             adj[0][rel_u] = orient_bb(atks & !stm_occ);
             adj[1][rel_u] = orient_bb(atks & stm_occ);
+            if is_slider {
+                let occ_no_block = all_occ & !atks;
+                let xray = piece_attacks_from(pos, stm, p, u, occ_no_block) & !atks;
+                adj[4][rel_u] = orient_bb(xray);
+            }
         }
         for u in pos.piece_bb(opp, p) {
             let atks = piece_attacks_from(pos, opp, p, u, all_occ);
             let rel_u = u.relative_to(stm).index();
             adj[2][rel_u] = orient_bb(atks & !opp_occ);
             adj[3][rel_u] = orient_bb(atks & opp_occ);
+            if is_slider {
+                let occ_no_block = all_occ & !atks;
+                let xray = piece_attacks_from(pos, opp, p, u, occ_no_block) & !atks;
+                adj[5][rel_u] = orient_bb(xray);
+            }
         }
     }
     adj

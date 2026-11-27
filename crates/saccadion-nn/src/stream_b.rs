@@ -11,13 +11,21 @@
 
 use crate::config::{AMACRINE_RANK, GRAPH_EDGE_TYPES, OPTIC_LAYERS};
 use crate::plasticity::DopaminePlasticityState;
-use crate::simd::{add_inplace_f32, axpy_f32, dot_f32, layer_norm, matvec_f32, sigmoid, silu, softmax_inplace, softplus};
+use crate::simd::{
+    add_inplace_f32, axpy_f32, dot_f32, layer_norm, matvec_f32, matvec_i8_f32, sigmoid, silu,
+    softmax_inplace, softplus,
+};
 use crate::stream_a::wdl_to_cp;
-use crate::weights::SaccadionWeights;
+use crate::weights::{QuantizedMatrixI8, SaccadionWeights};
 use saccadion_chess::features::{extract_chess_graph_adj, extract_stream_b_board};
 use saccadion_chess::position::Position;
 use saccadion_chess::types::{Move, MoveList};
 use saccadion_chess::Bitboard;
+
+/// Dale's-Law edge polarity & X-Ray attenuation across all 6 directed chess-graph channels:
+/// 0: STM Atk (+1.0), 1: STM Def (+1.0), 2: Opp Atk (-1.0), 3: Opp Def (-1.0),
+/// 4: STM X-Ray Through-Blocker (+0.7), 5: Opp X-Ray Through-Blocker (-0.7).
+const GRAPH_EDGE_SIGNS: [f32; GRAPH_EDGE_TYPES] = [1.0, 1.0, -1.0, -1.0, 0.7, -0.7];
 
 /// Scored move returned by PFL3 99%-contralateral goal-vector steering + Noduli expectation.
 #[derive(Copy, Clone, Debug)]
@@ -52,6 +60,8 @@ pub struct StreamBOutput {
     pub centrifugal_kc_mask: Vec<f32>,
     /// 64-square top-down Visual Centrifugal attention weights (for diagnostics).
     pub centrifugal_board_mask: [f32; 64],
+    /// 64-square FC2 Retrograde Target-Square Goal Saliency (STM-oriented, in [0, 1]).
+    pub retro_goal_saliency: [f32; 64],
 }
 
 #[inline(always)]
@@ -59,10 +69,33 @@ fn matvec(w: &[f32], x: &[f32], rows: usize, cols: usize, out: &mut [f32]) {
     matvec_f32(w, x, rows, cols, out);
 }
 
-/// FlyWire Dale's-Law Typed Directed Chess-Graph Message Passing (GNN) over live piece edges:
-/// Propagates signed synaptic messages along STM Attack (+E), STM Defend (+E),
-/// Opp Attack (-I), and Opp Defend (-I) edges directly across the 64-square chess graph!
-fn apply_flywire_gnn_hop(sq_state: &mut [f32], graph_adj: &[[u64; 64]; 4], w: &SaccadionWeights, d: usize) {
+#[inline(always)]
+fn matvec_opt(
+    w_f32: &[f32],
+    w_q: &QuantizedMatrixI8,
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    use_i8: bool,
+) {
+    if use_i8 {
+        matvec_i8_f32(&w_q.data, &w_q.scales, x, rows, cols, out);
+    } else {
+        matvec_f32(w_f32, x, rows, cols, out);
+    }
+}
+
+/// FlyWire Dale's-Law 6-Channel Forward Chess-Graph GNN (A: u -> v):
+/// Propagates signed synaptic messages along STM Atk/Def (+E), Opp Atk/Def (-I),
+/// and STM/Opp X-Ray Through-Blocker (+/-0.7) edges across all 64 squares!
+fn apply_flywire_gnn_hop(
+    sq_state: &mut [f32],
+    graph_adj: &[[u64; 64]; GRAPH_EDGE_TYPES],
+    w: &SaccadionWeights,
+    d: usize,
+    use_i8: bool,
+) {
     let mut x_g = vec![0.0f32; 64 * d];
     for sq in 0..64 {
         layer_norm(
@@ -94,7 +127,8 @@ fn apply_flywire_gnn_hop(sq_state: &mut [f32], graph_adj: &[[u64; 64]; 4], w: &S
             }
         }
         let wk = &w.b_gnn_w[k * d * d..(k + 1) * d * d];
-        let sign = if k < 2 { 1.0f32 } else { -1.0f32 }; // Dale's Law: +ACh (STM) vs -GABA (Opp)
+        let wq = &w.sb_i8.gnn_w[k];
+        let sign = GRAPH_EDGE_SIGNS[k];
         for v in 0..64 {
             if in_deg[v] == 0.0 {
                 continue;
@@ -104,7 +138,7 @@ fn apply_flywire_gnn_hop(sq_state: &mut [f32], graph_adj: &[[u64; 64]; 4], w: &S
             for j in 0..d {
                 av[j] *= inv;
             }
-            matvec(wk, av, d, d, &mut proj);
+            matvec_opt(wk, wq, av, d, d, &mut proj, use_i8);
             let dst = &mut signed_sum[v * d..(v + 1) * d];
             axpy_f32(dst, &proj, sign);
         }
@@ -115,11 +149,65 @@ fn apply_flywire_gnn_hop(sq_state: &mut [f32], graph_adj: &[[u64; 64]; 4], w: &S
     }
 }
 
-/// Runs the complete Stream B Deep Strategic Brain on `pos` with legal moves `legal_moves`.
-///
-/// `mbon_summary` is the 32-dim Push-Pull MBON signal from Stream A (feeding CX Ring/Tangential).
-/// `sez_cp` is the SEZ innate survival valence in centipawns fused cleanly into deep strategic value.
-/// `serotonin` in [0.5, 1.5] modulates hDelta 180-deg prophylaxis weight & strategic persistence.
+/// Saccadion-8 Retrograde Fischer-Graph Backward Goal-Backpropagation GNN (A^T: u <- v):
+/// Weights every destination square v by its FC2 target-goal saliency `(0.25 + goal_sq[v])`
+/// and propagates credit BACKWARD along all 6 Attack/Defense/X-Ray channels into enabling
+/// source squares u so quiet preparatory moves inherit future tactical & positional goals!
+fn apply_retrograde_gnn_hop(
+    sq_state: &mut [f32],
+    graph_adj: &[[u64; 64]; GRAPH_EDGE_TYPES],
+    goal_sq: &[f32; 64],
+    w: &SaccadionWeights,
+    d: usize,
+    use_i8: bool,
+) {
+    let mut x_r = vec![0.0f32; 64 * d];
+    for sq in 0..64 {
+        let dst = &mut x_r[sq * d..(sq + 1) * d];
+        layer_norm(
+            &sq_state[sq * d..(sq + 1) * d],
+            &w.b_retro_ln_g,
+            &w.b_retro_ln_b,
+            dst,
+        );
+        let gw = 0.25 + goal_sq[sq];
+        for j in 0..d {
+            dst[j] *= gw;
+        }
+    }
+    let mut agg_u = vec![0.0f32; d];
+    let mut proj = vec![0.0f32; d];
+    let mut signed_sum = vec![0.0f32; 64 * d];
+
+    for k in 0..GRAPH_EDGE_TYPES {
+        let wk = &w.b_retro_w[k * d * d..(k + 1) * d * d];
+        let wq = &w.sb_i8.retro_w[k];
+        let sign = GRAPH_EDGE_SIGNS[k];
+        for u in 0..64 {
+            let mask = graph_adj[k][u];
+            if mask == 0 {
+                continue;
+            }
+            let inv = 1.0 / (mask.count_ones() as f32 + 1.0);
+            agg_u.fill(0.0);
+            for v_sq in Bitboard(mask) {
+                let v = v_sq.index();
+                add_inplace_f32(&mut agg_u, &x_r[v * d..(v + 1) * d]);
+            }
+            for j in 0..d {
+                agg_u[j] *= inv;
+            }
+            matvec_opt(wk, wq, &agg_u, d, d, &mut proj, use_i8);
+            axpy_f32(&mut signed_sum[u * d..(u + 1) * d], &proj, sign);
+        }
+    }
+
+    for i in 0..64 * d {
+        sq_state[i] += silu(signed_sum[i]);
+    }
+}
+
+/// Runs the fast INT8 AVX2 Stream B Deep Strategic Brain on `pos` (used during live search).
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_stream_b(
     pos: &Position,
@@ -131,6 +219,62 @@ pub fn evaluate_stream_b(
     novelty_score: f32,
     serotonin: f32,
     adaptive_halt: bool,
+) -> StreamBOutput {
+    evaluate_stream_b_ex(
+        pos,
+        legal_moves,
+        w,
+        mbon_summary,
+        sez_cp,
+        plasticity,
+        novelty_score,
+        serotonin,
+        adaptive_halt,
+        true,
+    )
+}
+
+/// Exact FP32 reference Stream B evaluation for `< 1e-4` Python <-> Rust parity verification.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_stream_b_fp32(
+    pos: &Position,
+    legal_moves: &MoveList,
+    w: &SaccadionWeights,
+    mbon_summary: &[f32],
+    sez_cp: f32,
+    plasticity: Option<&DopaminePlasticityState>,
+    novelty_score: f32,
+    serotonin: f32,
+    adaptive_halt: bool,
+) -> StreamBOutput {
+    evaluate_stream_b_ex(
+        pos,
+        legal_moves,
+        w,
+        mbon_summary,
+        sez_cp,
+        plasticity,
+        novelty_score,
+        serotonin,
+        adaptive_halt,
+        false,
+    )
+}
+
+/// Internal Stream B Deep Strategic Brain supporting both fast INT8 AVX2 (`use_i8=true`)
+/// and exact FP32 reference (`use_i8=false`).
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_stream_b_ex(
+    pos: &Position,
+    legal_moves: &MoveList,
+    w: &SaccadionWeights,
+    mbon_summary: &[f32],
+    sez_cp: f32,
+    plasticity: Option<&DopaminePlasticityState>,
+    novelty_score: f32,
+    serotonin: f32,
+    adaptive_halt: bool,
+    use_i8: bool,
 ) -> StreamBOutput {
     let cfg = &w.cfg;
     let d = cfg.stream_b_dim;
@@ -165,9 +309,10 @@ pub fn evaluate_stream_b(
         }
     }
 
-    // B1a. FlyWire Typed Directed Chess-Graph GNN (Hop 1: exact 1-hop live attack/defense graph!)
+    // B1a. FlyWire 6-Channel X-Ray Forward Chess-Graph GNN (Hop 1: immediate 1-hop live graph!)
     let graph_adj = extract_chess_graph_adj(pos);
-    apply_flywire_gnn_hop(&mut sq_state, &graph_adj, w, d);
+    apply_flywire_gnn_hop(&mut sq_state, &graph_adj, w, d, use_i8);
+    let mut retro_goal_saliency = [0.5f32; 64];
 
     // -------------------------------------------------------------------------
     // B1b. 3-Layer Untied FlyWire Optic Lobe Stack (Medulla -> Lobula -> Lobula Plate):
@@ -217,9 +362,9 @@ pub fn evaluate_stream_b(
             for j in 0..d {
                 x1_mean[j] += x1_sq[j] * (1.0 / 64.0);
             }
-            matvec(wq, x1_sq, d, d, &mut lob_q[sq * d..(sq + 1) * d]);
-            matvec(wk, x1_sq, d, d, &mut lob_k[sq * d..(sq + 1) * d]);
-            matvec(wv, x1_sq, d, d, &mut lob_v[sq * d..(sq + 1) * d]);
+            matvec_opt(wq, &w.sb_i8.opt_q[l], x1_sq, d, d, &mut lob_q[sq * d..(sq + 1) * d], use_i8);
+            matvec_opt(wk, &w.sb_i8.opt_k[l], x1_sq, d, d, &mut lob_k[sq * d..(sq + 1) * d], use_i8);
+            matvec_opt(wv, &w.sb_i8.opt_v[l], x1_sq, d, d, &mut lob_v[sq * d..(sq + 1) * d], use_i8);
             matvec(w_au, x1_sq, ama_tot, d, &mut ama_u[sq * ama_tot..(sq + 1) * ama_tot]);
             matvec(w_av, x1_sq, ama_tot, d, &mut ama_v[sq * ama_tot..(sq + 1) * ama_tot]);
             for k in 0..ama_tot {
@@ -261,7 +406,7 @@ pub fn evaluate_stream_b(
             }
         }
         for sq in 0..64 {
-            matvec(wo, &lob_ctx[sq * d..(sq + 1) * d], d, d, &mut o_buf);
+            matvec_opt(wo, &w.sb_i8.opt_o[l], &lob_ctx[sq * d..(sq + 1) * d], d, d, &mut o_buf, use_i8);
             let cur = &mut sq_state[sq * d..(sq + 1) * d];
             for j in 0..d {
                 cur[j] += o_buf[j];
@@ -277,20 +422,31 @@ pub fn evaluate_stream_b(
 
         for sq in 0..64 {
             layer_norm(&sq_state[sq * d..(sq + 1) * d], ln2_g, ln2_b, &mut sq_ln);
-            matvec(wfg, &sq_ln, ffn_d, d, &mut ffn_g);
-            matvec(wfu, &sq_ln, ffn_d, d, &mut ffn_u);
+            matvec_opt(wfg, &w.sb_i8.opt_fg[l], &sq_ln, ffn_d, d, &mut ffn_g, use_i8);
+            matvec_opt(wfu, &w.sb_i8.opt_fu[l], &sq_ln, ffn_d, d, &mut ffn_u, use_i8);
             for j in 0..ffn_d {
                 ffn_g[j] = silu(ffn_g[j]) * ffn_u[j];
             }
-            matvec(wfd, &ffn_g, d, ffn_d, &mut o_buf);
+            matvec_opt(wfd, &w.sb_i8.opt_fd[l], &ffn_g, d, ffn_d, &mut o_buf, use_i8);
             let cur = &mut sq_state[sq * d..(sq + 1) * d];
             for j in 0..d {
                 cur[j] += o_buf[j];
             }
         }
-        // Hop 2 after Layer 0: 2-hop transitive battery/pin/overload propagation across chess graph!
+        // Alternating Bi-Directional Fischer-Graph Hops:
+        // - After Layer 0: Forward 2-hop transitive battery/pin/X-ray propagation (A)
+        // - After Layer 1: Predict FC2 Target-Square Goal Saliency + Backward Retrograde Hop 1 (A^T)
+        // - After Layer 2: Backward Retrograde Hop 2 (A^T) -> deep 2-to-4-hop causal credit assignment!
         if l == 0 {
-            apply_flywire_gnn_hop(&mut sq_state, &graph_adj, w, d);
+            apply_flywire_gnn_hop(&mut sq_state, &graph_adj, w, d, use_i8);
+        } else if l == 1 {
+            for sq in 0..64 {
+                let s = &sq_state[sq * d..(sq + 1) * d];
+                retro_goal_saliency[sq] = sigmoid(dot_f32(&w.b_retro_goal_w, s) + w.b_retro_goal_b);
+            }
+            apply_retrograde_gnn_hop(&mut sq_state, &graph_adj, &retro_goal_saliency, w, d, use_i8);
+        } else if l == 2 {
+            apply_retrograde_gnn_hop(&mut sq_state, &graph_adj, &retro_goal_saliency, w, d, use_i8);
         }
     }
 
@@ -332,12 +488,12 @@ pub fn evaluate_stream_b(
         // Step A: Integrators Cross-Attention pulling global board tension from 64 squares
         for sq in 0..64 {
             let s = &sq_state[sq * d..(sq + 1) * d];
-            matvec(&w.b_int_k, s, d, d, &mut sq_k[sq * d..(sq + 1) * d]);
-            matvec(&w.b_int_v, s, d, d, &mut sq_v[sq * d..(sq + 1) * d]);
+            matvec_opt(&w.b_int_k, &w.sb_i8.int_k, s, d, d, &mut sq_k[sq * d..(sq + 1) * d], use_i8);
+            matvec_opt(&w.b_int_v, &w.sb_i8.int_v, s, d, d, &mut sq_v[sq * d..(sq + 1) * d], use_i8);
         }
         for h in 0..n_int {
             let h_slice = &hubs[h * d..(h + 1) * d];
-            matvec(&w.b_int_q, h_slice, d, d, &mut q_buf);
+            matvec_opt(&w.b_int_q, &w.sb_i8.int_q, h_slice, d, d, &mut q_buf, use_i8);
             for sq in 0..64 {
                 attn_scores[sq] = dot_f32(&q_buf, &sq_k[sq * d..(sq + 1) * d]) * inv_sqrt_d;
             }
@@ -350,7 +506,7 @@ pub fn evaluate_stream_b(
                     ctx_buf[j] += a * vs[j];
                 }
             }
-            matvec(&w.b_int_o, &ctx_buf, d, d, &mut o_buf);
+            matvec_opt(&w.b_int_o, &w.sb_i8.int_o, &ctx_buf, d, d, &mut o_buf, use_i8);
             for j in 0..d {
                 hub_tmp[j] = hubs[h * d + j] + o_buf[j];
             }
@@ -370,11 +526,11 @@ pub fn evaluate_stream_b(
             for j in 0..d {
                 ctx_buf[j] = 0.5 * hubs[h * d + j] + 0.5 * int_mean[j];
             }
-            matvec(&w.b_rc_mix1, &ctx_buf, d, d, &mut o_buf);
+            matvec_opt(&w.b_rc_mix1, &w.sb_i8.rc_mix1, &ctx_buf, d, d, &mut o_buf, use_i8);
             for x in &mut o_buf {
                 *x = (*x).max(0.0);
             }
-            matvec(&w.b_rc_mix2, &o_buf, d, d, &mut hub_tmp);
+            matvec_opt(&w.b_rc_mix2, &w.sb_i8.rc_mix2, &o_buf, d, d, &mut hub_tmp, use_i8);
             for j in 0..d {
                 hub_tmp[j] += hubs[h * d + j];
             }
@@ -470,14 +626,14 @@ pub fn evaluate_stream_b(
         for sq in 0..64 {
             cent_board_mask[sq] = sigmoid(cent_board_mask[sq] + w.b_cent_b[sq]);
         }
-        matvec(&w.b_broad_to_sq, &broad_mean, d, d, &mut broad_proj);
+        matvec_opt(&w.b_broad_to_sq, &w.sb_i8.broad_to_sq, &broad_mean, d, d, &mut broad_proj, use_i8);
         for sq in 0..64 {
             let gate = 1.0 - 0.718 * (1.0 - cent_board_mask[sq]); // Exact 71.8% inhibitory carving!
             let cur = &sq_state[sq * d..(sq + 1) * d];
             for j in 0..d {
                 ctx_buf[j] = cur[j] * gate + 0.25 * broad_proj[j];
             }
-            matvec(&w.b_sq_upd, &ctx_buf, d, d, &mut sq_tmp);
+            matvec_opt(&w.b_sq_upd, &w.sb_i8.sq_upd, &ctx_buf, d, d, &mut sq_tmp, use_i8);
             for j in 0..d {
                 sq_tmp[j] = cur[j] + 0.5 * sq_tmp[j].tanh();
             }
@@ -635,19 +791,22 @@ pub fn evaluate_stream_b(
     }
 
     if !logits_tmp.is_empty() {
-        // Saccadion-6 Live Test-Time hDelta Mental Rollout:
-        // Mentally simulates the top-6 PFL3 candidate moves in latent space z_{t+2} = WM(z_t, do(m))
-        // and blends the imagined future consequence into expected_delta_cp & move priority!
+        // Saccadion-8 2-Ply Counterfactual Latent Minimax Mental Rollout:
+        // Ply 1: imagines STM move z_1 = WM(z_0, do(m_1))
+        // Ply 2: predicts opponent's sharpest counter-action opp_act = tanh(W_opp @ z_1 + b_opp)
+        //        and imagines opponent refutation z_2 = WM(z_1, -opp_act) -> V_minimax!
         let wm_active = w.b_wm_w2.iter().any(|&x| x != 0.0);
         if wm_active {
+            let opp_active = w.b_wm_opp_w.iter().any(|&x| x != 0.0);
             let g_dim = d + cx_d;
             let mut order: Vec<usize> = (0..logits_tmp.len()).collect();
             order.sort_by(|&a, &b| logits_tmp[b].total_cmp(&logits_tmp[a]));
             let mut wm_in = vec![0.0f32; g_dim + cx_d];
-            wm_in[..g_dim].copy_from_slice(&global_vec);
             let mut wm_h = vec![0.0f32; g_dim];
             let mut wm_delta = vec![0.0f32; g_dim];
-            let mut z_fut = vec![0.0f32; g_dim];
+            let mut z_1 = vec![0.0f32; g_dim];
+            let mut opp_act = vec![0.0f32; cx_d];
+            let mut z_2 = vec![0.0f32; g_dim];
 
             for &idx in order.iter().take(6) {
                 let mv = policy_moves[idx].mv;
@@ -656,28 +815,56 @@ pub fn evaluate_stream_b(
                 let qu = &q_sq[u * cx_d..(u + 1) * cx_d];
                 let kv = &k_sq[v * cx_d..(v + 1) * cx_d];
                 let ov = &opp_sq[v * cx_d..(v + 1) * cx_d];
+                wm_in[..g_dim].copy_from_slice(&global_vec);
                 for j in 0..cx_d {
                     wm_in[g_dim + j] = qu[j] * (1.0 + eff_goal[j]) - (kv[j] - 0.99 * ov[j]);
                 }
-                matvec(&w.b_wm_w1, &wm_in, g_dim, g_dim + cx_d, &mut wm_h);
+                matvec_opt(&w.b_wm_w1, &w.sb_i8.wm_w1, &wm_in, g_dim, g_dim + cx_d, &mut wm_h, use_i8);
                 for j in 0..g_dim {
                     wm_h[j] = silu(wm_h[j] + w.b_wm_b1[j]);
                 }
-                matvec(&w.b_wm_w2, &wm_h, g_dim, g_dim, &mut wm_delta);
+                matvec_opt(&w.b_wm_w2, &w.sb_i8.wm_w2, &wm_h, g_dim, g_dim, &mut wm_delta, use_i8);
                 for j in 0..g_dim {
-                    z_fut[j] = global_vec[j] + wm_delta[j];
+                    z_1[j] = global_vec[j] + wm_delta[j];
                 }
-                let mut fut_logits = [0.0f32; 3];
+                let mut fut1_logits = [0.0f32; 3];
                 for c in 0..3 {
                     let row = &w.b_wdl_w[c * g_dim..(c + 1) * g_dim];
-                    fut_logits[c] = dot_f32(row, &z_fut) + w.b_wdl_b[c];
+                    fut1_logits[c] = dot_f32(row, &z_1) + w.b_wdl_b[c];
                 }
-                softmax_inplace(&mut fut_logits);
-                let fut_pos_cp = wdl_to_cp(fut_logits);
+                softmax_inplace(&mut fut1_logits);
+                let v1_cp = wdl_to_cp(fut1_logits);
+
+                let fut_pos_cp = if opp_active {
+                    matvec(&w.b_wm_opp_w, &z_1, cx_d, g_dim, &mut opp_act);
+                    wm_in[..g_dim].copy_from_slice(&z_1);
+                    for j in 0..cx_d {
+                        wm_in[g_dim + j] = -(opp_act[j] + w.b_wm_opp_b[j]).tanh();
+                    }
+                    matvec_opt(&w.b_wm_w1, &w.sb_i8.wm_w1, &wm_in, g_dim, g_dim + cx_d, &mut wm_h, use_i8);
+                    for j in 0..g_dim {
+                        wm_h[j] = silu(wm_h[j] + w.b_wm_b1[j]);
+                    }
+                    matvec_opt(&w.b_wm_w2, &w.sb_i8.wm_w2, &wm_h, g_dim, g_dim, &mut wm_delta, use_i8);
+                    for j in 0..g_dim {
+                        z_2[j] = z_1[j] + wm_delta[j];
+                    }
+                    let mut fut2_logits = [0.0f32; 3];
+                    for c in 0..3 {
+                        let row = &w.b_wdl_w[c * g_dim..(c + 1) * g_dim];
+                        fut2_logits[c] = dot_f32(row, &z_2) + w.b_wdl_b[c];
+                    }
+                    softmax_inplace(&mut fut2_logits);
+                    let v2_cp = wdl_to_cp(fut2_logits);
+                    0.55 * v1_cp + 0.45 * v2_cp
+                } else {
+                    v1_cp
+                };
+
                 let imagined_delta = (fut_pos_cp - deep_pos_cp).clamp(-300.0, 300.0);
                 policy_moves[idx].expected_delta_cp =
-                    0.65 * policy_moves[idx].expected_delta_cp + 0.35 * imagined_delta;
-                logits_tmp[idx] += 0.0025 * imagined_delta;
+                    0.60 * policy_moves[idx].expected_delta_cp + 0.40 * imagined_delta;
+                logits_tmp[idx] += 0.0030 * imagined_delta;
                 policy_moves[idx].logit = logits_tmp[idx];
             }
         }
@@ -716,5 +903,6 @@ pub fn evaluate_stream_b(
         gamma_seed,
         centrifugal_kc_mask,
         centrifugal_board_mask: cent_board_mask,
+        retro_goal_saliency,
     }
 }

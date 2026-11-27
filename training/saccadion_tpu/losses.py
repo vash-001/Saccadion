@@ -185,6 +185,41 @@ def blunder_repulsion_loss(
     return loss, avoid_hits, count
 
 
+def retrograde_goal_loss(
+    retro_goal_logits: jnp.ndarray,  # [B, 64]
+    board_feats: jnp.ndarray,        # [B, 64, 48]
+    best_move: jnp.ndarray,          # [B] int32
+    next_move: jnp.ndarray | None,   # [B] int32 (m_{t+2}, optional)
+    pos_weight: float = 4.0,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Saccadion-8 Retrograde Fischer-Graph Goal Saliency Supervision:
+    Supervises `goal_sq[64]` on current destination `v_t`, 2-ply future target `v_{t+2}`,
+    and Enemy King Ring so Backward `A^T` GNN deduces enabling quiet moves backwards from future goals!
+    Returns (bce_loss, top8_goal_recall).
+    """
+    bsz = retro_goal_logits.shape[0]
+    row = jnp.arange(bsz)
+    v_now = best_move & 63
+    opp_kring = board_feats[:, :, 40]  # [B, 64] Enemy King Ring magnet
+    target = jnp.zeros((bsz, 64), dtype=jnp.float32)
+    target = target.at[row, v_now].set(1.0)
+    if next_move is not None:
+        v_fut = next_move & 63
+        has_fut = (next_move > 0).astype(jnp.float32)
+        target = jnp.maximum(target, jnp.zeros((bsz, 64), dtype=jnp.float32).at[row, v_fut].set(has_fut))
+    target = jnp.clip(jnp.maximum(target, 0.45 * opp_kring), 0.0, 1.0)
+
+    log_sig = jax.nn.log_sigmoid(retro_goal_logits)
+    log_1msig = jax.nn.log_sigmoid(-retro_goal_logits)
+    bce = -(pos_weight * target * log_sig + (1.0 - target) * log_1msig)
+    loss = jnp.mean(bce)
+
+    # Top-8 recall: is `v_now` (or `v_fut`) inside the 8 highest-saliency retrograde goal squares?
+    top8_sq = jax.lax.top_k(retro_goal_logits, 8)[1]  # [B, 8]
+    hit_now = jnp.any(top8_sq == v_now[:, None], axis=-1).astype(jnp.float32)
+    return loss, jnp.mean(hit_now)
+
+
 def wm_blunder_contrast_loss(
     params: Dict[str, jnp.ndarray],
     out_b: Dict[str, jnp.ndarray],
@@ -193,9 +228,9 @@ def wm_blunder_contrast_loss(
     blunder_drop_cp: jnp.ndarray,
     wdl_target: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Before->After Live hDelta World Model Supervision:
-    Teaches exported `b_wm_w1/b1/w2` that `do(m_blunder)` collapses future WDL by `-drop_cp`
-    while `do(m_best)` preserves/achieves the clean target WDL! Returns (loss, wm_detect_hits).
+    """Saccadion-8 2-Ply Counterfactual Minimax World Model Supervision:
+    Teaches `b_wm_w1/b1/w2` + `b_wm_opp_w/b` that `do(m_blunder)` followed by opponent's
+    sharpest counter-action collapses WDL by `-drop_cp` while `do(m_best)` holds the target WDL!
     """
     bsz = best_move.shape[0]
     row = jnp.arange(bsz)
@@ -206,20 +241,29 @@ def wm_blunder_contrast_loss(
     ck = jax.lax.stop_gradient(out_b["contra_k"])
     w_wdl = jax.lax.stop_gradient(params["b_wdl_w"])
     b_wdl = jax.lax.stop_gradient(params["b_wdl_b"])
+    has_opp = "b_wm_opp_w" in params
 
-    def _imagined_wdl_logits(mv_u: jnp.ndarray) -> jnp.ndarray:
+    def _imagined_minimax_logits(mv_u: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         u = (mv_u >> 6) & 63
         v = mv_u & 63
         act_emb = aq[row, u] - ck[row, v]
         wm_in = jnp.concatenate([z0, act_emb], axis=-1)
-        h = jax.nn.silu(jnp.einsum("bi,hi->bh", wm_in, params["b_wm_w1"]) + params["b_wm_b1"])
-        z_fut = z0 + jnp.einsum("bh,oh->bo", h, params["b_wm_w2"])
-        return jnp.einsum("bg,kg->bk", z_fut, w_wdl) + b_wdl
+        h1 = jax.nn.silu(jnp.einsum("bi,hi->bh", wm_in, params["b_wm_w1"]) + params["b_wm_b1"])
+        z_1 = z0 + jnp.einsum("bh,oh->bo", h1, params["b_wm_w2"])
+        l1 = jnp.einsum("bg,kg->bk", z_1, w_wdl) + b_wdl
+        if has_opp:
+            opp_act = jnp.tanh(jnp.einsum("bg,cg->bc", z_1, params["b_wm_opp_w"]) + params["b_wm_opp_b"])
+            wm2_in = jnp.concatenate([z_1, -opp_act], axis=-1)
+            h2 = jax.nn.silu(jnp.einsum("bi,hi->bh", wm2_in, params["b_wm_w1"]) + params["b_wm_b1"])
+            z_2 = z_1 + jnp.einsum("bh,oh->bo", h2, params["b_wm_w2"])
+            l2 = jnp.einsum("bg,kg->bk", z_2, w_wdl) + b_wdl
+            return 0.55 * l1 + 0.45 * l2, l2
+        return l1, l1
 
-    logits_bad = _imagined_wdl_logits(blunder_move)
-    logits_good = _imagined_wdl_logits(best_move)
+    logits_bad, logits_bad_ply2 = _imagined_minimax_logits(blunder_move)
+    logits_good, _ = _imagined_minimax_logits(best_move)
 
-    # Exact World-Model causal blunder-collapse accuracy: does WM foresee WDL(good) > WDL(blunder) + 0.15?
+    # Exact World-Model causal blunder-collapse accuracy: does 2-Ply WM foresee WDL(good) > WDL(blunder) + 0.15?
     p_good = jax.nn.softmax(logits_good, axis=-1)
     p_bad = jax.nn.softmax(logits_bad, axis=-1)
     exp_good = p_good[:, 0] - p_good[:, 2]
@@ -241,7 +285,7 @@ def wm_blunder_contrast_loss(
         safe_t = jnp.clip(t_probs, 1e-6, 1.0)
         return jnp.sum(safe_t * (jnp.log(safe_t) - log_p), axis=-1)
 
-    per_b = _kl_vec(logits_bad, wdl_after) + 0.5 * _kl_vec(logits_good, wdl_target)
+    per_b = _kl_vec(logits_bad, wdl_after) + 0.4 * _kl_vec(logits_bad_ply2, wdl_after) + 0.5 * _kl_vec(logits_good, wdl_target)
     denom = jnp.maximum(jnp.sum(mask), 1.0)
     return jnp.sum(per_b * mask) / denom, wm_detect_hits
 
@@ -485,6 +529,15 @@ def compute_multitask_loss(
         bril_top3_hits = jnp.array(0.0, dtype=jnp.float32)
         bril_count = jnp.array(0.0, dtype=jnp.float32)
 
+    # 15. Saccadion-8 Retrograde Fischer-Graph Goal Saliency Loss (trains backward A^T goal credit!)
+    if "retro_goal_logits" in out_b:
+        loss_retro_goal, retro_goal_recall = retrograde_goal_loss(
+            out_b["retro_goal_logits"], batch["board_feats"], best_mv, batch.get("next_move")
+        )
+    else:
+        loss_retro_goal = jnp.array(0.0, dtype=jnp.float32)
+        retro_goal_recall = jnp.array(0.0, dtype=jnp.float32)
+
     total = (
         loss_wdl
         + 0.65 * loss_policy
@@ -501,6 +554,7 @@ def compute_multitask_loss(
         + 0.35 * loss_imbalance
         + 0.30 * loss_blunder_repel
         + 0.25 * loss_wm_contrast
+        + 0.25 * loss_retro_goal
     )
     metrics = {
         "total": total,
@@ -520,6 +574,8 @@ def compute_multitask_loss(
         "imbalance": loss_imbalance,
         "blunder_repel": loss_blunder_repel,
         "wm_contrast": loss_wm_contrast,
+        "retro_goal": loss_retro_goal,
+        "retro_goal_recall": retro_goal_recall,
         "blunder_avoid_hits": blunder_avoid_hits,
         "wm_blunder_hits": wm_blunder_hits,
         "blunder_count": blunder_count,
