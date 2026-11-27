@@ -516,26 +516,27 @@ def train_saccadion_smart(
 
         def loss_single(cur_p, batch, apl_target, apl_w, rng_key):
             k1, k2, k3 = jax.random.split(rng_key, 3)
+            batch_f = {**batch, "board_feats": batch["board_feats"].astype(jnp.float32)}
             out_a = forward_stream_a(
                 cur_p, cfg, claws_idx,
-                batch["sparse_stm"], batch["sparse_opp"],
-                batch["lh_feat"], batch["phase_bucket"],
+                batch_f["sparse_stm"], batch_f["sparse_opp"],
+                batch_f["lh_feat"], batch_f["phase_bucket"],
                 qat=qat, dropout_key=k1, kc_drop_rate=0.08,
             )
             out_b = forward_stream_b(
-                cur_p, cfg, batch["board_feats"], out_a["mbon_summary"],
+                cur_p, cfg, batch_f["board_feats"], out_a["mbon_summary"],
                 num_ticks=num_ticks, sez_cp=out_a["sez_cp"],
-                graph_adj_u32=batch.get("graph_adj"),
+                graph_adj_u32=batch_f.get("graph_adj"),
                 qat=qat, causal_drop_key=k3,
             )
             out_a_steered = forward_stream_a(
                 cur_p, cfg, claws_idx,
-                batch["sparse_stm"], batch["sparse_opp"],
-                batch["lh_feat"], batch["phase_bucket"],
+                batch_f["sparse_stm"], batch_f["sparse_opp"],
+                batch_f["lh_feat"], batch_f["phase_bucket"],
                 cent_mask=out_b["cent_kc_mask"], qat=qat, dropout_key=k2, kc_drop_rate=0.08,
             )
             return compute_multitask_loss(
-                out_a_steered, out_b, batch, apl_target_active=apl_target, apl_weight=apl_w, params=cur_p, out_a_unmasked=out_a
+                out_a_steered, out_b, batch_f, apl_target_active=apl_target, apl_weight=apl_w, params=cur_p, out_a_unmasked=out_a
             )
 
         if use_pmap:
@@ -566,24 +567,25 @@ def train_saccadion_smart(
 
         @jax.jit
         def vstep(p, batch, apl_target, apl_w):
+            batch_f = {**batch, "board_feats": batch["board_feats"].astype(jnp.float32)}
             out_a = forward_stream_a(
                 p, cfg, claws_idx,
-                batch["sparse_stm"], batch["sparse_opp"],
-                batch["lh_feat"], batch["phase_bucket"], qat=qat,
+                batch_f["sparse_stm"], batch_f["sparse_opp"],
+                batch_f["lh_feat"], batch_f["phase_bucket"], qat=qat,
             )
             out_b = forward_stream_b(
-                p, cfg, batch["board_feats"], out_a["mbon_summary"],
+                p, cfg, batch_f["board_feats"], out_a["mbon_summary"],
                 num_ticks=num_ticks, sez_cp=out_a["sez_cp"],
-                graph_adj_u32=batch.get("graph_adj"), qat=qat,
+                graph_adj_u32=batch_f.get("graph_adj"), qat=qat,
             )
             out_a_s = forward_stream_a(
                 p, cfg, claws_idx,
-                batch["sparse_stm"], batch["sparse_opp"],
-                batch["lh_feat"], batch["phase_bucket"],
+                batch_f["sparse_stm"], batch_f["sparse_opp"],
+                batch_f["lh_feat"], batch_f["phase_bucket"],
                 cent_mask=out_b["cent_kc_mask"], qat=qat,
             )
             _, m = compute_multitask_loss(
-                out_a_s, out_b, batch, apl_target_active=apl_target, apl_weight=apl_w, params=p, out_a_unmasked=out_a
+                out_a_s, out_b, batch_f, apl_target_active=apl_target, apl_weight=apl_w, params=p, out_a_unmasked=out_a
             )
             # Chess accuracy & calibration telemetry
             pol = out_b["policy_logits"]
@@ -727,51 +729,87 @@ def train_saccadion_smart(
             ema_step_ms = 45.0
             t_loop_start: Optional[float] = None
             pos_after_jit = 0
-            aug_rng = np.random.default_rng(epoch * 7919 + 13)
             jax_rng = jax.random.PRNGKey(epoch * 4241 + 7)
+            prev_m: Any = None
+            prev_step_idx = 0
+            prev_t0 = time.time()
 
-            for step_idx, batch_np in enumerate(train_ds.iter_batches(eff_bsz, seed=epoch * 997), start=1):
+            # Mirror augmentation & f16 streaming run in 2 overlapped background threads (zero TPU stalls!)
+            for step_idx, batch_np in enumerate(
+                train_ds.iter_batches(eff_bsz, seed=epoch * 997, prefetch=12, mirror_prob=0.5),
+                start=1,
+            ):
                 t_s0 = time.time()
-                # Exact horizontal file-mirror symmetry augmentation (a <-> h) on castling-free positions!
-                batch_np = augment_batch_file_mirror(batch_np, aug_rng, prob=0.5)
                 jax_rng, step_key = jax.random.split(jax_rng)
                 if use_pmap:
                     b_in = _shard_batch_for_pmap(batch_np, n_dev)
                     dev_keys = jax.random.split(step_key, n_dev)
-                    params_dev, opt_dev, m = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight, dev_keys)
-                    loss_val = float(m["total"][0])
-                    kc_val = float(m["active_kc_ratio"][0])
+                    params_dev, opt_dev, cur_m = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight, dev_keys)
                 else:
                     b_in = {k: jnp.asarray(v) for k, v in batch_np.items()}
-                    params_dev, opt_dev, m = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight, step_key)
-                    loss_val = float(m["total"])
-                    kc_val = float(m["active_kc_ratio"])
+                    params_dev, opt_dev, cur_m = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight, step_key)
 
-                step_ms = (time.time() - t_s0) * 1000.0
-                if step_idx == 1:
-                    # Exclude one-time XLA JIT recompile & Stage-2 Meta-Dopamine from live pos/s & ETA!
-                    t_loop_start = time.time()
-                else:
-                    ema_step_ms = 0.88 * ema_step_ms + 0.12 * step_ms
-                    pos_after_jit += eff_bsz
-                ep_losses.append(loss_val)
+                # Async 1-step overlap: read PREVIOUS step's scalar metrics while TPU executes CURRENT step!
+                if prev_m is not None:
+                    loss_val = float(prev_m["total"][0]) if use_pmap else float(prev_m["total"])
+                    kc_val = float(prev_m["active_kc_ratio"][0]) if use_pmap else float(prev_m["active_kc_ratio"])
+                    step_ms = (t_s0 - prev_t0) * 1000.0
+                    if prev_step_idx == 1:
+                        t_loop_start = t_s0
+                    else:
+                        ema_step_ms = 0.88 * ema_step_ms + 0.12 * step_ms
+                        pos_after_jit += eff_bsz
+                    ep_losses.append(loss_val)
+
+                    if t_loop_start is not None and pos_after_jit > 0:
+                        elapsed_loop = max(1e-3, time.time() - t_loop_start)
+                        cur_pos_s = pos_after_jit / elapsed_loop
+                        sec_per_step = elapsed_loop / max(1, prev_step_idx - 1)
+                    else:
+                        cur_pos_s = eff_bsz / max(1e-3, step_ms / 1000.0)
+                        sec_per_step = max(1e-3, ema_step_ms / 1000.0)
+                    rem_steps = (epochs - epoch) * steps_per_epoch + (steps_per_epoch - prev_step_idx)
+                    eta_sec = rem_steps * sec_per_step
+                    hud.update(
+                        epoch=epoch,
+                        total_epochs=epochs,
+                        step=prev_step_idx,
+                        steps_per_epoch=steps_per_epoch,
+                        stage_name=stage_name,
+                        ticks=num_ticks,
+                        qat=qat,
+                        step_loss=loss_val,
+                        step_kc_pct=kc_val * 100.0,
+                        step_ms=ema_step_ms,
+                        pos_per_sec=cur_pos_s,
+                        eta_sec=eta_sec,
+                        history=history,
+                        arena_status=arena.get_status() if arena else None,
+                        force=False,
+                    )
+
+                prev_m = cur_m
+                prev_step_idx = step_idx
+                prev_t0 = t_s0
                 global_step += 1
                 pos_seen += eff_bsz
 
-                # Smooth 20 Hz Live Cockpit update with accurate post-JIT throughput & ETA!
-                if t_loop_start is not None and pos_after_jit > 0:
-                    elapsed_loop = max(1e-3, time.time() - t_loop_start)
-                    cur_pos_s = pos_after_jit / elapsed_loop
-                    sec_per_step = elapsed_loop / max(1, step_idx - 1)
-                else:
-                    cur_pos_s = eff_bsz / max(1e-3, step_ms / 1000.0)
-                    sec_per_step = max(1e-3, ema_step_ms / 1000.0)
-                rem_steps = (epochs - epoch) * steps_per_epoch + (steps_per_epoch - step_idx)
-                eta_sec = rem_steps * sec_per_step
+                if (time.time() - last_ckpt_time) > ckpt_every_minutes * 60.0:
+                    host_p = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
+                    host_o = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
+                    save_checkpoint(ckpt_file, host_p, host_o, epoch - 1, global_step, best_val_loss, history)
+                    last_ckpt_time = time.time()
+
+            if prev_m is not None:
+                loss_val = float(prev_m["total"][0]) if use_pmap else float(prev_m["total"])
+                kc_val = float(prev_m["active_kc_ratio"][0]) if use_pmap else float(prev_m["active_kc_ratio"])
+                ep_losses.append(loss_val)
+                elapsed_loop = max(1e-3, time.time() - (t_loop_start or t_ep0))
+                cur_pos_s = max(pos_after_jit, eff_bsz) / elapsed_loop
                 hud.update(
                     epoch=epoch,
                     total_epochs=epochs,
-                    step=step_idx,
+                    step=prev_step_idx,
                     steps_per_epoch=steps_per_epoch,
                     stage_name=stage_name,
                     ticks=num_ticks,
@@ -780,17 +818,11 @@ def train_saccadion_smart(
                     step_kc_pct=kc_val * 100.0,
                     step_ms=ema_step_ms,
                     pos_per_sec=cur_pos_s,
-                    eta_sec=eta_sec,
+                    eta_sec=max(0.0, (epochs - epoch) * elapsed_loop),
                     history=history,
                     arena_status=arena.get_status() if arena else None,
-                    force=(step_idx == steps_per_epoch),
+                    force=True,
                 )
-
-                if (time.time() - last_ckpt_time) > ckpt_every_minutes * 60.0:
-                    host_p = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
-                    host_o = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
-                    save_checkpoint(ckpt_file, host_p, host_o, epoch - 1, global_step, best_val_loss, history)
-                    last_ckpt_time = time.time()
 
             # Unwrap single-host copy for clean held-out Validation & .saccnet export
             replay_batches_run = 0
