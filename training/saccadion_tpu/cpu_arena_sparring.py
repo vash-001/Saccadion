@@ -188,22 +188,32 @@ def discover_and_install_multi_engines() -> Tuple[List[EngineSpec], Optional[Pat
     """Discovers & installs a diverse Multi-Engine UCI Gauntlet (Stockfish + Fruit + Toga2 + Glaurung + GNUChess)."""
     sf_bin = find_or_install_stockfish()
 
-    # On Colab Linux VM, install additional diverse classic/tactical UCI engines in one clean pass!
+    # On Colab Linux VM, always refresh apt index once before installing diverse UCI engines!
     extra_apt_pkgs = ["toga2", "fruit", "glaurung", "gnuchess"]
     if Path("/content").exists() and shutil.which("apt-get"):
-        for pkg in extra_apt_pkgs:
-            if shutil.which(pkg) or Path(f"/usr/games/{pkg}").exists():
-                continue
+        missing = [p for p in extra_apt_pkgs if not (shutil.which(p) or Path(f"/usr/games/{p}").exists())]
+        if missing:
             try:
                 subprocess.run(
-                    ["apt-get", "install", "-qq", "-y", pkg],
+                    ["apt-get", "update", "-qq"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    timeout=35,
+                    timeout=45,
                     check=False,
                 )
             except Exception:
                 pass
+            for pkg in missing:
+                try:
+                    subprocess.run(
+                        ["apt-get", "install", "-qq", "-y", pkg],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=45,
+                        check=False,
+                    )
+                except Exception:
+                    pass
 
     gauntlet: List[EngineSpec] = [
         EngineSpec("Baseline-Material-d2", "Baseline", 900, None),

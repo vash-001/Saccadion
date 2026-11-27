@@ -1077,6 +1077,8 @@ class SaccShardDataset:
             chunk_q: queue.Queue = queue.Queue(maxsize=2)
             batch_q: queue.Queue = queue.Queue(maxsize=max(4, prefetch))
             stop_evt = threading.Event()
+            disk_done = threading.Event()
+            build_done = threading.Event()
             sentinel = object()
 
             def _put_safe(target_q: queue.Queue, item: object) -> bool:
@@ -1104,18 +1106,18 @@ class SaccShardDataset:
                             del merged
                             break
                 finally:
-                    try:
-                        chunk_q.put(sentinel, timeout=0.2)
-                    except queue.Full:
-                        pass
+                    disk_done.set()
+                    _put_safe(chunk_q, sentinel)
 
             def batch_builder() -> None:
                 aug_rng = np.random.default_rng(seed * 7919 + 13)
                 try:
                     while not stop_evt.is_set():
                         try:
-                            merged = chunk_q.get(timeout=0.1)
+                            merged = chunk_q.get(timeout=0.05)
                         except queue.Empty:
+                            if disk_done.is_set():
+                                break
                             continue
                         if merged is sentinel:
                             break
@@ -1132,10 +1134,8 @@ class SaccShardDataset:
                                 break
                         del merged
                 finally:
-                    try:
-                        batch_q.put(sentinel, timeout=0.2)
-                    except queue.Full:
-                        pass
+                    build_done.set()
+                    _put_safe(batch_q, sentinel)
 
             t_disk = threading.Thread(target=disk_reader, daemon=True)
             t_build = threading.Thread(target=batch_builder, daemon=True)
@@ -1143,7 +1143,12 @@ class SaccShardDataset:
             t_build.start()
             try:
                 while True:
-                    item = batch_q.get()
+                    try:
+                        item = batch_q.get(timeout=0.1)
+                    except queue.Empty:
+                        if build_done.is_set():
+                            break
+                        continue
                     if item is sentinel:
                         break
                     yield item
@@ -1155,8 +1160,8 @@ class SaccShardDataset:
                             q_ref.get_nowait()
                         except queue.Empty:
                             break
-                t_disk.join(timeout=1.0)
-                t_build.join(timeout=1.0)
+                t_disk.join(timeout=1.5)
+                t_build.join(timeout=1.5)
             return
 
         perm = rng.permutation(self._count)
