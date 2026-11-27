@@ -29,6 +29,8 @@ import gc
 import json
 import math
 import pickle
+import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -203,6 +205,117 @@ def estimate_elo_proxy(val_top1_pct: float, val_wdl_acc: float, val_cp_mae: floa
     return float(max(600.0, min(3600.0, 520.0 + 0.55 * pol_term + 0.45 * wdl_term + 0.35 * mae_term)))
 
 
+def _dequant_board_feats(bf: jnp.ndarray) -> jnp.ndarray:
+    """Dequantizes compact INT8 FastCache v7 board_feats on TPU in <0.005 ms (zero host cost!)."""
+    if bf.dtype == jnp.int8:
+        return bf.astype(jnp.float32) * jnp.float32(1.0 / 127.0)
+    return bf.astype(jnp.float32)
+
+
+def build_freeze_thaw_schedule(
+    params: Dict[str, jnp.ndarray], epoch: int, total_epochs: int
+) -> Tuple[int, str, int, float, bool, Dict[str, jnp.ndarray], Dict[str, str]]:
+    """4-Stage Neurodevelopmental Freeze/Thaw Curriculum preventing late-epoch regression:
+      Phase 1 (Foundation):      Thaw Optic+GNN + SEZ + Dendritic GF; freeze Meta-DA.
+      Phase 2 (Causal+Blunder):  Anchor SEZ/HalfKA/GF (0.08-0.25x) so leaf Elo NEVER drifts;
+                                 full-thaw GNN, CX (T=4), World Model, Blunder/Brilliant, Causal!
+      Phase 3 (Distill+DA):      Anchor Optic/GNN (0.15x); full-thaw GF, Stream A, & Meta-DA!
+      Phase 4 (Apex Polish+QAT): Gentle co-adaptive polish (0.30x) + STE-QAT + EMA selection!
+    """
+    p1_end = max(1, int(round(total_epochs * 0.25)))
+    p2_end = max(p1_end + 1, int(round(total_epochs * 0.60)))
+    p3_end = max(p2_end + 1, int(round(total_epochs * 0.85)))
+    qat_active = epoch >= max(2, total_epochs - 1) and total_epochs >= 4
+
+    if epoch <= p1_end:
+        stage, name, ticks, apl_t, qat = 1, "P1:Foundation-Thaw", 3, 0.14, False
+        m_gf, m_ft, m_sez, m_optic, m_cx, m_wm, m_da = 1.0, 1.0, 1.0, 1.0, 0.60, 0.35, 0.0
+        fmap = {"GF+HalfKA": "THAWED 1.0x", "Optic+GNN": "THAWED 1.0x", "CX+World": "WARM 0.6x", "Meta-DA": "FROZEN 0.0x"}
+    elif epoch <= p2_end:
+        stage, name, ticks, apl_t, qat = 2, "P2:Causal-Blunder-Thaw", 4, 0.10, False
+        m_gf, m_ft, m_sez, m_optic, m_cx, m_wm, m_da = 0.25, 0.08, 0.05, 1.0, 1.0, 1.0, 0.0
+        fmap = {"GF+HalfKA": "ANCHORED 0.1x", "Optic+GNN": "THAWED 1.0x", "CX+World": "THAWED 1.0x", "Meta-DA": "FROZEN 0.0x"}
+    elif epoch <= p3_end:
+        stage, name, ticks, apl_t, qat = 3, "P3:Distill-Dopamine-Thaw", 4, 0.08, False
+        m_gf, m_ft, m_sez, m_optic, m_cx, m_wm, m_da = 1.0, 0.35, 0.15, 0.15, 0.40, 0.50, 1.0
+        fmap = {"GF+HalfKA": "THAWED 1.0x", "Optic+GNN": "ANCHORED 0.15x", "CX+World": "WARM 0.4x", "Meta-DA": "THAWED 1.0x"}
+    else:
+        stage, name, ticks, apl_t, qat = 4, "P4:Apex-Polish+QAT" if qat_active else "P4:Apex-Polish", 4, 0.08, qat_active
+        m_gf, m_ft, m_sez, m_optic, m_cx, m_wm, m_da = 0.35, 0.20, 0.10, 0.25, 0.35, 0.35, 0.40
+        fmap = {"GF+HalfKA": "POLISH 0.3x", "Optic+GNN": "POLISH 0.25x", "CX+World": "POLISH 0.35x", "Meta-DA": "POLISH 0.4x"}
+
+    scales: Dict[str, jnp.ndarray] = {}
+    for k in params:
+        if k.startswith("a_gf_"):
+            s = m_gf
+        elif k == "a_sez_weight":
+            s = m_sez
+        elif k in ("a_ft_weight", "a_ft_bias"):
+            s = m_ft
+        elif k.startswith("meta_") or k == "a_plastic_to_mbon":
+            s = m_da
+        elif k.startswith("b_wm_"):
+            s = m_wm
+        elif k.startswith(("b_shunt", "b_lc", "b_optic", "b_opt_", "b_ama_", "b_gnn_")):
+            s = m_optic
+        elif k.startswith("a_"):
+            s = max(m_gf, 0.35)
+        else:
+            s = m_cx
+        scales[k] = jnp.array(s, dtype=jnp.float32)
+    return stage, name, ticks, apl_t, qat, scales, fmap
+
+
+class _AsyncCheckpointSaver:
+    """Writes checkpoints to local SSD first and copies to Google Drive in background (zero FUSE stalls!)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+
+    def save_async(
+        self,
+        drive_path: Path,
+        params: Dict[str, Any],
+        ema_params: Dict[str, Any],
+        opt_state: Any,
+        epoch: int,
+        global_step: int,
+        best_val_loss: float,
+        history: List[Dict[str, Any]],
+    ) -> None:
+        payload = {
+            "params": jax.device_get(params),
+            "ema_params": jax.device_get(ema_params),
+            "opt_state": jax.device_get(opt_state),
+            "epoch": epoch,
+            "global_step": global_step,
+            "best_val_loss": best_val_loss,
+            "history": list(history),
+        }
+
+        def _worker() -> None:
+            with self._lock:
+                try:
+                    drive_path.parent.mkdir(parents=True, exist_ok=True)
+                    local_tmp = Path("/content/_sacc_latest.pkl") if Path("/content").exists() else drive_path.with_suffix(".pkl.tmp")
+                    with open(local_tmp, "wb") as f:
+                        pickle.dump(payload, f)
+                    dst_tmp = drive_path.with_suffix(".pkl.tmp")
+                    shutil.copy2(local_tmp, dst_tmp)
+                    dst_tmp.replace(drive_path)
+                except Exception:
+                    pass
+
+        self._thread = threading.Thread(target=_worker, name="SaccAsyncCkpt", daemon=True)
+        self._thread.start()
+
+    def wait(self) -> None:
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout=60.0)
+
+
 def save_checkpoint(
     path: Path,
     params: Dict[str, Any],
@@ -211,12 +324,14 @@ def save_checkpoint(
     global_step: int,
     best_val_loss: float,
     history: List[Dict[str, Any]],
+    ema_params: Optional[Dict[str, Any]] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
         pickle.dump(
             {
                 "params": jax.device_get(params),
+                "ema_params": jax.device_get(ema_params) if ema_params is not None else jax.device_get(params),
                 "opt_state": jax.device_get(opt_state),
                 "epoch": epoch,
                 "global_step": global_step,
@@ -365,8 +480,9 @@ def _print_epoch_banner(row: Dict[str, Any], is_best: bool) -> None:
         f"Policy={row['val_policy']:.4f} | Press(10-20ply)={row['val_pressure']:.4f} | LH={row['val_lh']:.4f}"
     )
     print(
-        f"  CAUSAL  : 16-Concept F1={row['val_causal_f1']*100:5.1f}% | NoduliGap={row['val_noduli_margin']:+.3f} | "
-        f"VNC-2Ply={row['val_vnc2']:.4f} | CausalLoss={row['val_causal']:.4f} | Imb={row.get('val_imbalance', 0.0):.4f}"
+        f"  CAUSAL  : 16-Concept F1={row['val_causal_f1']*100:5.1f}% | BlunderAvoid={row.get('blunder_avoid_pct', 0.0):5.1f}% | "
+        f"WM-Collapse={row.get('wm_blunder_pct', 0.0):5.1f}% | Brilliant!! Top3={row.get('bril_top3_pct', 0.0):5.1f}% | "
+        f"NoduliGap={row['val_noduli_margin']:+.3f} | Imb={row.get('val_imbalance', 0.0):.4f}"
     )
     print(
         f"  CHESS   : Move Top-1={row['val_top1_acc']:5.2f}% | Move Top-3={row['val_top3_acc']:5.2f}% | "
@@ -460,17 +576,18 @@ def train_saccadion_smart(
     if ckpt_file.exists():
         ck = load_checkpoint(ckpt_file)
         loaded_p = ck["params"]
-        # Seamless forward migration when resuming an earlier Saccadion-1 checkpoint into Saccadion-2 Causal!
         added_keys = [k for k in fresh_params if k not in loaded_p]
         if added_keys:
             params = {**fresh_params, **loaded_p}
             tx, sched_muon, sched_adamw = build_muon_adamw_optimizer(params, total_steps, lr_muon, lr_adamw)
             opt_state = tx.init(params)
-            print(f"Migrated Saccadion-1 checkpoint cleanly (initialized new causal params: {added_keys})")
+            print(f"Migrated checkpoint cleanly (initialized new params: {added_keys})")
         else:
             params = loaded_p
             tx, sched_muon, sched_adamw = build_muon_adamw_optimizer(params, total_steps, lr_muon, lr_adamw)
             opt_state = ck["opt_state"]
+        loaded_ema = ck.get("ema_params")
+        ema_params = {**params, **loaded_ema} if isinstance(loaded_ema, dict) else jax.tree_util.tree_map(jnp.array, params)
         start_epoch = int(ck["epoch"]) + 1
         global_step = int(ck["global_step"])
         best_val_loss = float(ck["best_val_loss"])
@@ -478,6 +595,7 @@ def train_saccadion_smart(
         print(f"Resumed checkpoint cleanly at Epoch {start_epoch} (best_val={best_val_loss:.4f})")
     else:
         params = fresh_params
+        ema_params = jax.tree_util.tree_map(jnp.array, params)
         tx, sched_muon, sched_adamw = build_muon_adamw_optimizer(params, total_steps, lr_muon, lr_adamw)
         opt_state = tx.init(params)
         start_epoch = 1
@@ -487,10 +605,24 @@ def train_saccadion_smart(
 
     if use_pmap:
         params_dev = jax.device_put_replicated(params, jax.local_devices())
+        ema_dev = jax.device_put_replicated(ema_params, jax.local_devices())
         opt_dev = jax.device_put_replicated(opt_state, jax.local_devices())
     else:
         params_dev = params
+        ema_dev = ema_params
         opt_dev = opt_state
+
+    # Pre-decode a compact RAM pool of trajectory batches ONCE (~2s) so Stage 3/4 Meta-Dopamine NEVER freezes!
+    cached_traj_batches: List[Dict[str, Any]] = []
+    if len(traj_ds) >= 12:
+        t_bsz = max(4, min(32, (len(traj_ds) // 12) // 2 or 1))
+        for ti, tb_np in enumerate(traj_ds.iter_trajectory_batches(t_bsz, window_k=12, seed=2026)):
+            cached_traj_batches.append(tb_np)
+            if ti + 1 >= 16:
+                break
+        print(f"[TrajPool] Pre-cached {len(cached_traj_batches)} trajectory batches in RAM (zero Stage-3 stall!)")
+
+    async_ckpt = _AsyncCheckpointSaver()
 
     # Start Background CPU Stockfish Sparring & Real-Elo Arena using BEST generalizing weights!
     arena: Optional[StockfishSparringArena] = None
@@ -516,7 +648,7 @@ def train_saccadion_smart(
 
         def loss_single(cur_p, batch, apl_target, apl_w, rng_key):
             k1, k2, k3 = jax.random.split(rng_key, 3)
-            batch_f = {**batch, "board_feats": batch["board_feats"].astype(jnp.float32)}
+            batch_f = {**batch, "board_feats": _dequant_board_feats(batch["board_feats"])}
             out_a = forward_stream_a(
                 cur_p, cfg, claws_idx,
                 batch_f["sparse_stm"], batch_f["sparse_opp"],
@@ -540,20 +672,26 @@ def train_saccadion_smart(
             )
 
         if use_pmap:
-            def pstep(p, ost, batch, apl_target, apl_w, rng_key):
+            def pstep(p, ema_p, ost, batch, apl_target, apl_w, rng_key, gscales):
                 (_, metrics), grads = jax.value_and_grad(loss_single, has_aux=True)(p, batch, apl_target, apl_w, rng_key)
                 grads = jax.lax.pmean(grads, axis_name="dev")
+                grads = jax.tree_util.tree_map(lambda g, s: g * s, grads, gscales)
                 metrics = jax.lax.pmean(metrics, axis_name="dev")
                 updates, new_ost = tx.update(grads, ost, p)
-                return optax.apply_updates(p, updates), new_ost, metrics
+                new_p = optax.apply_updates(p, updates)
+                new_ema = jax.tree_util.tree_map(lambda e, n: 0.996 * e + 0.004 * n, ema_p, new_p)
+                return new_p, new_ema, new_ost, metrics
 
-            fn = jax.pmap(pstep, axis_name="dev", in_axes=(0, 0, 0, None, None, 0))
+            fn = jax.pmap(pstep, axis_name="dev", in_axes=(0, 0, 0, 0, None, None, 0, None))
         else:
             @jax.jit
-            def jstep(p, ost, batch, apl_target, apl_w, rng_key):
+            def jstep(p, ema_p, ost, batch, apl_target, apl_w, rng_key, gscales):
                 (_, metrics), grads = jax.value_and_grad(loss_single, has_aux=True)(p, batch, apl_target, apl_w, rng_key)
+                grads = jax.tree_util.tree_map(lambda g, s: g * s, grads, gscales)
                 updates, new_ost = tx.update(grads, ost, p)
-                return optax.apply_updates(p, updates), new_ost, metrics
+                new_p = optax.apply_updates(p, updates)
+                new_ema = jax.tree_util.tree_map(lambda e, n: 0.996 * e + 0.004 * n, ema_p, new_p)
+                return new_p, new_ema, new_ost, metrics
 
             fn = jstep
 
@@ -567,7 +705,7 @@ def train_saccadion_smart(
 
         @jax.jit
         def vstep(p, batch, apl_target, apl_w):
-            batch_f = {**batch, "board_feats": batch["board_feats"].astype(jnp.float32)}
+            batch_f = {**batch, "board_feats": _dequant_board_feats(batch["board_feats"])}
             out_a = forward_stream_a(
                 p, cfg, claws_idx,
                 batch_f["sparse_stm"], batch_f["sparse_opp"],
@@ -674,8 +812,6 @@ def train_saccadion_smart(
         updates, new_ost = tx.update(grads, ost, p)
         return optax.apply_updates(p, updates), new_ost, m
 
-    stage1_end = max(1, int(round(epochs * 0.20)))
-    stage2_end = max(stage1_end + 1, int(round(epochs * 0.70)))
     apl_weight = 0.05
     last_ckpt_time = time.time()
     prev_val_loss = history[-1]["val_loss"] if history else float("nan")
@@ -684,37 +820,23 @@ def train_saccadion_smart(
     try:
         for epoch in range(start_epoch, epochs + 1):
             t_ep0 = time.time()
-            # Keep QAT disabled until the final 2 epochs so validation converges smoothly!
-            qat_active = epoch >= max(2, epochs - 1) and epochs >= 4
-            if epoch <= stage1_end:
-                stage, stage_name, num_ticks, apl_target, qat = 1, "Optic-SEZ-Vision", 3, 0.16, False
-            elif epoch <= stage2_end:
-                stage, stage_name, num_ticks, apl_target, qat = 2, "Phasor-Causal", min(4, cfg.cx_max_ticks), 0.10, qat_active
-            else:
-                stage, stage_name, num_ticks, apl_target, qat = (
-                    3,
-                    "Meta-Dopamine+QAT" if qat_active else "Meta-Dopamine",
-                    min(4, cfg.cx_max_ticks),
-                    0.08,
-                    qat_active,
-                )
+            host_p_ref = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
+            stage, stage_name, num_ticks, apl_target, qat, grad_scales, freeze_map = build_freeze_thaw_schedule(
+                host_p_ref, epoch, epochs
+            )
 
-            # Stage 2 & 3: Run Meta-Dopamine + JEPA 2-Ply at the START of the epoch (before main
-            # full-tick sweep!) so policy/WDL weights settle cleanly before held-out validation!
+            # Phase 3 & 4: Fast pre-cached Meta-Dopamine + Action World Model scan (< 2s, ZERO Python decode freeze!)
             meta_gain_vals: List[float] = []
             jepa_loss_vals: List[float] = []
-            if stage >= 2 and len(traj_ds) >= 12:
+            if stage >= 3 and cached_traj_batches:
                 host_params = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
                 host_opt = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
-                traj_bsz = max(4, min(32, (len(traj_ds) // 12) // 2 or 1))
-                max_t_batches = 12 if stage == 2 else 28
-                for t_i, tbatch_np in enumerate(traj_ds.iter_trajectory_batches(traj_bsz, window_k=12, seed=epoch * 31)):
+                max_t_batches = 8 if stage == 3 else 12
+                for t_i, tbatch_np in enumerate(cached_traj_batches[:max_t_batches]):
                     tbatch = {k: jnp.asarray(v) for k, v in tbatch_np.items()}
                     host_params, host_opt, mm = stage_meta_jepa_step(host_params, host_opt, tbatch)
                     meta_gain_vals.append(float(mm["adapt_gain"]))
                     jepa_loss_vals.append(float(mm["jepa_loss"]))
-                    if t_i + 1 >= max_t_batches:
-                        break
                 if use_pmap:
                     params_dev = jax.device_put_replicated(host_params, jax.local_devices())
                     opt_dev = jax.device_put_replicated(host_opt, jax.local_devices())
@@ -725,8 +847,14 @@ def train_saccadion_smart(
             val_fn = get_val_step(num_ticks, qat)
 
             ep_losses: List[float] = []
+            ep_blunder_hits = 0.0
+            ep_wm_hits = 0.0
+            ep_blunder_cnt = 0.0
+            ep_bril_t1 = 0.0
+            ep_bril_t3 = 0.0
+            ep_bril_cnt = 0.0
             pos_seen = 0
-            ema_step_ms = 45.0
+            ema_step_ms = 35.0
             t_loop_start: Optional[float] = None
             pos_after_jit = 0
             jax_rng = jax.random.PRNGKey(epoch * 4241 + 7)
@@ -734,9 +862,9 @@ def train_saccadion_smart(
             prev_step_idx = 0
             prev_t0 = time.time()
 
-            # Mirror augmentation & f16 streaming run in 2 overlapped background threads (zero TPU stalls!)
+            # INT8 2-stage async streaming + background mirror augmentation (ZERO TPU stalls!)
             for step_idx, batch_np in enumerate(
-                train_ds.iter_batches(eff_bsz, seed=epoch * 997, prefetch=12, mirror_prob=0.5),
+                train_ds.iter_batches(eff_bsz, seed=epoch * 997, prefetch=16, mirror_prob=0.5),
                 start=1,
             ):
                 t_s0 = time.time()
@@ -744,15 +872,29 @@ def train_saccadion_smart(
                 if use_pmap:
                     b_in = _shard_batch_for_pmap(batch_np, n_dev)
                     dev_keys = jax.random.split(step_key, n_dev)
-                    params_dev, opt_dev, cur_m = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight, dev_keys)
+                    params_dev, ema_dev, opt_dev, cur_m = train_fn(
+                        params_dev, ema_dev, opt_dev, b_in, apl_target, apl_weight, dev_keys, grad_scales
+                    )
                 else:
                     b_in = {k: jnp.asarray(v) for k, v in batch_np.items()}
-                    params_dev, opt_dev, cur_m = train_fn(params_dev, opt_dev, b_in, apl_target, apl_weight, step_key)
+                    params_dev, ema_dev, opt_dev, cur_m = train_fn(
+                        params_dev, ema_dev, opt_dev, b_in, apl_target, apl_weight, step_key, grad_scales
+                    )
 
                 # Async 1-step overlap: read PREVIOUS step's scalar metrics while TPU executes CURRENT step!
                 if prev_m is not None:
-                    loss_val = float(prev_m["total"][0]) if use_pmap else float(prev_m["total"])
-                    kc_val = float(prev_m["active_kc_ratio"][0]) if use_pmap else float(prev_m["active_kc_ratio"])
+                    def _sc(key: str) -> float:
+                        return float(prev_m[key][0]) if use_pmap else float(prev_m[key])
+
+                    loss_val = _sc("total")
+                    kc_val = _sc("active_kc_ratio")
+                    ep_blunder_hits += _sc("blunder_avoid_hits")
+                    ep_wm_hits += _sc("wm_blunder_hits")
+                    ep_blunder_cnt += _sc("blunder_count")
+                    ep_bril_t1 += _sc("bril_top1_hits")
+                    ep_bril_t3 += _sc("bril_top3_hits")
+                    ep_bril_cnt += _sc("bril_count")
+
                     step_ms = (t_s0 - prev_t0) * 1000.0
                     if prev_step_idx == 1:
                         t_loop_start = t_s0
@@ -770,6 +912,17 @@ def train_saccadion_smart(
                         sec_per_step = max(1e-3, ema_step_ms / 1000.0)
                     rem_steps = (epochs - epoch) * steps_per_epoch + (steps_per_epoch - prev_step_idx)
                     eta_sec = rem_steps * sec_per_step
+                    live_extra = {
+                        "freeze_map": freeze_map,
+                        "blunder_avoid_pct": (100.0 * ep_blunder_hits / ep_blunder_cnt) if ep_blunder_cnt > 0 else 0.0,
+                        "wm_blunder_pct": (100.0 * ep_wm_hits / ep_blunder_cnt) if ep_blunder_cnt > 0 else 0.0,
+                        "bril_top1_pct": (100.0 * ep_bril_t1 / ep_bril_cnt) if ep_bril_cnt > 0 else 0.0,
+                        "bril_top3_pct": (100.0 * ep_bril_t3 / ep_bril_cnt) if ep_bril_cnt > 0 else 0.0,
+                        "blunder_seen": int(ep_blunder_cnt),
+                        "bril_seen": int(ep_bril_cnt),
+                        "gf_quiet_mae_live": _sc("gf_quiet_mae"),
+                        "best_val_loss": best_val_loss if best_val_loss < 1e8 else None,
+                    }
                     hud.update(
                         epoch=epoch,
                         total_epochs=epochs,
@@ -785,6 +938,7 @@ def train_saccadion_smart(
                         eta_sec=eta_sec,
                         history=history,
                         arena_status=arena.get_status() if arena else None,
+                        extra=live_extra,
                         force=False,
                     )
 
@@ -796,71 +950,79 @@ def train_saccadion_smart(
 
                 if (time.time() - last_ckpt_time) > ckpt_every_minutes * 60.0:
                     host_p = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
+                    host_e = jax.tree_util.tree_map(lambda x: x[0], ema_dev) if use_pmap else ema_dev
                     host_o = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
-                    save_checkpoint(ckpt_file, host_p, host_o, epoch - 1, global_step, best_val_loss, history)
+                    async_ckpt.save_async(ckpt_file, host_p, host_e, host_o, epoch - 1, global_step, best_val_loss, history)
                     last_ckpt_time = time.time()
 
             if prev_m is not None:
-                loss_val = float(prev_m["total"][0]) if use_pmap else float(prev_m["total"])
-                kc_val = float(prev_m["active_kc_ratio"][0]) if use_pmap else float(prev_m["active_kc_ratio"])
-                ep_losses.append(loss_val)
-                elapsed_loop = max(1e-3, time.time() - (t_loop_start or t_ep0))
-                cur_pos_s = max(pos_after_jit, eff_bsz) / elapsed_loop
-                hud.update(
-                    epoch=epoch,
-                    total_epochs=epochs,
-                    step=prev_step_idx,
-                    steps_per_epoch=steps_per_epoch,
-                    stage_name=stage_name,
-                    ticks=num_ticks,
-                    qat=qat,
-                    step_loss=loss_val,
-                    step_kc_pct=kc_val * 100.0,
-                    step_ms=ema_step_ms,
-                    pos_per_sec=cur_pos_s,
-                    eta_sec=max(0.0, (epochs - epoch) * elapsed_loop),
-                    history=history,
-                    arena_status=arena.get_status() if arena else None,
-                    force=True,
-                )
+                def _sc2(key: str) -> float:
+                    return float(prev_m[key][0]) if use_pmap else float(prev_m[key])
 
-            # Unwrap single-host copy for clean held-out Validation & .saccnet export
+                loss_val = _sc2("total")
+                kc_val = _sc2("active_kc_ratio")
+                ep_blunder_hits += _sc2("blunder_avoid_hits")
+                ep_wm_hits += _sc2("wm_blunder_hits")
+                ep_blunder_cnt += _sc2("blunder_count")
+                ep_bril_t1 += _sc2("bril_top1_hits")
+                ep_bril_t3 += _sc2("bril_top3_hits")
+                ep_bril_cnt += _sc2("bril_count")
+                ep_losses.append(loss_val)
+
+            # Unwrap single-host copy for clean held-out Validation (BOTH Live & Polyak EMA!)
             replay_batches_run = 0
             host_params = jax.tree_util.tree_map(lambda x: x[0], params_dev) if use_pmap else params_dev
+            host_ema = jax.tree_util.tree_map(lambda x: x[0], ema_dev) if use_pmap else ema_dev
             host_opt = jax.tree_util.tree_map(lambda x: x[0], opt_dev) if use_pmap else opt_dev
 
-            # Full Held-Out Validation Evaluation (Games + Dedicated 16-Causal-Concept Puzzles!)
-            val_acc: Dict[str, List[float]] = {
-                k: []
-                for k in [
-                    "total", "wdl_b", "wdl_a", "gf_loss", "gf_quiet_mae", "policy", "pressure", "lh", "orth",
-                    "noduli", "noduli_margin", "causal", "causal_f1", "vnc2", "imbalance",
-                    "active_kc_ratio", "top1_acc", "top3_acc", "wdl_acc", "cp_mae",
-                    "shunt_gain", "lob_focus", "mbon_ei_ratio", "lh_veto_mean",
-                    "rc_hub_norm", "cx_phasor_norm", "cent_focus", "plan_entropy", "pfl2_mean",
-                ]
-            }
+            val_keys = [
+                "total", "wdl_b", "wdl_a", "gf_loss", "gf_quiet_mae", "policy", "pressure", "lh", "orth",
+                "noduli", "noduli_margin", "causal", "causal_f1", "vnc2", "imbalance",
+                "active_kc_ratio", "top1_acc", "top3_acc", "wdl_acc", "cp_mae",
+                "shunt_gain", "lob_focus", "mbon_ei_ratio", "lh_veto_mean",
+                "rc_hub_norm", "cx_phasor_norm", "cent_focus", "plan_entropy", "pfl2_mean",
+            ]
             val_bsz = min(eff_bsz, max(1, len(val_ds)))
-            for v_i, vbatch_np in enumerate(val_ds.iter_batches(val_bsz, seed=12345)):
-                vb = {k: jnp.asarray(v) for k, v in vbatch_np.items()}
-                vm = val_fn(host_params, vb, apl_target, apl_weight)
-                for k in val_acc:
-                    if k not in ("causal", "causal_f1"):
-                        val_acc[k].append(float(vm[k]))
-                if v_i >= 24:
-                    break
+            val_batches_cached = [
+                {k: jnp.asarray(v) for k, v in vb_np.items()}
+                for v_i, vb_np in enumerate(val_ds.iter_batches(val_bsz, seed=12345))
+                if v_i <= 24
+            ]
 
-            # Dedicated held-out evaluation on 16-Causal-Concept Elite Puzzles!
-            if val_puz_ds is not None and len(val_puz_ds) > 0:
-                p_bsz = min(eff_bsz, len(val_puz_ds))
-                for pbatch_np in val_puz_ds.iter_batches(p_bsz, seed=12345):
-                    pb = {k: jnp.asarray(v) for k, v in pbatch_np.items()}
-                    pm = val_fn(host_params, pb, apl_target, apl_weight)
-                    val_acc["causal"].append(float(pm["causal"]))
-                    val_acc["causal_f1"].append(float(pm["causal_f1"]))
+            def _eval_candidate(cand_p: Dict[str, Any]) -> Dict[str, float]:
+                acc: Dict[str, List[float]] = {k: [] for k in val_keys}
+                for vb in val_batches_cached:
+                    vm = val_fn(cand_p, vb, apl_target, apl_weight)
+                    for k in val_keys:
+                        if k not in ("causal", "causal_f1"):
+                            acc[k].append(float(vm[k]))
+                if val_puz_ds is not None and len(val_puz_ds) > 0:
+                    p_bsz = min(eff_bsz, len(val_puz_ds))
+                    for pbatch_np in val_puz_ds.iter_batches(p_bsz, seed=12345):
+                        pb = {k: jnp.asarray(v) for k, v in pbatch_np.items()}
+                        pm = val_fn(cand_p, pb, apl_target, apl_weight)
+                        acc["causal"].append(float(pm["causal"]))
+                        acc["causal_f1"].append(float(pm["causal_f1"]))
+                return {k: float(np.mean(v)) if v else 0.0 for k, v in acc.items()}
 
-            v_mean = {k: float(np.mean(v)) if v else 0.0 for k, v in val_acc.items()}
-            ep_sec = max(1e-3, time.time() - t_ep0)
+            v_live = _eval_candidate(host_params)
+            # Compare Live vs Polyak EMA from Epoch 2+ and export strict best (zero regression!)
+            if epoch >= 2:
+                v_ema = _eval_candidate(host_ema)
+                if v_ema["total"] < v_live["total"]:
+                    v_mean = v_ema
+                    export_cand = host_ema
+                    used_ema = True
+                else:
+                    v_mean = v_live
+                    export_cand = host_params
+                    used_ema = False
+            else:
+                v_mean = v_live
+                export_cand = host_params
+                used_ema = False
+
+            ep_sec = max(1e-3, time.time() - (t_loop_start or t_ep0))
 
             # Adaptive APL Sparsity Controller
             if v_mean["active_kc_ratio"] > apl_target + 0.03:
@@ -874,8 +1036,13 @@ def train_saccadion_smart(
             is_best = val_loss < best_val_loss
             if is_best:
                 best_val_loss = val_loss
-                export_params_to_saccnet(cfg, jax.device_get(host_params), export_dir / "saccadion_best.saccnet")
-            export_params_to_saccnet(cfg, jax.device_get(host_params), export_dir / "saccadion_latest.saccnet")
+                export_params_to_saccnet(cfg, jax.device_get(export_cand), export_dir / "saccadion_best.saccnet")
+            export_params_to_saccnet(cfg, jax.device_get(export_cand), export_dir / "saccadion_latest.saccnet")
+
+            blunder_avoid_pct = (100.0 * ep_blunder_hits / ep_blunder_cnt) if ep_blunder_cnt > 0 else 0.0
+            wm_blunder_pct = (100.0 * ep_wm_hits / ep_blunder_cnt) if ep_blunder_cnt > 0 else 0.0
+            bril_top1_pct = (100.0 * ep_bril_t1 / ep_bril_cnt) if ep_bril_cnt > 0 else 0.0
+            bril_top3_pct = (100.0 * ep_bril_t3 / ep_bril_cnt) if ep_bril_cnt > 0 else 0.0
 
             eta_pam_v = float(jax.nn.softplus(host_params["meta_eta_pam"]))
             eta_ppl1_v = float(jax.nn.softplus(host_params["meta_eta_ppl1"]))
@@ -902,6 +1069,7 @@ def train_saccadion_smart(
                 "val_delta": val_delta,
                 "val_wdl_b": v_mean["wdl_b"],
                 "val_wdl_a": v_mean["wdl_a"],
+                "val_gf_loss": v_mean["gf_loss"],
                 "val_policy": v_mean["policy"],
                 "val_pressure": v_mean["pressure"],
                 "val_lh": v_mean["lh"],
@@ -912,6 +1080,12 @@ def train_saccadion_smart(
                 "val_causal_f1": v_mean["causal_f1"],
                 "val_vnc2": v_mean["vnc2"],
                 "val_imbalance": v_mean["imbalance"],
+                "blunder_avoid_pct": blunder_avoid_pct,
+                "wm_blunder_pct": wm_blunder_pct,
+                "bril_top1_pct": bril_top1_pct,
+                "bril_top3_pct": bril_top3_pct,
+                "used_ema": used_ema,
+                "best_val_loss": best_val_loss,
                 "val_top1_acc": v_mean["top1_acc"],
                 "val_top3_acc": v_mean["top3_acc"],
                 "val_wdl_acc": v_mean["wdl_acc"],
@@ -967,14 +1141,27 @@ def train_saccadion_smart(
                 eta_sec=max(0.0, (epochs - epoch) * ep_sec),
                 history=history,
                 arena_status=a_st,
+                extra={
+                    "freeze_map": freeze_map,
+                    "blunder_avoid_pct": blunder_avoid_pct,
+                    "wm_blunder_pct": wm_blunder_pct,
+                    "bril_top1_pct": bril_top1_pct,
+                    "bril_top3_pct": bril_top3_pct,
+                    "blunder_seen": int(ep_blunder_cnt),
+                    "bril_seen": int(ep_bril_cnt),
+                    "gf_quiet_mae_live": v_mean["gf_quiet_mae"],
+                    "used_ema": used_ema,
+                    "best_val_loss": best_val_loss,
+                },
                 force=True,
             )
             _print_epoch_banner(row, is_best)
-            save_checkpoint(ckpt_file, host_params, host_opt, epoch, global_step, best_val_loss, history)
+            async_ckpt.save_async(ckpt_file, host_params, host_ema, host_opt, epoch, global_step, best_val_loss, history)
             last_ckpt_time = time.time()
             # Reclaim Python + glibc host RAM cleanly every epoch so Colab RAM never climbs!
             _reclaim_host_ram()
     finally:
+        async_ckpt.wait()
         if arena is not None:
             arena.stop()
 

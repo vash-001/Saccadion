@@ -162,11 +162,13 @@ def blunder_repulsion_loss(
     best_move: jnp.ndarray,         # [B] int32
     blunder_move: jnp.ndarray,      # [B] int32 (0 = none)
     blunder_drop_cp: jnp.ndarray,   # [B] float32
-) -> jnp.ndarray:
-    """PPL1 Aversive Blunder Repulsion: actively drives down P(m_blunder) and Noduli(m_blunder)!"""
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """PPL1 Aversive Blunder Repulsion: drives down P(m_blunder) and Noduli(m_blunder)
+    and returns (loss, avoid_hits, blunder_count) for exact live telemetry!"""
     bsz = policy_logits.shape[0]
     row = jnp.arange(bsz)
-    mask = ((blunder_move > 0) & (blunder_move != best_move) & (blunder_drop_cp >= 150.0)).astype(jnp.float32)
+    mask_b = (blunder_move > 0) & (blunder_move != best_move) & (blunder_drop_cp >= 150.0)
+    mask = mask_b.astype(jnp.float32)
     probs = jax.nn.softmax(policy_logits, axis=-1)
     p_bad = probs[row, blunder_move]
     repel_pol = -jnp.log(jnp.clip(1.0 - p_bad, 1e-5, 1.0))
@@ -174,8 +176,13 @@ def blunder_repulsion_loss(
     nod_bad = noduli_delta_map[row, blunder_move]
     nod_good = noduli_delta_map[row, best_move]
     repel_nod = jax.nn.relu(nod_bad + 0.55) + jax.nn.relu(0.85 - (nod_good - nod_bad))
-    denom = jnp.maximum(jnp.sum(mask), 1.0)
-    return jnp.sum((2.0 * repel_pol + 0.5 * repel_nod) * mask) / denom
+
+    pol_good = policy_logits[row, best_move]
+    pol_bad = policy_logits[row, blunder_move]
+    avoid_hits = jnp.sum(((pol_good > pol_bad) & (nod_good > nod_bad)).astype(jnp.float32) * mask)
+    count = jnp.sum(mask)
+    loss = jnp.sum((2.0 * repel_pol + 0.5 * repel_nod) * mask) / jnp.maximum(count, 1.0)
+    return loss, avoid_hits, count
 
 
 def wm_blunder_contrast_loss(
@@ -185,10 +192,10 @@ def wm_blunder_contrast_loss(
     blunder_move: jnp.ndarray,
     blunder_drop_cp: jnp.ndarray,
     wdl_target: jnp.ndarray,
-) -> jnp.ndarray:
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Before->After Live hDelta World Model Supervision:
     Teaches exported `b_wm_w1/b1/w2` that `do(m_blunder)` collapses future WDL by `-drop_cp`
-    while `do(m_best)` preserves/achieves the clean target WDL!
+    while `do(m_best)` preserves/achieves the clean target WDL! Returns (loss, wm_detect_hits).
     """
     bsz = best_move.shape[0]
     row = jnp.arange(bsz)
@@ -212,6 +219,13 @@ def wm_blunder_contrast_loss(
     logits_bad = _imagined_wdl_logits(blunder_move)
     logits_good = _imagined_wdl_logits(best_move)
 
+    # Exact World-Model causal blunder-collapse accuracy: does WM foresee WDL(good) > WDL(blunder) + 0.15?
+    p_good = jax.nn.softmax(logits_good, axis=-1)
+    p_bad = jax.nn.softmax(logits_bad, axis=-1)
+    exp_good = p_good[:, 0] - p_good[:, 2]
+    exp_bad = p_bad[:, 0] - p_bad[:, 2]
+    wm_detect_hits = jnp.sum(((exp_good - exp_bad) >= 0.15).astype(jnp.float32) * mask)
+
     # Compute exact collapsed post-blunder WDL target: cp_after = cp_before - drop_cp
     exp_before = jnp.clip(wdl_target[:, 0] - wdl_target[:, 2], -0.99, 0.99)
     cp_before = 400.0 * jnp.arctanh(exp_before)
@@ -229,7 +243,7 @@ def wm_blunder_contrast_loss(
 
     per_b = _kl_vec(logits_bad, wdl_after) + 0.5 * _kl_vec(logits_good, wdl_target)
     denom = jnp.maximum(jnp.sum(mask), 1.0)
-    return jnp.sum(per_b * mask) / denom
+    return jnp.sum(per_b * mask) / denom, wm_detect_hits
 
 
 def creative_orthogonality_loss(plans: jnp.ndarray) -> jnp.ndarray:
@@ -441,19 +455,35 @@ def compute_multitask_loss(
 
     # 13. PPL1 Aversive Blunder Repulsion + 14. Before->After Live hDelta World Model Blunder Contrast!
     if "blunder_move" in batch and "blunder_drop_cp" in batch:
-        loss_blunder_repel = blunder_repulsion_loss(
+        loss_blunder_repel, blunder_avoid_hits, blunder_count = blunder_repulsion_loss(
             out_b["policy_logits"], out_b["noduli_delta_map"], best_mv,
             batch["blunder_move"], batch["blunder_drop_cp"],
         )
         if params is not None and "b_wm_w1" in params:
-            loss_wm_contrast = wm_blunder_contrast_loss(
+            loss_wm_contrast, wm_blunder_hits = wm_blunder_contrast_loss(
                 params, out_b, best_mv, batch["blunder_move"], batch["blunder_drop_cp"], wdl_t
             )
         else:
             loss_wm_contrast = jnp.array(0.0, dtype=jnp.float32)
+            wm_blunder_hits = jnp.array(0.0, dtype=jnp.float32)
     else:
         loss_blunder_repel = jnp.array(0.0, dtype=jnp.float32)
+        blunder_avoid_hits = jnp.array(0.0, dtype=jnp.float32)
+        blunder_count = jnp.array(0.0, dtype=jnp.float32)
         loss_wm_contrast = jnp.array(0.0, dtype=jnp.float32)
+        wm_blunder_hits = jnp.array(0.0, dtype=jnp.float32)
+
+    # Exact Brilliant (!!) Move Discovery Telemetry (Top-1 & Top-3 on verified sacrifices/breakthroughs)
+    if is_bril is not None:
+        bril_m = (is_bril > 0.5).astype(jnp.float32)
+        top3_pol = jax.lax.top_k(out_b["policy_logits"], 3)[1]
+        bril_top1_hits = jnp.sum((top3_pol[:, 0] == best_mv).astype(jnp.float32) * bril_m)
+        bril_top3_hits = jnp.sum(jnp.any(top3_pol == best_mv[:, None], axis=-1).astype(jnp.float32) * bril_m)
+        bril_count = jnp.sum(bril_m)
+    else:
+        bril_top1_hits = jnp.array(0.0, dtype=jnp.float32)
+        bril_top3_hits = jnp.array(0.0, dtype=jnp.float32)
+        bril_count = jnp.array(0.0, dtype=jnp.float32)
 
     total = (
         loss_wdl
@@ -490,6 +520,12 @@ def compute_multitask_loss(
         "imbalance": loss_imbalance,
         "blunder_repel": loss_blunder_repel,
         "wm_contrast": loss_wm_contrast,
+        "blunder_avoid_hits": blunder_avoid_hits,
+        "wm_blunder_hits": wm_blunder_hits,
+        "blunder_count": blunder_count,
+        "bril_top1_hits": bril_top1_hits,
+        "bril_top3_hits": bril_top3_hits,
+        "bril_count": bril_count,
         "active_kc_ratio": out_a["active_kc_ratio"],
         # All-12 Drosophila Brain Circuits live telemetry
         "shunt_gain": out_b["shunt_gain"],

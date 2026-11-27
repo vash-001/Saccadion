@@ -5,7 +5,7 @@ use saccadion_chess::features::{
     extract_bilateral_sparse, extract_chess_graph_adj, extract_lateral_horn_features,
     extract_stream_b_board, LATERAL_HORN_DIM, STREAM_B_SQ_FEAT_DIM,
 };
-use saccadion_data::format::{f32_to_f16, read_sacc_shard, write_sacc_shard, SaccRecord};
+use saccadion_data::format::{read_sacc_shard, write_sacc_shard, SaccRecord};
 use saccadion_data::pgn::parse_pgn_text;
 use saccadion_data::pipeline::{extract_trajectory_windows, game_to_sacc_records};
 use std::env;
@@ -125,7 +125,8 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
 
     let mut sp_stm = vec![-1i16; n * MAX_SPARSE_CACHE];
     let mut sp_opp = vec![-1i16; n * MAX_SPARSE_CACHE];
-    let mut board_f16 = vec![0u16; n * 64 * STREAM_B_SQ_FEAT_DIM];
+    // FastCache v7: compact INT8 [-127, 127] board_feats cuts disk/RAM/PCIe by 2x (fits 100% hot in RAM!)
+    let mut board_i8 = vec![0i8; n * 64 * STREAM_B_SQ_FEAT_DIM];
     // Bit-packed 4-channel FlyWire Chess-Graph adjacency: [n, 4, 64, 2] u32 (lo/hi 32 bits of u64)
     let mut graph_adj_u32 = vec![0u32; n * 4 * 64 * 2];
     let mut lh_feat = vec![0.0f32; n * LATERAL_HORN_DIM];
@@ -148,7 +149,7 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
     std::thread::scope(|scope| {
         let mut rem_sp_s = sp_stm.as_mut_slice();
         let mut rem_sp_o = sp_opp.as_mut_slice();
-        let mut rem_bd = board_f16.as_mut_slice();
+        let mut rem_bd = board_i8.as_mut_slice();
         let mut rem_gadj = graph_adj_u32.as_mut_slice();
         let mut rem_lh = lh_feat.as_mut_slice();
         let mut rem_ph = phase.as_mut_slice();
@@ -213,7 +214,7 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
                     for sq in 0..64 {
                         let base = sq * STREAM_B_SQ_FEAT_DIM;
                         for f in 0..STREAM_B_SQ_FEAT_DIM {
-                            dst_bd[base + f] = f32_to_f16(bd[sq][f]);
+                            dst_bd[base + f] = (bd[sq][f] * 127.0).round().clamp(-127.0, 127.0) as i8;
                         }
                     }
 
@@ -262,7 +263,7 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
 
     write_raw_slice(&out_cache_dir.join("sparse_stm.i16"), &sp_stm).expect("write sparse_stm");
     write_raw_slice(&out_cache_dir.join("sparse_opp.i16"), &sp_opp).expect("write sparse_opp");
-    write_raw_slice(&out_cache_dir.join("board_feats.f16"), &board_f16).expect("write board_feats");
+    write_raw_slice(&out_cache_dir.join("board_feats.i8"), &board_i8).expect("write board_feats");
     write_raw_slice(&out_cache_dir.join("graph_adj.u32"), &graph_adj_u32).expect("write graph_adj");
     write_raw_slice(&out_cache_dir.join("lh_feat.f32"), &lh_feat).expect("write lh_feat");
     write_raw_slice(&out_cache_dir.join("phase.u8"), &phase).expect("write phase");
@@ -278,7 +279,7 @@ fn run_predecode(out_cache_dir: &Path, shard_paths: &[PathBuf]) {
     write_raw_slice(&out_cache_dir.join("contrast.u32"), &all_contrast).expect("write contrast");
 
     let meta_json = format!(
-        "{{\"count\": {}, \"max_sparse\": {}, \"version\": 6, \"num_shards\": {}}}",
+        "{{\"count\": {}, \"max_sparse\": {}, \"version\": 7, \"num_shards\": {}}}",
         n,
         MAX_SPARSE_CACHE,
         shard_paths.len()

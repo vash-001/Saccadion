@@ -651,6 +651,8 @@ def _find_rust_data_binary() -> Optional[Path]:
     for cand in [
         repo_root / "target" / "release" / "saccadion-data",
         repo_root / "target" / "release" / "saccadion-data.exe",
+        Path("/content/drive/MyDrive/Saccadion_TPU/bin_v13/saccadion-data"),
+        Path("/content/drive/MyDrive/Saccadion_TPU/bin_v12/saccadion-data"),
         Path("/content/drive/MyDrive/Saccadion_TPU/bin_v11/saccadion-data"),
         Path("/content/drive/MyDrive/Saccadion_TPU/bin_v10/saccadion-data"),
         Path("/content/drive/MyDrive/Saccadion_TPU/bin_v9/saccadion-data"),
@@ -707,12 +709,12 @@ def build_or_open_memmap_cache(
     if not shard_paths:
         return None
     fp = _shards_fingerprint(shard_paths)
-    cdir = cache_root / f"{split_name}_v6_{fp}"
+    cdir = cache_root / f"{split_name}_v7_{fp}"
     meta_file = cdir / "meta.json"
     if meta_file.exists():
         try:
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
-            if meta.get("version") == 6 and int(meta.get("count", 0)) > 0:
+            if meta.get("version") == 7 and int(meta.get("count", 0)) > 0:
                 return cdir
         except Exception:
             pass
@@ -720,7 +722,7 @@ def build_or_open_memmap_cache(
     cdir.mkdir(parents=True, exist_ok=True)
     rust_bin = _find_rust_data_binary()
     if rust_bin is not None:
-        print(f"[FastCache] Rust multi-threaded pre-decoding `{split_name}` ({len(shard_paths)} shards, Graph+LC4+Blunder/Brilliant)...")
+        print(f"[FastCache v7] Rust multi-threaded INT8 pre-decoding `{split_name}` ({len(shard_paths)} shards, 2x smaller RAM)...")
         res = subprocess.run(
             [str(rust_bin), "predecode", str(cdir)] + [str(p) for p in shard_paths],
             capture_output=True,
@@ -730,7 +732,7 @@ def build_or_open_memmap_cache(
         if res.returncode == 0 and meta_file.exists():
             try:
                 m_chk = json.loads(meta_file.read_text(encoding="utf-8"))
-                if m_chk.get("version") == 6:
+                if m_chk.get("version") == 7:
                     print(" ", res.stdout.strip())
                     return cdir
             except Exception:
@@ -772,7 +774,7 @@ def build_or_open_memmap_cache(
 
     sp_s = np.memmap(cdir / "sparse_stm.i16", dtype="<i2", mode="w+", shape=(n, max_sparse))
     sp_o = np.memmap(cdir / "sparse_opp.i16", dtype="<i2", mode="w+", shape=(n, max_sparse))
-    bd = np.memmap(cdir / "board_feats.f16", dtype="<f2", mode="w+", shape=(n, 64, STREAM_B_SQ_FEAT_DIM))
+    bd = np.memmap(cdir / "board_feats.i8", dtype=np.int8, mode="w+", shape=(n, 64, STREAM_B_SQ_FEAT_DIM))
     ga = np.memmap(cdir / "graph_adj.u32", dtype="<u4", mode="w+", shape=(n, 4, 64, 2))
     lh = np.memmap(cdir / "lh_feat.f32", dtype="<f4", mode="w+", shape=(n, LATERAL_HORN_DIM))
     ph = np.memmap(cdir / "phase.u8", dtype=np.uint8, mode="w+", shape=(n,))
@@ -788,7 +790,7 @@ def build_or_open_memmap_cache(
                 m = len(p_c)
                 sp_s[offset : offset + m] = s_c
                 sp_o[offset : offset + m] = o_c
-                bd[offset : offset + m] = b_c
+                bd[offset : offset + m] = np.clip(np.rint(b_c.astype(np.float32) * 127.0), -127, 127).astype(np.int8)
                 ga[offset : offset + m] = g_c
                 lh[offset : offset + m] = l_c
                 ph[offset : offset + m] = p_c
@@ -799,7 +801,7 @@ def build_or_open_memmap_cache(
             m = len(p_c)
             sp_s[offset : offset + m] = s_c
             sp_o[offset : offset + m] = o_c
-            bd[offset : offset + m] = b_c
+            bd[offset : offset + m] = np.clip(np.rint(b_c.astype(np.float32) * 127.0), -127, 127).astype(np.int8)
             ga[offset : offset + m] = g_c
             lh[offset : offset + m] = l_c
             ph[offset : offset + m] = p_c
@@ -837,7 +839,7 @@ def build_or_open_memmap_cache(
     np.ascontiguousarray(contrast_ori, dtype="<u4").tofile(cdir / "contrast.u32")
 
     meta_file.write_text(
-        json.dumps({"count": n, "max_sparse": max_sparse, "version": 6, "num_shards": len(shard_paths)}),
+        json.dumps({"count": n, "max_sparse": max_sparse, "version": 7, "num_shards": len(shard_paths)}),
         encoding="utf-8",
     )
     dt = max(1e-3, time.time() - t0)
@@ -906,7 +908,13 @@ class SaccShardDataset:
         self._cache_path = cdir
         self._sp_s = np.memmap(cdir / "sparse_stm.i16", dtype="<i2", mode="r", shape=(n, ms))
         self._sp_o = np.memmap(cdir / "sparse_opp.i16", dtype="<i2", mode="r", shape=(n, ms))
-        self._bd = np.memmap(cdir / "board_feats.f16", dtype="<f2", mode="r", shape=(n, 64, STREAM_B_SQ_FEAT_DIM))
+        bd_i8 = cdir / "board_feats.i8"
+        if bd_i8.exists():
+            self._bd_is_i8 = True
+            self._bd = np.memmap(bd_i8, dtype=np.int8, mode="r", shape=(n, 64, STREAM_B_SQ_FEAT_DIM))
+        else:
+            self._bd_is_i8 = False
+            self._bd = np.memmap(cdir / "board_feats.f16", dtype="<f2", mode="r", shape=(n, 64, STREAM_B_SQ_FEAT_DIM))
         self._ga = np.memmap(cdir / "graph_adj.u32", dtype="<u4", mode="r", shape=(n, 4, 64, 2))
         self._lh = np.memmap(cdir / "lh_feat.f32", dtype="<f4", mode="r", shape=(n, LATERAL_HORN_DIM))
         self._ph = np.memmap(cdir / "phase.u8", dtype=np.uint8, mode="r", shape=(n,))
@@ -931,10 +939,13 @@ class SaccShardDataset:
             causal_concepts = ((cb[:, None] >> _BIT_SHIFTS_16[None, :]) & np.uint16(1)).astype(np.float32)
             causal_mask = (cb > 0).astype(np.float32)
             bmv, bdrop, is_bril = _unpack_contrast_u32(np.asarray(self._ct[indices], dtype=np.uint32))
+            bd_arr = np.asarray(self._bd[indices], dtype=np.float32)
+            if getattr(self, "_bd_is_i8", False):
+                bd_arr = bd_arr * (1.0 / 127.0)
             return {
                 "sparse_stm": np.asarray(self._sp_s[indices], dtype=np.int32),
                 "sparse_opp": np.asarray(self._sp_o[indices], dtype=np.int32),
-                "board_feats": np.asarray(self._bd[indices], dtype=np.float32),
+                "board_feats": bd_arr,
                 "graph_adj": np.asarray(self._ga[indices], dtype=np.uint32),
                 "lh_feat": np.asarray(self._lh[indices], dtype=np.float32),
                 "phase_bucket": np.asarray(self._ph[indices], dtype=np.int32),
@@ -1031,7 +1042,11 @@ class SaccShardDataset:
         return {
             "sparse_stm": np.asarray(self._sp_s[start:end], dtype=np.int32),
             "sparse_opp": np.asarray(self._sp_o[start:end], dtype=np.int32),
-            "board_feats": np.array(self._bd[start:end], dtype=np.float16, copy=True),
+            "board_feats": np.array(
+                self._bd[start:end],
+                dtype=np.int8 if getattr(self, "_bd_is_i8", False) else np.float16,
+                copy=True,
+            ),
             "graph_adj": np.array(self._ga[start:end], dtype=np.uint32, copy=True),
             "lh_feat": np.asarray(self._lh[start:end], dtype=np.float32),
             "phase_bucket": np.asarray(self._ph[start:end], dtype=np.int32),
@@ -1066,13 +1081,15 @@ class SaccShardDataset:
         rng = np.random.default_rng(seed)
 
         if self._cached and self._count >= batch_size * 2:
-            block_sz = max(batch_size * 2, 4096)
+            # Globally pre-shuffled super-blocks (16,384 recs = 32 batches, mix_k=1 -> ZERO np.concatenate copy
+            # and maximum Linux sequential SSD read-ahead! Only ~48 MB per block in INT8!)
+            block_sz = max(batch_size * 4, 16384)
             blocks = [
                 (s, min(self._count, s + block_sz))
                 for s in range(0, self._count, block_sz)
             ]
             block_order = rng.permutation(len(blocks))
-            mix_k = min(2, len(blocks))  # 8,192 records (~50 MB in compact f16!)
+            mix_k = 1
 
             chunk_q: queue.Queue = queue.Queue(maxsize=2)
             batch_q: queue.Queue = queue.Queue(maxsize=max(4, prefetch))
@@ -1219,7 +1236,10 @@ def augment_batch_file_mirror(
     sub[:, :, 12:20] = sub[:, :, 12 + _SLIDE_MIRROR]
     sub[:, :, 20:28] = sub[:, :, 20 + _SLIDE_MIRROR]
     sub[:, :, 28:36] = sub[:, :, 28 + _KNIGHT_MIRROR]
-    sub[:, :, 43] = sub.dtype.type(1.0) - sub[:, :, 43]
+    if sub.dtype == np.int8:
+        sub[:, :, 43] = np.int8(127) - sub[:, :, 43]
+    else:
+        sub[:, :, 43] = sub.dtype.type(1.0) - sub[:, :, 43]
     bd_new[do_flip] = sub
     out["board_feats"] = bd_new
 

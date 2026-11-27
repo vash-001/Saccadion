@@ -448,6 +448,9 @@ class ArenaStatus:
     parallel_workers: int = 1
     engine_families: List[str] = field(default_factory=list)
     per_engine_wdl: Dict[str, List[int]] = field(default_factory=dict)
+    active_boards: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    recent_games: List[Dict[str, Any]] = field(default_factory=list)
+    result_strip: List[int] = field(default_factory=list)
     opponent_name: str = "Baseline-Material-d2"
     opponent_elo: int = 900
     level_idx: int = 0
@@ -469,6 +472,9 @@ class ArenaStatus:
             "parallel_workers": self.parallel_workers,
             "engine_families": list(self.engine_families),
             "per_engine_wdl": {k: list(v) for k, v in self.per_engine_wdl.items()},
+            "active_boards": {k: dict(v) for k, v in self.active_boards.items()},
+            "recent_games": list(self.recent_games),
+            "result_strip": list(self.result_strip),
             "opponent_name": self.opponent_name,
             "opponent_elo": self.opponent_elo,
             "level_idx": self.level_idx,
@@ -567,6 +573,7 @@ class StockfishSparringArena:
         for cand in [
             repo_root / "target" / "release" / "saccadion",
             repo_root / "target" / "release" / "saccadion.exe",
+            Path("/content/drive/MyDrive/Saccadion_TPU/bin_v13/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v12/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v11/saccadion"),
             Path("/content/drive/MyDrive/Saccadion_TPU/bin_v10/saccadion"),
@@ -794,20 +801,35 @@ class StockfishSparringArena:
                 sacc_is_white = ((local_game + worker_id) % 2) == 0
                 local_game += 1
                 sacc_positions: List[Tuple[str, int]] = []
+                recent_ucis: List[str] = [m.uci() for m in board.move_stack[-6:]]
+                last_sacc_cp = 0
 
                 for ply in range(self.max_plies):
                     if self._stop_evt.is_set() or board.is_game_over():
                         break
-                    if worker_id == 0:
-                        with self._lock:
+                    with self._lock:
+                        if worker_id == 0:
                             self._status.current_game_ply = ply + 1
                             self._status.opponent_name = spec.name
                             self._status.opponent_elo = spec.elo
+                        self._status.active_boards[f"W{worker_id}"] = {
+                            "worker_id": worker_id,
+                            "opponent": spec.name,
+                            "family": spec.family,
+                            "opp_elo": spec.elo,
+                            "sacc_white": sacc_is_white,
+                            "ply": len(board.move_stack),
+                            "fen": board.fen(),
+                            "last_cp": last_sacc_cp,
+                            "recent_moves": list(recent_ucis[-8:]),
+                        }
 
                     is_sacc_turn = (board.turn == chess.WHITE) == sacc_is_white
                     if is_sacc_turn:
                         mv_u, cp = sacc_proc.go(board.fen(), movetime_ms=self.movetime_ms)
-                        sacc_positions.append((board.fen(), cp or 0))
+                        if cp is not None:
+                            last_sacc_cp = int(cp)
+                        sacc_positions.append((board.fen(), last_sacc_cp))
                     else:
                         if opp_proc is not None:
                             opp_time = max(35, self.movetime_ms // 2) if spec.is_stockfish else max(40, self.movetime_ms // 2)
@@ -822,6 +844,7 @@ class StockfishSparringArena:
                         if mv not in board.legal_moves:
                             break
                         board.push(mv)
+                        recent_ucis.append(mv_u)
                     except Exception:
                         break
 
@@ -864,6 +887,24 @@ class StockfishSparringArena:
                         wdl_e[2] += 1
                     self._status.real_elo = real_elo
                     self._status.elo_ci = elo_ci
+                    self._status.result_strip.append(1 if score == 1.0 else (-1 if score == 0.0 else 0))
+                    if len(self._status.result_strip) > 60:
+                        self._status.result_strip = self._status.result_strip[-60:]
+                    self._status.recent_games.append(
+                        {
+                            "gnum": gnum,
+                            "worker_id": worker_id,
+                            "opponent": spec.name,
+                            "family": spec.family,
+                            "opp_elo": spec.elo,
+                            "res": res_txt,
+                            "plies": len(board.move_stack),
+                            "sacc_white": sacc_is_white,
+                            "last_cp": last_sacc_cp,
+                        }
+                    )
+                    if len(self._status.recent_games) > 10:
+                        self._status.recent_games = self._status.recent_games[-10:]
                     if new_recs:
                         self._harvest_records.extend(new_recs)
                         self._status.harvested_positions = len(self._harvest_records)

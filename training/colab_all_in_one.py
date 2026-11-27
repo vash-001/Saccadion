@@ -38,7 +38,7 @@ LR_MUON = 3.5e-3             # Calibrated Muon peak LR
 LR_ADAMW = 5.0e-4            # Calibrated AdamW peak LR
 BUILD_RUST_TOOLS = True      # Builds Pure-Rust pre-decoder + UCI engine once & caches on Drive!
 ENABLE_CPU_ARENA = True      # Background Stockfish sparring on idle CPU cores -> REAL ELO!
-LIVE_HUD_HZ = 20.0           # Smooth 20 Hz flicker-free Colab HTML/SVG cockpit
+LIVE_HUD_HZ = 2.0            # Silky 2 Hz Zorynto Hakuji x Akane cockpit (zero Colab WebSocket lag!)
 USE_GOOGLE_DRIVE = True      # Saves checkpoints & best .saccnet safely across Colab disconnects
 # ====================================================================
 
@@ -120,9 +120,9 @@ def main() -> None:
     # 3. Install lightweight Python packages
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "optax", "python-chess", "zstandard", "matplotlib"])
 
-    # 4. Build or restore Pure-Rust tools (v12 = Saccadion-7 Neuro-Apex: Dendritic GF + 3500-PVS!)
+    # 4. Build or restore Pure-Rust tools (v13 = Saccadion-7 Apex + FastCache v7 INT8 + 3500-PVS!)
     if in_colab and BUILD_RUST_TOOLS:
-        _ensure_rust_binaries(work_root, persist_root / "bin_v12")
+        _ensure_rust_binaries(work_root, persist_root / "bin_v13")
 
     # 5. Purge any stale in-memory `saccadion_tpu.*` submodules before importing!
     train_pkg_root = str(work_root / "training")
@@ -174,8 +174,8 @@ def main() -> None:
         "pro": SaccadionConfig.pro,
     }[MODEL_TIER]()
 
-    ckpt_dir = persist_root / f"checkpoints_{MODEL_TIER}_v7"
-    export_dir = persist_root / f"exports_{MODEL_TIER}_v7"
+    ckpt_dir = persist_root / f"checkpoints_{MODEL_TIER}_v7_apex"
+    export_dir = persist_root / f"exports_{MODEL_TIER}_v7_apex"
     fast_cache = Path("/content/sacc_cache") if in_colab else (data_dir / "cache")
 
     _, history = train_saccadion_smart(
