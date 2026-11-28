@@ -65,7 +65,7 @@ def init_saccadion_params(cfg: SaccadionConfig, seed: int = 42) -> Dict[str, jnp
     stacks = cfg.num_phase_stacks
     smp_in = 2 * mbon + 4
 
-    s_ft = float((1.0 / 32.0) ** 0.5 * 0.15)
+    s_ft = float((1.0 / 32.0) ** 0.5 * 0.55)
     s_d = float((1.0 / d) ** 0.5 * 0.5)
     s_cx = float((1.0 / cx) ** 0.5 * 0.5)
     s_mbon = float((1.0 / (cfg.acc_dim * 0.1)) ** 0.5 * 0.25)
@@ -73,7 +73,7 @@ def init_saccadion_params(cfg: SaccadionConfig, seed: int = 42) -> Dict[str, jnp
     return {
         # Stream A
         "a_ft_weight": u((cfg.sparse_input_dim, cfg.acc_dim), s_ft),
-        "a_ft_bias": jnp.full((cfg.acc_dim,), 0.05, dtype=jnp.float32),
+        "a_ft_bias": jnp.full((cfg.acc_dim,), 0.25, dtype=jnp.float32),
         "a_sez_weight": jnp.asarray(init_sez_innate_weights(cfg.sparse_input_dim, stacks), dtype=jnp.float32),
         "a_claw_weight": u((plastic_dim, cfg.flyhash_claws), 0.35),
         "a_apl_beta": jnp.array([0.85, 0.85], dtype=jnp.float32),
@@ -171,12 +171,12 @@ def init_saccadion_params(cfg: SaccadionConfig, seed: int = 42) -> Dict[str, jnp
         "b_retro_w": u((GRAPH_EDGE_TYPES, d, d), s_d * 0.5),
         "b_wm_opp_w": u((cx, d + cx), s_d * 0.5),
         "b_wm_opp_b": jnp.zeros((cx,), dtype=jnp.float32),
-        # Saccadion-9 2-Layer NNUE Giant Fiber MLP (`ab_dim -> 32 -> 32 -> 1`, SCReLU, exported to v9!)
-        "a_gf_l1_w": u((stacks, GF_H1, ab_dim), float((2.0 / ab_dim) ** 0.5 * 0.5)),
-        "a_gf_l1_b": jnp.full((stacks, GF_H1), 0.05, dtype=jnp.float32),
-        "a_gf_l2_w": u((stacks, GF_H2, GF_H1), float((2.0 / GF_H1) ** 0.5 * 0.5)),
-        "a_gf_l2_b": jnp.full((stacks, GF_H2), 0.05, dtype=jnp.float32),
-        "a_gf_out_w": u((stacks, GF_H2), float((1.0 / GF_H2) ** 0.5 * 0.15)),
+        # Saccadion-9 2-Layer NNUE Giant Fiber MLP (`ab_dim -> 32 -> 32 -> 1`, CReLU, exported to v9!)
+        "a_gf_l1_w": u((stacks, GF_H1, ab_dim), float((2.0 / ab_dim) ** 0.5 * 0.75)),
+        "a_gf_l1_b": jnp.full((stacks, GF_H1), 0.20, dtype=jnp.float32),
+        "a_gf_l2_w": u((stacks, GF_H2, GF_H1), float((2.0 / GF_H1) ** 0.5 * 0.75)),
+        "a_gf_l2_b": jnp.full((stacks, GF_H2), 0.20, dtype=jnp.float32),
+        "a_gf_out_w": u((stacks, GF_H2), float((1.0 / GF_H2) ** 0.5 * 0.25)),
         "a_gf_out_b": jnp.zeros((stacks,), dtype=jnp.float32),
         # Training-only AOTU -> LAL -> SMP 16-Causal-Concept Effectome Head (zero Rust latency!)
         "aux_causal_w": u((NUM_CAUSAL_CONCEPTS, d + cx), s_d),
@@ -289,10 +289,10 @@ def forward_stream_a(
     if "a_gf_l1_w" in params:
         l1_w = ste_quantize(params["a_gf_l1_w"], bits=8, enabled=qat)[phase_bucket]  # [B, 32, ab_dim]
         l1_b = params["a_gf_l1_b"][phase_bucket]                                     # [B, 32]
-        h1 = jnp.clip(jnp.einsum("bha,ba->bh", l1_w, gf_feat) + l1_b, 0.0, 1.0) ** 2
+        h1 = jnp.clip(jnp.einsum("bha,ba->bh", l1_w, gf_feat) + l1_b, 0.0, 1.0)
         l2_w = params["a_gf_l2_w"][phase_bucket]                                     # [B, 32, 32]
         l2_b = params["a_gf_l2_b"][phase_bucket]                                     # [B, 32]
-        h2 = jnp.clip(jnp.einsum("bkh,bh->bk", l2_w, h1) + l2_b, 0.0, 1.0) ** 2
+        h2 = jnp.clip(jnp.einsum("bkh,bh->bk", l2_w, h1) + l2_b, 0.0, 1.0)
         out_w = params["a_gf_out_w"][phase_bucket]                                   # [B, 32]
         out_b = params["a_gf_out_b"][phase_bucket]                                   # [B]
         gf_mlp = jnp.sum(h2 * out_w, axis=-1) + out_b

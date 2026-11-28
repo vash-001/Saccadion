@@ -432,12 +432,12 @@ impl SaccadionWeights {
         let mbon = cfg.mbon_dim;
         let stacks = cfg.num_phase_stacks;
 
-        let s_ft = (1.0 / 32.0f32).sqrt() * 0.15;
+        let s_ft = (1.0 / 32.0f32).sqrt() * 0.55;
         let s_d = (1.0 / d as f32).sqrt() * 0.5;
         let s_cx = (1.0 / cx as f32).sqrt() * 0.5;
 
         let a_ft_weight = alloc_init(cfg.sparse_input_dim * cfg.acc_dim, s_ft, &mut rng);
-        let a_ft_bias = vec![0.05; cfg.acc_dim];
+        let a_ft_bias = vec![0.25; cfg.acc_dim];
         let a_ft_weight_i16 = quantize_to_i16(&a_ft_weight);
         let a_ft_ab_i16 = pack_ab_lobe_i16(&a_ft_weight_i16, cfg.sparse_input_dim, cfg.acc_dim, ab_dim);
         let a_ft_bias_i16 = quantize_to_i16(&a_ft_bias);
@@ -484,11 +484,11 @@ impl SaccadionWeights {
         let b_retro_w = alloc_init(GRAPH_EDGE_TYPES * d * d, s_d * 0.5, &mut rng);
         let b_wm_opp_w = alloc_init(cx * (d + cx), s_d * 0.5, &mut rng);
         let b_wm_opp_b = vec![0.0; cx];
-        let a_gf_l1_w = alloc_init(stacks * GF_H1 * ab_dim, (2.0 / ab_dim as f32).sqrt() * 0.5, &mut rng);
-        let a_gf_l1_b = vec![0.05; stacks * GF_H1];
-        let a_gf_l2_w = alloc_init(stacks * GF_H2 * GF_H1, (2.0 / GF_H1 as f32).sqrt() * 0.5, &mut rng);
-        let a_gf_l2_b = vec![0.05; stacks * GF_H2];
-        let a_gf_out_w = alloc_init(stacks * GF_H2, (1.0 / GF_H2 as f32).sqrt() * 0.15, &mut rng);
+        let a_gf_l1_w = alloc_init(stacks * GF_H1 * ab_dim, (2.0 / ab_dim as f32).sqrt() * 0.75, &mut rng);
+        let a_gf_l1_b = vec![0.20; stacks * GF_H1];
+        let a_gf_l2_w = alloc_init(stacks * GF_H2 * GF_H1, (2.0 / GF_H1 as f32).sqrt() * 0.75, &mut rng);
+        let a_gf_l2_b = vec![0.20; stacks * GF_H2];
+        let a_gf_out_w = alloc_init(stacks * GF_H2, (1.0 / GF_H2 as f32).sqrt() * 0.25, &mut rng);
         let a_gf_out_b = vec![0.0; stacks];
         let a_gf_mlp_active = true;
         let a_gf_l1_i8: Vec<QuantizedMatrixI8> = (0..stacks)

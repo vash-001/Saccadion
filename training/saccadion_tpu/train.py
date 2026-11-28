@@ -206,6 +206,56 @@ def estimate_elo_proxy(val_top1_pct: float, val_wdl_acc: float, val_cp_mae: floa
     return float(max(600.0, min(3600.0, 520.0 + 0.55 * pol_term + 0.45 * wdl_term + 0.35 * mae_term)))
 
 
+_JAX_SQ_MIRROR = jnp.asarray([sq ^ 7 for sq in range(64)], dtype=jnp.int32)
+_JAX_RAY_PERM = jnp.asarray(
+    list(range(12))
+    + [12 + i for i in (0, 7, 6, 5, 4, 3, 2, 1)]
+    + [20 + i for i in (0, 7, 6, 5, 4, 3, 2, 1)]
+    + [28 + i for i in (7, 6, 5, 4, 3, 2, 1, 0)]
+    + list(range(36, 48)),
+    dtype=jnp.int32,
+)
+
+
+def _reverse_bytes_u32_jax(x: jnp.ndarray) -> jnp.ndarray:
+    """Reverses the 8 bits inside each byte of a uint32 array on TPU (exact file a<->h bitboard mirror!)."""
+    x = ((x & jnp.uint32(0x55555555)) << jnp.uint32(1)) | ((x >> jnp.uint32(1)) & jnp.uint32(0x55555555))
+    x = ((x & jnp.uint32(0x33333333)) << jnp.uint32(2)) | ((x >> jnp.uint32(2)) & jnp.uint32(0x33333333))
+    x = ((x & jnp.uint32(0x0F0F0F0F)) << jnp.uint32(4)) | ((x >> jnp.uint32(4)) & jnp.uint32(0x0F0F0F0F))
+    return x
+
+
+def _augment_batch_file_mirror_jax(batch: Dict[str, jnp.ndarray], rng_key: Any, prob: float = 0.5) -> Dict[str, jnp.ndarray]:
+    """Exact horizontal file-mirror (a<->h) augmentation directly on TPU in < 0.05 ms (zero CPU/GIL cost!)."""
+    bd = batch["board_feats"]
+    bsz = bd.shape[0]
+    no_castle = bd[:, 0, 45] == 0.0
+    do_flip = no_castle & (jax.random.uniform(rng_key, (bsz,)) < prob)
+
+    bd_m = bd[:, _JAX_SQ_MIRROR, :][:, :, _JAX_RAY_PERM]
+    bd_m = bd_m.at[:, :, 43].set(1.0 - bd_m[:, :, 43])
+    bd_out = jnp.where(do_flip[:, None, None], bd_m, bd)
+
+    def _mirror_mv(m: jnp.ndarray) -> jnp.ndarray:
+        nz = m != 0
+        u = ((m >> 6) & 63) ^ 7
+        v = (m & 63) ^ 7
+        return jnp.where(nz, (u << 6) | v, m)
+
+    out = dict(batch)
+    out["board_feats"] = bd_out
+    if "graph_adj" in batch:
+        ga = batch["graph_adj"]
+        ga_m = _reverse_bytes_u32_jax(ga[:, :, _JAX_SQ_MIRROR, :])
+        out["graph_adj"] = jnp.where(do_flip[:, None, None, None], ga_m, ga)
+    out["top4_moves"] = jnp.where(do_flip[:, None], _mirror_mv(batch["top4_moves"]), batch["top4_moves"])
+    out["next_move"] = jnp.where(do_flip, _mirror_mv(batch["next_move"]), batch["next_move"])
+    if "blunder_move" in batch:
+        out["blunder_move"] = jnp.where(do_flip, _mirror_mv(batch["blunder_move"]), batch["blunder_move"])
+    out["threat_map_64"] = jnp.where(do_flip[:, None], batch["threat_map_64"][:, _JAX_SQ_MIRROR], batch["threat_map_64"])
+    return out
+
+
 def _unpack_batch_on_tpu(batch: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
     """Dequantizes compact INT8/INT16/UINT8 Host->TPU transfers on-chip in <0.01 ms!"""
     return {
@@ -665,8 +715,8 @@ def train_saccadion_smart(
             return compiled_train[key]
 
         def loss_single(cur_p, batch, apl_target, apl_w, rng_key):
-            k1, k2, k3 = jax.random.split(rng_key, 3)
-            batch_f = _unpack_batch_on_tpu(batch)
+            k_aug, k1, k3 = jax.random.split(rng_key, 3)
+            batch_f = _augment_batch_file_mirror_jax(_unpack_batch_on_tpu(batch), k_aug, prob=0.5)
             out_a = forward_stream_a(
                 cur_p, cfg, claws_idx,
                 batch_f["sparse_stm"], batch_f["sparse_opp"],
@@ -679,14 +729,8 @@ def train_saccadion_smart(
                 graph_adj_u32=batch_f.get("graph_adj"),
                 qat=qat, causal_drop_key=k3, drop_rate=0.12,
             )
-            out_a_steered = forward_stream_a(
-                cur_p, cfg, claws_idx,
-                batch_f["sparse_stm"], batch_f["sparse_opp"],
-                batch_f["lh_feat"], batch_f["phase_bucket"],
-                cent_mask=out_b["cent_kc_mask"], qat=qat, dropout_key=k2, kc_drop_rate=0.10, sparse_drop_rate=0.04, gf_drop_rate=0.05,
-            )
             return compute_multitask_loss(
-                out_a_steered, out_b, batch_f, apl_target_active=apl_target, apl_weight=apl_w, params=cur_p, out_a_unmasked=out_a
+                out_a, out_b, batch_f, apl_target_active=apl_target, apl_weight=apl_w, params=cur_p, out_a_unmasked=None
             )
 
         if use_pmap:
@@ -886,9 +930,9 @@ def train_saccadion_smart(
             prev_step_idx = 0
             prev_t0 = time.time()
 
-            # INT8 2-stage async streaming + background mirror augmentation (ZERO TPU stalls!)
+            # Zero-copy sequential streaming + on-TPU mirror augmentation (ZERO CPU/GIL/disk stalls!)
             for step_idx, batch_np in enumerate(
-                train_ds.iter_batches(eff_bsz, seed=epoch * 997, prefetch=16, mirror_prob=0.5),
+                train_ds.iter_batches(eff_bsz, seed=epoch * 997, prefetch=20, mirror_prob=0.0),
                 start=1,
             ):
                 t_s0 = time.time()

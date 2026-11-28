@@ -30,12 +30,12 @@ from pathlib import Path
 REPO_URL = "https://github.com/vash-001/Saccadion.git"
 MODEL_TIER = "pro"           # "tiny" (smoke test) | "nano" (fast ablation) | "pro" (full 58MB)
 DATA_SOURCE = "auto"         # "auto" (75% Fishtest + 25% Lichess 2000+ [%eval] + Diverse Puzzles + Survival)
-MAX_GAMES = 25000            # 25k Elite games (~2.7M pos + 45k Puzzles + 100k Contrastive — 100% RAM-hot on Colab!)
+MAX_GAMES = 15000            # 15k Elite games (~1.65M pos + 45k Puzzles + 100k Contrastive — 100% RAM-hot, ZERO disk stutter!)
 MAX_CAUSAL_PUZZLES = 45000   # Balanced across ALL 16 diverse causal/tactical/endgame concepts!
-EPOCHS = 15                  # Crisp anti-overfit schedule + 2-Layer NNUE Giant Fiber!
-BATCH_SIZE = 1024            # Saturates TPU v5e-1 MXU (~2x faster pos/s & cleaner gradients!)
-LR_MUON = 4.2e-3             # Scaled smoothly for batch=1024
-LR_ADAMW = 6.5e-4            # Scaled smoothly for batch=1024
+EPOCHS = 15                  # Crisp anti-overfit schedule + 2-Layer CReLU NNUE Giant Fiber!
+BATCH_SIZE = 512             # Full ~3,200 optimizer updates/epoch for sharp HalfKA + 2L Giant Fiber!
+LR_MUON = 3.0e-3             # Calibrated Muon peak LR
+LR_ADAMW = 5.0e-4            # Calibrated AdamW peak LR for 2-Layer CReLU Giant Fiber + HalfKA!
 BUILD_RUST_TOOLS = True      # Builds Pure-Rust pre-decoder + UCI engine once & caches on Drive!
 ENABLE_CPU_ARENA = True      # Background Stockfish sparring on idle CPU cores -> REAL ELO!
 LIVE_HUD_HZ = 1.0            # Silky 1 Hz Zorynto Hakuji x Akane cockpit (zero browser/WebSocket lag!)
@@ -120,9 +120,9 @@ def main() -> None:
     # 3. Install lightweight Python packages
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "optax", "python-chess", "zstandard", "matplotlib"])
 
-    # 4. Build or restore Pure-Rust tools (v16 = Saccadion-9 2-Layer NNUE Giant Fiber + Non-Blocking Async Stream B!)
+    # 4. Build or restore Pure-Rust tools (v17 = Saccadion-9.2 2-Layer CReLU NNUE Giant Fiber + Non-Blocking Async Stream B!)
     if in_colab and BUILD_RUST_TOOLS:
-        _ensure_rust_binaries(work_root, persist_root / "bin_v16")
+        _ensure_rust_binaries(work_root, persist_root / "bin_v17")
 
     # 5. Purge any stale in-memory `saccadion_tpu.*` submodules before importing!
     train_pkg_root = str(work_root / "training")
@@ -144,8 +144,8 @@ def main() -> None:
 
     print("JAX version:", jax.__version__, "| Devices:", jax.devices())
 
-    # 6. Download & organize elite chess dataset (35k Fishtest+Lichess + 45k Causal Puzzles + 100k Contrastive!)
-    data_dir = persist_root / "data_v9_nnue"
+    # 6. Download & organize RAM-hot elite chess dataset (15k Fishtest+Lichess + 45k Puzzles + 100k Contrastive!)
+    data_dir = persist_root / "data_v9_2_nnue"
     shard_dir = data_dir / "shards"
     if not list(shard_dir.glob("train_random_*.sacc")):
         shard_dir = fetch_and_prepare(
@@ -174,8 +174,8 @@ def main() -> None:
         "pro": SaccadionConfig.pro,
     }[MODEL_TIER]()
 
-    ckpt_dir = persist_root / f"checkpoints_{MODEL_TIER}_v9_nnue"
-    export_dir = persist_root / f"exports_{MODEL_TIER}_v9_nnue"
+    ckpt_dir = persist_root / f"checkpoints_{MODEL_TIER}_v9_2_nnue"
+    export_dir = persist_root / f"exports_{MODEL_TIER}_v9_2_nnue"
     fast_cache = Path("/content/sacc_cache") if in_colab else (data_dir / "cache")
 
     _, history = train_saccadion_smart(

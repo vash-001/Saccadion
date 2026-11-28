@@ -556,7 +556,7 @@ impl GiantFiberStack {
     }
 }
 
-/// L1-resident AVX2 INT8 2-Layer NNUE Giant Fiber MLP: `ab_dim -> 32 (SCReLU) -> 32 (SCReLU) -> 1`.
+/// L1-resident AVX2 INT8 2-Layer NNUE Giant Fiber MLP: `ab_dim -> 32 (CReLU) -> 32 (CReLU) -> 1`.
 #[inline(always)]
 fn eval_gf_mlp_i8(pair: &[f32], stack: usize, ab: usize, w: &SaccadionWeights) -> f32 {
     let mut h1 = [0.0f32; GF_H1];
@@ -564,16 +564,14 @@ fn eval_gf_mlp_i8(pair: &[f32], stack: usize, ab: usize, w: &SaccadionWeights) -
     matvec_i8_f32(&l1_q.data, &l1_q.scales, pair, GF_H1, ab, &mut h1);
     let l1_b = &w.a_gf_l1_b[stack * GF_H1..(stack + 1) * GF_H1];
     for j in 0..GF_H1 {
-        let v = (h1[j] + l1_b[j]).clamp(0.0, 1.0);
-        h1[j] = v * v;
+        h1[j] = (h1[j] + l1_b[j]).clamp(0.0, 1.0);
     }
     let mut h2 = [0.0f32; GF_H2];
     let l2_w = &w.a_gf_l2_w[stack * GF_H2 * GF_H1..(stack + 1) * GF_H2 * GF_H1];
     matvec_f32(l2_w, &h1, GF_H2, GF_H1, &mut h2);
     let l2_b = &w.a_gf_l2_b[stack * GF_H2..(stack + 1) * GF_H2];
     for j in 0..GF_H2 {
-        let v = (h2[j] + l2_b[j]).clamp(0.0, 1.0);
-        h2[j] = v * v;
+        h2[j] = (h2[j] + l2_b[j]).clamp(0.0, 1.0);
     }
     let out_w = &w.a_gf_out_w[stack * GF_H2..(stack + 1) * GF_H2];
     dot_f32(out_w, &h2) + w.a_gf_out_b[stack]
@@ -587,16 +585,14 @@ fn eval_gf_mlp_fp32(pair: &[f32], stack: usize, ab: usize, w: &SaccadionWeights)
     matvec_f32(l1_w, pair, GF_H1, ab, &mut h1);
     let l1_b = &w.a_gf_l1_b[stack * GF_H1..(stack + 1) * GF_H1];
     for j in 0..GF_H1 {
-        let v = (h1[j] + l1_b[j]).clamp(0.0, 1.0);
-        h1[j] = v * v;
+        h1[j] = (h1[j] + l1_b[j]).clamp(0.0, 1.0);
     }
     let mut h2 = [0.0f32; GF_H2];
     let l2_w = &w.a_gf_l2_w[stack * GF_H2 * GF_H1..(stack + 1) * GF_H2 * GF_H1];
     matvec_f32(l2_w, &h1, GF_H2, GF_H1, &mut h2);
     let l2_b = &w.a_gf_l2_b[stack * GF_H2..(stack + 1) * GF_H2];
     for j in 0..GF_H2 {
-        let v = (h2[j] + l2_b[j]).clamp(0.0, 1.0);
-        h2[j] = v * v;
+        h2[j] = (h2[j] + l2_b[j]).clamp(0.0, 1.0);
     }
     let out_w = &w.a_gf_out_w[stack * GF_H2..(stack + 1) * GF_H2];
     dot_f32(out_w, &h2) + w.a_gf_out_b[stack]

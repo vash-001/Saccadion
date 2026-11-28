@@ -432,7 +432,7 @@ def compute_multitask_loss(
     loss_gf = 1.40 * loss_gf_wdl + 0.55 * loss_gf_cp + 0.85 * loss_b_to_gf
     gf_quiet_mae = jnp.sum(jnp.abs(gf_cp - true_cp_target) * quiet_f) / jnp.maximum(jnp.sum(quiet_f), 1.0)
 
-    loss_wdl = loss_wdl_b + loss_wdl_a + 0.30 * loss_b_to_a + 0.45 * (loss_cp_a + loss_cp_b) + 0.85 * loss_gf
+    loss_wdl = loss_wdl_b + loss_wdl_a + 0.30 * loss_b_to_a + 0.45 * (loss_cp_a + loss_cp_b) + 1.35 * loss_gf
 
     # 2. Sparse Top-4 PFL3 Policy Loss with 2.2x PAM Brilliant Move (`!!`) Boost!
     is_bril = batch.get("is_brilliant")
