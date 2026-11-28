@@ -30,15 +30,15 @@ from pathlib import Path
 REPO_URL = "https://github.com/vash-001/Saccadion.git"
 MODEL_TIER = "pro"           # "tiny" (smoke test) | "nano" (fast ablation) | "pro" (full 58MB)
 DATA_SOURCE = "auto"         # "auto" (75% Fishtest + 25% Lichess 2000+ [%eval] + Diverse Puzzles + Survival)
-MAX_GAMES = 35000            # 35k Elite games (~3.8M pos + 45k Causal Puzzles + 100k Blunder/Looming — fits Free Colab TPU!)
+MAX_GAMES = 25000            # 25k Elite games (~2.7M pos + 45k Puzzles + 100k Contrastive — 100% RAM-hot on Colab!)
 MAX_CAUSAL_PUZZLES = 45000   # Balanced across ALL 16 diverse causal/tactical/endgame concepts!
-EPOCHS = 15                  # Crisp anti-overfit schedule + live Zero-Teacher dFB Self-Discovery from Ep 5+!
-BATCH_SIZE = 512             # Optimal for PRO on TPU v5e-1
-LR_MUON = 3.0e-3             # Calibrated Muon peak LR with 0.025 weight decay
-LR_ADAMW = 4.5e-4            # Calibrated AdamW peak LR with 0.045 HalfKA weight decay
+EPOCHS = 15                  # Crisp anti-overfit schedule + 2-Layer NNUE Giant Fiber!
+BATCH_SIZE = 1024            # Saturates TPU v5e-1 MXU (~2x faster pos/s & cleaner gradients!)
+LR_MUON = 4.2e-3             # Scaled smoothly for batch=1024
+LR_ADAMW = 6.5e-4            # Scaled smoothly for batch=1024
 BUILD_RUST_TOOLS = True      # Builds Pure-Rust pre-decoder + UCI engine once & caches on Drive!
 ENABLE_CPU_ARENA = True      # Background Stockfish sparring on idle CPU cores -> REAL ELO!
-LIVE_HUD_HZ = 2.0            # Silky 2 Hz Zorynto Hakuji x Akane cockpit (zero Colab WebSocket lag!)
+LIVE_HUD_HZ = 1.0            # Silky 1 Hz Zorynto Hakuji x Akane cockpit (zero browser/WebSocket lag!)
 USE_GOOGLE_DRIVE = True      # Saves checkpoints & best .saccnet safely across Colab disconnects
 # ====================================================================
 

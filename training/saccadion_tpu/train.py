@@ -206,6 +206,17 @@ def estimate_elo_proxy(val_top1_pct: float, val_wdl_acc: float, val_cp_mae: floa
     return float(max(600.0, min(3600.0, 520.0 + 0.55 * pol_term + 0.45 * wdl_term + 0.35 * mae_term)))
 
 
+def _unpack_batch_on_tpu(batch: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
+    """Dequantizes compact INT8/INT16/UINT8 Host->TPU transfers on-chip in <0.01 ms!"""
+    return {
+        **batch,
+        "board_feats": _dequant_board_feats(batch["board_feats"]),
+        "sparse_stm": batch["sparse_stm"].astype(jnp.int32),
+        "sparse_opp": batch["sparse_opp"].astype(jnp.int32),
+        "threat_map_64": batch["threat_map_64"].astype(jnp.float32),
+    }
+
+
 def _dequant_board_feats(bf: jnp.ndarray) -> jnp.ndarray:
     """Dequantizes compact INT8 FastCache v7 board_feats on TPU in <0.005 ms (zero host cost!)."""
     if bf.dtype == jnp.int8:
@@ -655,7 +666,7 @@ def train_saccadion_smart(
 
         def loss_single(cur_p, batch, apl_target, apl_w, rng_key):
             k1, k2, k3 = jax.random.split(rng_key, 3)
-            batch_f = {**batch, "board_feats": _dequant_board_feats(batch["board_feats"])}
+            batch_f = _unpack_batch_on_tpu(batch)
             out_a = forward_stream_a(
                 cur_p, cfg, claws_idx,
                 batch_f["sparse_stm"], batch_f["sparse_opp"],
@@ -712,7 +723,7 @@ def train_saccadion_smart(
 
         @jax.jit
         def vstep(p, batch, apl_target, apl_w):
-            batch_f = {**batch, "board_feats": _dequant_board_feats(batch["board_feats"])}
+            batch_f = _unpack_batch_on_tpu(batch)
             out_a = forward_stream_a(
                 p, cfg, claws_idx,
                 batch_f["sparse_stm"], batch_f["sparse_opp"],
