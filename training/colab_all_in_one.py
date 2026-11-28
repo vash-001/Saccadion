@@ -30,7 +30,7 @@ from pathlib import Path
 REPO_URL = "https://github.com/vash-001/Saccadion.git"
 MODEL_TIER = "pro"           # "tiny" (smoke test) | "nano" (fast ablation) | "pro" (full 58MB)
 DATA_SOURCE = "auto"         # "auto" (75% Fishtest + 25% Lichess 2000+ [%eval] + Diverse Puzzles + Survival)
-MAX_GAMES = 20000            # Compact diverse dataset (~2.0M pos + 45k Causal Puzzles + 100k Blunder/Looming — 100% RAM-hot!)
+MAX_GAMES = 35000            # 35k Elite games (~3.8M pos + 45k Causal Puzzles + 100k Blunder/Looming — fits Free Colab TPU!)
 MAX_CAUSAL_PUZZLES = 45000   # Balanced across ALL 16 diverse causal/tactical/endgame concepts!
 EPOCHS = 15                  # Crisp anti-overfit schedule + live Zero-Teacher dFB Self-Discovery from Ep 5+!
 BATCH_SIZE = 512             # Optimal for PRO on TPU v5e-1
@@ -120,9 +120,9 @@ def main() -> None:
     # 3. Install lightweight Python packages
     run_cmd([sys.executable, "-m", "pip", "install", "-q", "optax", "python-chess", "zstandard", "matplotlib"])
 
-    # 4. Build or restore Pure-Rust tools (v15 = Saccadion-8.2 Push/Pop Incremental Giant Fiber + TT-Safe Drosophila Search!)
+    # 4. Build or restore Pure-Rust tools (v16 = Saccadion-9 2-Layer NNUE Giant Fiber + Non-Blocking Async Stream B!)
     if in_colab and BUILD_RUST_TOOLS:
-        _ensure_rust_binaries(work_root, persist_root / "bin_v15")
+        _ensure_rust_binaries(work_root, persist_root / "bin_v16")
 
     # 5. Purge any stale in-memory `saccadion_tpu.*` submodules before importing!
     train_pkg_root = str(work_root / "training")
@@ -144,8 +144,8 @@ def main() -> None:
 
     print("JAX version:", jax.__version__, "| Devices:", jax.devices())
 
-    # 6. Download & organize compact diverse chess dataset (NO 15M Stockfish bloat — concept-rich + puzzles + contrastive!)
-    data_dir = persist_root / "data_v8_1_retro"
+    # 6. Download & organize elite chess dataset (35k Fishtest+Lichess + 45k Causal Puzzles + 100k Contrastive!)
+    data_dir = persist_root / "data_v9_nnue"
     shard_dir = data_dir / "shards"
     if not list(shard_dir.glob("train_random_*.sacc")):
         shard_dir = fetch_and_prepare(
@@ -174,8 +174,8 @@ def main() -> None:
         "pro": SaccadionConfig.pro,
     }[MODEL_TIER]()
 
-    ckpt_dir = persist_root / f"checkpoints_{MODEL_TIER}_v8_1_retro"
-    export_dir = persist_root / f"exports_{MODEL_TIER}_v8_1_retro"
+    ckpt_dir = persist_root / f"checkpoints_{MODEL_TIER}_v9_nnue"
+    export_dir = persist_root / f"exports_{MODEL_TIER}_v9_nnue"
     fast_cache = Path("/content/sacc_cache") if in_colab else (data_dir / "cache")
 
     _, history = train_saccadion_smart(

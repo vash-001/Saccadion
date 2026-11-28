@@ -6,10 +6,11 @@
 //! - Lateral Horn 98.2%-Inhibitory Innate Veto Circuit
 //! - SMP/CRE/SIP Convergence Hub + Octopamine Gain + Bounded Eligibility-Trace Dopamine
 
+use crate::config::{GF_H1, GF_H2};
 use crate::plasticity::{DopaminePlasticityState, SparseActiveKc};
 use crate::simd::{
-    add_inplace_f32, add_inplace_i16, axpy_f32, dot_f32, giant_fiber_pairwise_dot_i16, sigmoid,
-    silu, softmax_inplace, sub_inplace_f32, sub_inplace_i16,
+    add_inplace_f32, add_inplace_i16, axpy_f32, dot_f32, giant_fiber_pairwise_fill_i16,
+    matvec_f32, matvec_i8_f32, sigmoid, silu, softmax_inplace, sub_inplace_f32, sub_inplace_i16,
 };
 use crate::weights::{SaccadionWeights, FT_I16_INV_SCALE};
 use saccadion_chess::features::{
@@ -526,7 +527,8 @@ impl GiantFiberStack {
         }
     }
 
-    /// Evaluates the current ply in ~45 ns via fused AVX2+FMA Pairwise Dendritic Coincidence!
+    /// Evaluates the current ply in ~100 ns via fused AVX2 Pairwise Dendritic Coincidence
+    /// + Saccadion-9 2-Layer L1-Resident INT8/AVX2 NNUE MLP (`ab_dim -> 32 -> 32 -> 1`, SCReLU)!
     #[inline(always)]
     pub fn evaluate_ply(&self, ply: usize, pos: &Position, w: &SaccadionWeights) -> i32 {
         let entry = &self.entries[ply.min(MAX_GF_PLY - 1)];
@@ -535,16 +537,69 @@ impl GiantFiberStack {
         let stack = pos.phase_bucket().min(w.cfg.num_phase_stacks - 1);
         let stm_i = pos.side_to_move.index();
         let opp_i = stm_i ^ 1;
-        let gf_off = stack * ab;
-        let w_stm = &w.a_gf_w[gf_off..gf_off + half_ab];
-        let w_opp = &w.a_gf_w[gf_off + half_ab..gf_off + ab];
 
-        let stm_dot = giant_fiber_pairwise_dot_i16(&entry.acc[stm_i], w_stm, FT_I16_INV_SCALE);
-        let opp_dot = giant_fiber_pairwise_dot_i16(&entry.acc[opp_i], w_opp, FT_I16_INV_SCALE);
+        let mut pair = [0.0f32; 512];
+        let pair_sl = &mut pair[..ab];
+        giant_fiber_pairwise_fill_i16(&entry.acc[stm_i], &mut pair_sl[..half_ab], FT_I16_INV_SCALE);
+        giant_fiber_pairwise_fill_i16(&entry.acc[opp_i], &mut pair_sl[half_ab..ab], FT_I16_INV_SCALE);
+
+        let gf_off = stack * ab;
+        let skip = dot_f32(pair_sl, &w.a_gf_w[gf_off..gf_off + ab]) + w.a_gf_b[stack];
+        let mlp = if w.a_gf_mlp_active {
+            eval_gf_mlp_i8(pair_sl, stack, ab, w)
+        } else {
+            0.0
+        };
         let sez_cp = ((entry.sez[stm_i][stack] - entry.sez[opp_i][stack]) as f32) * 50.0;
-        let gf_pos_cp = (stm_dot + opp_dot + w.a_gf_b[stack]) * 400.0;
+        let gf_pos_cp = (skip + mlp) * 400.0;
         (sez_cp + gf_pos_cp).clamp(-2500.0, 2500.0).round() as i32
     }
+}
+
+/// L1-resident AVX2 INT8 2-Layer NNUE Giant Fiber MLP: `ab_dim -> 32 (SCReLU) -> 32 (SCReLU) -> 1`.
+#[inline(always)]
+fn eval_gf_mlp_i8(pair: &[f32], stack: usize, ab: usize, w: &SaccadionWeights) -> f32 {
+    let mut h1 = [0.0f32; GF_H1];
+    let l1_q = &w.a_gf_l1_i8[stack];
+    matvec_i8_f32(&l1_q.data, &l1_q.scales, pair, GF_H1, ab, &mut h1);
+    let l1_b = &w.a_gf_l1_b[stack * GF_H1..(stack + 1) * GF_H1];
+    for j in 0..GF_H1 {
+        let v = (h1[j] + l1_b[j]).clamp(0.0, 1.0);
+        h1[j] = v * v;
+    }
+    let mut h2 = [0.0f32; GF_H2];
+    let l2_w = &w.a_gf_l2_w[stack * GF_H2 * GF_H1..(stack + 1) * GF_H2 * GF_H1];
+    matvec_f32(l2_w, &h1, GF_H2, GF_H1, &mut h2);
+    let l2_b = &w.a_gf_l2_b[stack * GF_H2..(stack + 1) * GF_H2];
+    for j in 0..GF_H2 {
+        let v = (h2[j] + l2_b[j]).clamp(0.0, 1.0);
+        h2[j] = v * v;
+    }
+    let out_w = &w.a_gf_out_w[stack * GF_H2..(stack + 1) * GF_H2];
+    dot_f32(out_w, &h2) + w.a_gf_out_b[stack]
+}
+
+/// Exact FP32 reference for the 2-Layer NNUE Giant Fiber MLP (used in JAX <-> Rust parity tests).
+#[inline(always)]
+fn eval_gf_mlp_fp32(pair: &[f32], stack: usize, ab: usize, w: &SaccadionWeights) -> f32 {
+    let mut h1 = [0.0f32; GF_H1];
+    let l1_w = &w.a_gf_l1_w[stack * GF_H1 * ab..(stack + 1) * GF_H1 * ab];
+    matvec_f32(l1_w, pair, GF_H1, ab, &mut h1);
+    let l1_b = &w.a_gf_l1_b[stack * GF_H1..(stack + 1) * GF_H1];
+    for j in 0..GF_H1 {
+        let v = (h1[j] + l1_b[j]).clamp(0.0, 1.0);
+        h1[j] = v * v;
+    }
+    let mut h2 = [0.0f32; GF_H2];
+    let l2_w = &w.a_gf_l2_w[stack * GF_H2 * GF_H1..(stack + 1) * GF_H2 * GF_H1];
+    matvec_f32(l2_w, &h1, GF_H2, GF_H1, &mut h2);
+    let l2_b = &w.a_gf_l2_b[stack * GF_H2..(stack + 1) * GF_H2];
+    for j in 0..GF_H2 {
+        let v = (h2[j] + l2_b[j]).clamp(0.0, 1.0);
+        h2[j] = v * v;
+    }
+    let out_w = &w.a_gf_out_w[stack * GF_H2..(stack + 1) * GF_H2];
+    dot_f32(out_w, &h2) + w.a_gf_out_b[stack]
 }
 
 /// Ultra-fast (< 15 ns) innate Lateral Horn hazard reflex for non-PV nodes:
@@ -644,32 +699,33 @@ pub fn evaluate_giant_fiber_cp(
 
     let stm = pos.side_to_move;
     let opp = stm.flip();
-    let gf_off = stack * ab_dim;
-    let w_stm = &w.a_gf_w[gf_off..gf_off + half_ab];
-    let w_opp = &w.a_gf_w[gf_off + half_ab..gf_off + ab_dim];
+    let mut pair = [0.0f32; 512];
+    let pair_sl = &mut pair[..ab_dim];
 
-    // Zero-copy 16-wide AVX2 INT16 HalfKA accumulator update + fused Pairwise Dendritic FMA!
-    let (stm_dot, sez_stm) = {
+    let sez_stm = {
         let (acc_s, sez_all) = ws.finny_i16.update_halfka_ref_i16(pos, stm, w);
-        (
-            giant_fiber_pairwise_dot_i16(acc_s, w_stm, FT_I16_INV_SCALE),
-            sez_all[stack],
-        )
+        giant_fiber_pairwise_fill_i16(acc_s, &mut pair_sl[..half_ab], FT_I16_INV_SCALE);
+        sez_all[stack]
     };
-    let (opp_dot, sez_opp) = {
+    let sez_opp = {
         let (acc_o, sez_all) = ws.finny_i16.update_halfka_ref_i16(pos, opp, w);
-        (
-            giant_fiber_pairwise_dot_i16(acc_o, w_opp, FT_I16_INV_SCALE),
-            sez_all[stack],
-        )
+        giant_fiber_pairwise_fill_i16(acc_o, &mut pair_sl[half_ab..ab_dim], FT_I16_INV_SCALE);
+        sez_all[stack]
     };
 
+    let gf_off = stack * ab_dim;
+    let skip = dot_f32(pair_sl, &w.a_gf_w[gf_off..gf_off + ab_dim]) + w.a_gf_b[stack];
+    let mlp = if w.a_gf_mlp_active {
+        eval_gf_mlp_i8(pair_sl, stack, ab_dim, w)
+    } else {
+        0.0
+    };
     let sez_cp = (sez_stm - sez_opp) * 50.0;
-    let gf_pos_cp = (stm_dot + opp_dot + w.a_gf_b[stack]) * 400.0;
+    let gf_pos_cp = (skip + mlp) * 400.0;
     (sez_cp + gf_pos_cp).clamp(-2500.0, 2500.0).round() as i32
 }
 
-/// Exact FP32 Giant Fiber Dendritic Coincidence reference for bit-exact JAX <-> Rust parity tests.
+/// Exact FP32 Giant Fiber Dendritic Coincidence + 2-Layer NNUE MLP reference for bit-exact parity tests.
 pub fn evaluate_giant_fiber_fp32(
     pos: &Position,
     w: &SaccadionWeights,
@@ -681,32 +737,37 @@ pub fn evaluate_giant_fiber_fp32(
     let stack = pos.phase_bucket().min(cfg.num_phase_stacks - 1);
     let stm = pos.side_to_move;
     let opp = stm.flip();
-    let gf_off = stack * ab_dim;
-    let w_stm = &w.a_gf_w[gf_off..gf_off + half_ab];
-    let w_opp = &w.a_gf_w[gf_off + half_ab..gf_off + ab_dim];
+    let mut pair = [0.0f32; 512];
+    let pair_sl = &mut pair[..ab_dim];
 
-    let (stm_dot, sez_stm) = {
+    let sez_stm = {
         let (acc_s, sez_all) = ws.finny.update_halfka_ref(pos, stm, w);
-        let mut s = 0.0f32;
         for i in 0..half_ab {
             let a = acc_s[i].clamp(0.0, 1.0);
             let b = acc_s[i + half_ab].clamp(0.0, 1.0);
-            s += (a * b) * w_stm[i];
+            pair_sl[i] = a * b;
         }
-        (s, sez_all[stack])
+        sez_all[stack]
     };
-    let (opp_dot, sez_opp) = {
+    let sez_opp = {
         let (acc_o, sez_all) = ws.finny.update_halfka_ref(pos, opp, w);
-        let mut s = 0.0f32;
         for i in 0..half_ab {
             let a = acc_o[i].clamp(0.0, 1.0);
             let b = acc_o[i + half_ab].clamp(0.0, 1.0);
-            s += (a * b) * w_opp[i];
+            pair_sl[half_ab + i] = a * b;
         }
-        (s, sez_all[stack])
+        sez_all[stack]
+    };
+
+    let gf_off = stack * ab_dim;
+    let skip = dot_f32(pair_sl, &w.a_gf_w[gf_off..gf_off + ab_dim]) + w.a_gf_b[stack];
+    let mlp = if w.a_gf_mlp_active {
+        eval_gf_mlp_fp32(pair_sl, stack, ab_dim, w)
+    } else {
+        0.0
     };
     let sez_cp = (sez_stm - sez_opp) * 50.0;
-    let gf_pos_cp = (stm_dot + opp_dot + w.a_gf_b[stack]) * 400.0;
+    let gf_pos_cp = (skip + mlp) * 400.0;
     (sez_cp + gf_pos_cp).clamp(-2500.0, 2500.0)
 }
 

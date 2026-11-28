@@ -176,10 +176,10 @@ def build_muon_adamw_optimizer(
             _signed_decoupled_weight_decay(sched_muon, weight_decay=0.025),
         )
 
-    # Strong anti-overfit decoupled weight decay: prevents 13.9M HalfKA table & 4.5M Stream B
-    # from memorizing static games and drives Val GF Quiet MAE down cleanly!
-    adamw_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=1.5e-2)
-    sparse_ft_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=4.5e-2)
+    # Balanced decoupled weight decay: prevents memorization while letting HalfKA + 2L Giant Fiber
+    # learn crisp <50 cp positional patterns without over-shrinking sparse embeddings!
+    adamw_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=1.2e-2)
+    sparse_ft_tx = optax.adamw(learning_rate=sched_adamw, weight_decay=1.4e-2)
     sez_tx = optax.adamw(learning_rate=sched_sez, weight_decay=2.0e-4)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
@@ -660,7 +660,7 @@ def train_saccadion_smart(
                 cur_p, cfg, claws_idx,
                 batch_f["sparse_stm"], batch_f["sparse_opp"],
                 batch_f["lh_feat"], batch_f["phase_bucket"],
-                qat=qat, dropout_key=k1, kc_drop_rate=0.12, sparse_drop_rate=0.08, gf_drop_rate=0.22,
+                qat=qat, dropout_key=k1, kc_drop_rate=0.10, sparse_drop_rate=0.04, gf_drop_rate=0.05,
             )
             out_b = forward_stream_b(
                 cur_p, cfg, batch_f["board_feats"], out_a["mbon_summary"],
@@ -672,7 +672,7 @@ def train_saccadion_smart(
                 cur_p, cfg, claws_idx,
                 batch_f["sparse_stm"], batch_f["sparse_opp"],
                 batch_f["lh_feat"], batch_f["phase_bucket"],
-                cent_mask=out_b["cent_kc_mask"], qat=qat, dropout_key=k2, kc_drop_rate=0.12, sparse_drop_rate=0.08, gf_drop_rate=0.22,
+                cent_mask=out_b["cent_kc_mask"], qat=qat, dropout_key=k2, kc_drop_rate=0.10, sparse_drop_rate=0.04, gf_drop_rate=0.05,
             )
             return compute_multitask_loss(
                 out_a_steered, out_b, batch_f, apl_target_active=apl_target, apl_weight=apl_w, params=cur_p, out_a_unmasked=out_a
@@ -816,6 +816,12 @@ def train_saccadion_smart(
             }
 
         (_, m), grads = jax.value_and_grad(meta_loss_fn, has_aux=True)(p)
+        # Strict Meta-DA & World-Model Isolation: NEVER perturb calibrated HalfKA, Giant Fiber,
+        # Optic, or Policy weights during trajectory scan (eliminates post-Epoch-10 Elo dip!)
+        grads = {
+            k: (g if (k.startswith(("meta_", "b_wm_")) or k == "a_plastic_to_mbon") else jnp.zeros_like(g))
+            for k, g in grads.items()
+        }
         updates, new_ost = tx.update(grads, ost, p)
         return optax.apply_updates(p, updates), new_ost, m
 
@@ -979,12 +985,18 @@ def train_saccadion_smart(
 
             # Unwrap single-host copy for clean held-out Validation (BOTH Live & Polyak EMA!)
             replay_batches_run = 0
-            # Live Zero-Teacher dFB Self-Discovery Burst (starting Epoch 5, every 2 epochs):
-            # Generates brand-new self-played quiet positions using Saccadion's OWN best weights
-            # so the model breaks past static-dataset memorization and discovers original tactics!
+            # Live Zero-Teacher dFB Self-Discovery Burst: ONLY activates once 2-Layer Giant Fiber
+            # reaches <65 cp Quiet MAE so low-depth self-play NEVER dilutes 2,700+ Elo weights!
             best_saccnet_path = export_dir / "saccadion_best.saccnet"
             rust_uci_bin = arena._find_rust_uci() if arena is not None else None
-            if epoch >= 5 and (epoch % 2 == 1) and best_saccnet_path.exists() and rust_uci_bin is not None:
+            last_gf_mae = history[-1].get("val_gf_quiet_mae", 999.0) if history else 999.0
+            if (
+                epoch >= 6
+                and (epoch % 2 == 0)
+                and last_gf_mae < 65.0
+                and best_saccnet_path.exists()
+                and rust_uci_bin is not None
+            ):
                 sp_out = fast_cache_dir / f"dfb_selfplay_ep{epoch}.sacc"
                 try:
                     sp_res = subprocess.run(
@@ -1077,10 +1089,10 @@ def train_saccadion_smart(
 
             ep_sec = max(1e-3, time.time() - (t_loop_start or t_ep0))
 
-            # Adaptive APL Sparsity Controller
-            if v_mean["active_kc_ratio"] > apl_target + 0.03:
-                apl_weight = min(0.50, apl_weight * 1.25)
-            elif v_mean["active_kc_ratio"] < apl_target * 0.65:
+            # Adaptive APL Sparsity Controller (keeps Active KCs tightly pinned near 8.0% FlyWire target)
+            if v_mean["active_kc_ratio"] > apl_target + 0.015:
+                apl_weight = min(1.50, apl_weight * 1.35)
+            elif v_mean["active_kc_ratio"] < apl_target * 0.70:
                 apl_weight = max(0.01, apl_weight * 0.85)
 
             val_loss = v_mean["total"]

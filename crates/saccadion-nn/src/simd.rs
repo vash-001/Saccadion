@@ -535,6 +535,67 @@ unsafe fn sub_inplace_i16_avx2(dst: &mut [i16], src: &[i16]) {
     }
 }
 
+/// Fused AVX2 Pairwise Dendritic Coincidence feature builder (~15 ns for half=192!):
+/// Writes `out[i] = clamp(acc_i16[i]*inv_scale, 0, 1) * clamp(acc_i16[i+half]*inv_scale, 0, 1)`.
+#[inline]
+pub fn giant_fiber_pairwise_fill_i16(acc_i16: &[i16], out: &mut [f32], inv_scale: f32) {
+    let half = out.len();
+    debug_assert!(acc_i16.len() >= 2 * half);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            // SAFETY: AVX2 presence verified once at runtime.
+            unsafe { giant_fiber_pairwise_fill_i16_avx2(acc_i16, out, inv_scale) };
+            return;
+        }
+    }
+    for i in 0..half {
+        let a = (acc_i16[i] as f32 * inv_scale).clamp(0.0, 1.0);
+        let b = (acc_i16[i + half] as f32 * inv_scale).clamp(0.0, 1.0);
+        out[i] = a * b;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn giant_fiber_pairwise_fill_i16_avx2(acc_i16: &[i16], out: &mut [f32], inv_scale: f32) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let half = out.len();
+        let pa_lo = acc_i16.as_ptr();
+        let pa_hi = acc_i16.as_ptr().add(half);
+        let po = out.as_mut_ptr();
+        let v_zero = _mm256_setzero_ps();
+        let v_one = _mm256_set1_ps(1.0);
+        let v_sc = _mm256_set1_ps(inv_scale);
+        let mut i = 0usize;
+        while i + 16 <= half {
+            let raw_lo = _mm256_loadu_si256(pa_lo.add(i) as *const __m256i);
+            let raw_hi = _mm256_loadu_si256(pa_hi.add(i) as *const __m256i);
+
+            let lo0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(raw_lo))), v_sc);
+            let hi0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(raw_hi))), v_sc);
+            let a0 = _mm256_min_ps(_mm256_max_ps(lo0, v_zero), v_one);
+            let b0 = _mm256_min_ps(_mm256_max_ps(hi0, v_zero), v_one);
+            _mm256_storeu_ps(po.add(i), _mm256_mul_ps(a0, b0));
+
+            let lo1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(raw_lo, 1))), v_sc);
+            let hi1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(raw_hi, 1))), v_sc);
+            let a1 = _mm256_min_ps(_mm256_max_ps(lo1, v_zero), v_one);
+            let b1 = _mm256_min_ps(_mm256_max_ps(hi1, v_zero), v_one);
+            _mm256_storeu_ps(po.add(i + 8), _mm256_mul_ps(a1, b1));
+
+            i += 16;
+        }
+        while i < half {
+            let a = (*pa_lo.add(i) as f32 * inv_scale).clamp(0.0, 1.0);
+            let b = (*pa_hi.add(i) as f32 * inv_scale).clamp(0.0, 1.0);
+            *po.add(i) = a * b;
+            i += 1;
+        }
+    }
+}
+
 /// Fused AVX2+FMA Pairwise Dendritic Coincidence Giant Fiber kernel (~35 ns for ab_dim=384!):
 /// Computes `sum_{i=0..half} (clamp(acc[i]*inv_scale, 0, 1) * clamp(acc[i+half]*inv_scale, 0, 1)) * w[i]`.
 #[inline]

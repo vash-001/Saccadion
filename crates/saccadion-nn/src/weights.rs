@@ -4,8 +4,8 @@
 //! checkpoints load directly into Pure Rust with bit-verified numerical parity.
 
 use crate::config::{
-    build_flyhash_claws, splitmix64, ModelConfig, AMACRINE_RANK, GRAPH_EDGE_TYPES, OPTIC_LAYERS,
-    PLASTIC_RANK, SACCNET_MAGIC, SACCNET_VERSION,
+    build_flyhash_claws, splitmix64, ModelConfig, AMACRINE_RANK, GF_H1, GF_H2, GRAPH_EDGE_TYPES,
+    OPTIC_LAYERS, PLASTIC_RANK, SACCNET_MAGIC, SACCNET_VERSION,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -349,11 +349,23 @@ pub struct SaccadionWeights {
     pub b_wm_opp_w: Vec<f32>,        // [cx_dim * (stream_b_dim + cx_dim)]
     pub b_wm_opp_b: Vec<f32>,        // [cx_dim]
 
+    // ==================== SACCADION-9 2-LAYER NNUE GIANT FIBER MLP (v9!) ====================
+    /// L1-resident nonlinear Giant Fiber MLP per phase stack: `ab_dim -> 32 -> 32 -> 1` (SCReLU)
+    /// added residually to the linear pairwise skip connection (`a_gf_w/b`)!
+    pub a_gf_l1_w: Vec<f32>,         // [num_phase_stacks * GF_H1 * ab_dim]
+    pub a_gf_l1_b: Vec<f32>,         // [num_phase_stacks * GF_H1]
+    pub a_gf_l2_w: Vec<f32>,         // [num_phase_stacks * GF_H2 * GF_H1]
+    pub a_gf_l2_b: Vec<f32>,         // [num_phase_stacks * GF_H2]
+    pub a_gf_out_w: Vec<f32>,        // [num_phase_stacks * GF_H2]
+    pub a_gf_out_b: Vec<f32>,        // [num_phase_stacks]
+
     // ==================== DERIVED RUNTIME AVX2 INT16/INT8 CACHE (NOT ON DISK) ====================
     /// Pre-quantized INT16 feature transformer & tightly packed alpha/beta Giant Fiber rows.
     pub a_ft_weight_i16: Vec<i16>,
     pub a_ft_ab_i16: Vec<i16>,
     pub a_ft_bias_i16: Vec<i16>,
+    pub a_gf_l1_i8: Vec<QuantizedMatrixI8>,
+    pub a_gf_mlp_active: bool,
     pub a_mbon_ipsi_i8: Vec<i8>,
     pub a_mbon_ipsi_scale: Vec<f32>,
     pub a_mbon_contra_i8: Vec<i8>,
@@ -472,6 +484,22 @@ impl SaccadionWeights {
         let b_retro_w = alloc_init(GRAPH_EDGE_TYPES * d * d, s_d * 0.5, &mut rng);
         let b_wm_opp_w = alloc_init(cx * (d + cx), s_d * 0.5, &mut rng);
         let b_wm_opp_b = vec![0.0; cx];
+        let a_gf_l1_w = alloc_init(stacks * GF_H1 * ab_dim, (2.0 / ab_dim as f32).sqrt() * 0.5, &mut rng);
+        let a_gf_l1_b = vec![0.05; stacks * GF_H1];
+        let a_gf_l2_w = alloc_init(stacks * GF_H2 * GF_H1, (2.0 / GF_H1 as f32).sqrt() * 0.5, &mut rng);
+        let a_gf_l2_b = vec![0.05; stacks * GF_H2];
+        let a_gf_out_w = alloc_init(stacks * GF_H2, (1.0 / GF_H2 as f32).sqrt() * 0.15, &mut rng);
+        let a_gf_out_b = vec![0.0; stacks];
+        let a_gf_mlp_active = true;
+        let a_gf_l1_i8: Vec<QuantizedMatrixI8> = (0..stacks)
+            .map(|s| {
+                QuantizedMatrixI8::from_f32(
+                    &a_gf_l1_w[s * GF_H1 * ab_dim..(s + 1) * GF_H1 * ab_dim],
+                    GF_H1,
+                    ab_dim,
+                )
+            })
+            .collect();
         let sb_i8 = StreamBQuantCache::build(
             d, cx, &b_gnn_w, &b_retro_w, &b_opt_q, &b_opt_k, &b_opt_v, &b_opt_o,
             &b_opt_fg, &b_opt_fu, &b_opt_fd, &b_int_q, &b_int_k, &b_int_v, &b_int_o,
@@ -577,9 +605,17 @@ impl SaccadionWeights {
             b_retro_w,
             b_wm_opp_w,
             b_wm_opp_b,
+            a_gf_l1_w,
+            a_gf_l1_b,
+            a_gf_l2_w,
+            a_gf_l2_b,
+            a_gf_out_w,
+            a_gf_out_b,
             a_ft_weight_i16,
             a_ft_ab_i16,
             a_ft_bias_i16,
+            a_gf_l1_i8,
+            a_gf_mlp_active,
             a_mbon_ipsi_i8,
             a_mbon_ipsi_scale,
             a_mbon_contra_i8,
@@ -815,6 +851,12 @@ impl SaccadionWeights {
         write_slice(&mut w, &self.b_retro_w)?;
         write_slice(&mut w, &self.b_wm_opp_w)?;
         write_slice(&mut w, &self.b_wm_opp_b)?;
+        write_slice(&mut w, &self.a_gf_l1_w)?;
+        write_slice(&mut w, &self.a_gf_l1_b)?;
+        write_slice(&mut w, &self.a_gf_l2_w)?;
+        write_slice(&mut w, &self.a_gf_l2_b)?;
+        write_slice(&mut w, &self.a_gf_out_w)?;
+        write_slice(&mut w, &self.a_gf_out_b)?;
 
         w.flush()
     }
@@ -1056,9 +1098,41 @@ impl SaccadionWeights {
             )
         };
 
+        let (a_gf_l1_w, a_gf_l1_b, a_gf_l2_w, a_gf_l2_b, a_gf_out_w, a_gf_out_b, a_gf_mlp_active) =
+            if ver >= 9 {
+                (
+                    read_vec(&mut r, stacks * GF_H1 * ab_dim)?,
+                    read_vec(&mut r, stacks * GF_H1)?,
+                    read_vec(&mut r, stacks * GF_H2 * GF_H1)?,
+                    read_vec(&mut r, stacks * GF_H2)?,
+                    read_vec(&mut r, stacks * GF_H2)?,
+                    read_vec(&mut r, stacks)?,
+                    true,
+                )
+            } else {
+                (
+                    vec![0.0; stacks * GF_H1 * ab_dim],
+                    vec![0.0; stacks * GF_H1],
+                    vec![0.0; stacks * GF_H2 * GF_H1],
+                    vec![0.0; stacks * GF_H2],
+                    vec![0.0; stacks * GF_H2],
+                    vec![0.0; stacks],
+                    false,
+                )
+            };
+
         let a_ft_weight_i16 = quantize_to_i16(&a_ft_weight);
         let a_ft_ab_i16 = pack_ab_lobe_i16(&a_ft_weight_i16, cfg.sparse_input_dim, cfg.acc_dim, ab_dim);
         let a_ft_bias_i16 = quantize_to_i16(&a_ft_bias);
+        let a_gf_l1_i8: Vec<QuantizedMatrixI8> = (0..stacks)
+            .map(|s| {
+                QuantizedMatrixI8::from_f32(
+                    &a_gf_l1_w[s * GF_H1 * ab_dim..(s + 1) * GF_H1 * ab_dim],
+                    GF_H1,
+                    ab_dim,
+                )
+            })
+            .collect();
         let (a_mbon_ipsi_i8, a_mbon_ipsi_scale) = quantize_stacks_to_i8(&a_mbon_ipsi, stacks);
         let (a_mbon_contra_i8, a_mbon_contra_scale) = quantize_stacks_to_i8(&a_mbon_contra, stacks);
         let sb_i8 = StreamBQuantCache::build(
@@ -1162,9 +1236,17 @@ impl SaccadionWeights {
             b_retro_w,
             b_wm_opp_w,
             b_wm_opp_b,
+            a_gf_l1_w,
+            a_gf_l1_b,
+            a_gf_l2_w,
+            a_gf_l2_b,
+            a_gf_out_w,
+            a_gf_out_b,
             a_ft_weight_i16,
             a_ft_ab_i16,
             a_ft_bias_i16,
+            a_gf_l1_i8,
+            a_gf_mlp_active,
             a_mbon_ipsi_i8,
             a_mbon_ipsi_scale,
             a_mbon_contra_i8,

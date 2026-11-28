@@ -3,8 +3,11 @@
 use saccadion_chess::features::{LATERAL_HORN_DIM, STREAM_A_SPARSE_DIM, STREAM_B_SQ_FEAT_DIM};
 
 pub const SACCNET_MAGIC: [u8; 8] = *b"SACCNET1";
-pub const SACCNET_VERSION: u32 = 8;
+pub const SACCNET_VERSION: u32 = 9;
 pub const OPTIC_LAYERS: usize = 3;
+/// Saccadion-9 2-Layer NNUE Giant Fiber hidden widths (L1-resident AVX2 MLP: ab_dim -> 32 -> 32 -> 1).
+pub const GF_H1: usize = 32;
+pub const GF_H2: usize = 32;
 /// Low-rank L1-resident synaptic channel width for 3-lobe (gamma / alpha'-beta' -> MBON) plasticity.
 pub const PLASTIC_RANK: usize = 8;
 /// Low-rank dynamic factor width per head for Amacrine (Dm/Pm) position-conditioned attention.

@@ -19,6 +19,8 @@ import numpy as np
 
 from .config import (
     AMACRINE_RANK,
+    GF_H1,
+    GF_H2,
     GRAPH_EDGE_TYPES,
     HALFKA_DIM,
     NUM_CAUSAL_CONCEPTS,
@@ -169,6 +171,13 @@ def init_saccadion_params(cfg: SaccadionConfig, seed: int = 42) -> Dict[str, jnp
         "b_retro_w": u((GRAPH_EDGE_TYPES, d, d), s_d * 0.5),
         "b_wm_opp_w": u((cx, d + cx), s_d * 0.5),
         "b_wm_opp_b": jnp.zeros((cx,), dtype=jnp.float32),
+        # Saccadion-9 2-Layer NNUE Giant Fiber MLP (`ab_dim -> 32 -> 32 -> 1`, SCReLU, exported to v9!)
+        "a_gf_l1_w": u((stacks, GF_H1, ab_dim), float((2.0 / ab_dim) ** 0.5 * 0.5)),
+        "a_gf_l1_b": jnp.full((stacks, GF_H1), 0.05, dtype=jnp.float32),
+        "a_gf_l2_w": u((stacks, GF_H2, GF_H1), float((2.0 / GF_H1) ** 0.5 * 0.5)),
+        "a_gf_l2_b": jnp.full((stacks, GF_H2), 0.05, dtype=jnp.float32),
+        "a_gf_out_w": u((stacks, GF_H2), float((1.0 / GF_H2) ** 0.5 * 0.15)),
+        "a_gf_out_b": jnp.zeros((stacks,), dtype=jnp.float32),
         # Training-only AOTU -> LAL -> SMP 16-Causal-Concept Effectome Head (zero Rust latency!)
         "aux_causal_w": u((NUM_CAUSAL_CONCEPTS, d + cx), s_d),
         "aux_causal_b": jnp.full((NUM_CAUSAL_CONCEPTS,), -0.5, dtype=jnp.float32),
@@ -274,9 +283,22 @@ def forward_stream_a(
     if "a_gf_w" in params:
         gf_w = params["a_gf_w"][phase_bucket]  # [B, ab_dim]
         gf_b = params["a_gf_b"][phase_bucket]  # [B]
-        gf_pos_cp = (jnp.sum(gf_feat * gf_w, axis=-1) + gf_b) * 400.0
+        gf_skip = jnp.sum(gf_feat * gf_w, axis=-1) + gf_b
     else:
-        gf_pos_cp = jnp.zeros((bsz,), dtype=jnp.float32)
+        gf_skip = jnp.zeros((bsz,), dtype=jnp.float32)
+    if "a_gf_l1_w" in params:
+        l1_w = ste_quantize(params["a_gf_l1_w"], bits=8, enabled=qat)[phase_bucket]  # [B, 32, ab_dim]
+        l1_b = params["a_gf_l1_b"][phase_bucket]                                     # [B, 32]
+        h1 = jnp.clip(jnp.einsum("bha,ba->bh", l1_w, gf_feat) + l1_b, 0.0, 1.0) ** 2
+        l2_w = params["a_gf_l2_w"][phase_bucket]                                     # [B, 32, 32]
+        l2_b = params["a_gf_l2_b"][phase_bucket]                                     # [B, 32]
+        h2 = jnp.clip(jnp.einsum("bkh,bh->bk", l2_w, h1) + l2_b, 0.0, 1.0) ** 2
+        out_w = params["a_gf_out_w"][phase_bucket]                                   # [B, 32]
+        out_b = params["a_gf_out_b"][phase_bucket]                                   # [B]
+        gf_mlp = jnp.sum(h2 * out_w, axis=-1) + out_b
+    else:
+        gf_mlp = jnp.zeros((bsz,), dtype=jnp.float32)
+    gf_pos_cp = (gf_skip + gf_mlp) * 400.0
     gf_cp = jnp.clip(gf_sez_cp + gf_pos_cp, -2500.0, 2500.0)
 
     # 2. FlyHash Sparse Claw Projection onto gamma + alpha'/beta' lobes

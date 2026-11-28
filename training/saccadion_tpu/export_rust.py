@@ -15,6 +15,8 @@ import numpy as np
 
 from .config import (
     AMACRINE_RANK,
+    GF_H1,
+    GF_H2,
     GRAPH_EDGE_TYPES,
     OPTIC_LAYERS,
     PLASTIC_RANK,
@@ -118,6 +120,12 @@ SACCNET_TENSOR_ORDER = [
     "b_retro_w",
     "b_wm_opp_w",
     "b_wm_opp_b",
+    "a_gf_l1_w",
+    "a_gf_l1_b",
+    "a_gf_l2_w",
+    "a_gf_l2_b",
+    "a_gf_out_w",
+    "a_gf_out_b",
 ]
 
 
@@ -263,6 +271,12 @@ def init_numpy_params(cfg: SaccadionConfig, seed: int = 1234) -> Dict[str, np.nd
         "b_retro_w": u((GRAPH_EDGE_TYPES, d, d), s_d * 0.5),
         "b_wm_opp_w": u((cx, d + cx), s_d * 0.5),
         "b_wm_opp_b": np.zeros((cx,), dtype=np.float32),
+        "a_gf_l1_w": u((stacks, GF_H1, ab_dim), (2.0 / ab_dim) ** 0.5 * 0.5),
+        "a_gf_l1_b": np.full((stacks, GF_H1), 0.05, dtype=np.float32),
+        "a_gf_l2_w": u((stacks, GF_H2, GF_H1), (2.0 / GF_H1) ** 0.5 * 0.5),
+        "a_gf_l2_b": np.full((stacks, GF_H2), 0.05, dtype=np.float32),
+        "a_gf_out_w": u((stacks, GF_H2), (1.0 / GF_H2) ** 0.5 * 0.15),
+        "a_gf_out_b": np.zeros((stacks,), dtype=np.float32),
     }
 
 
@@ -329,7 +343,11 @@ def verify_python_to_rust_parity(rust_binary: Path, tmp_saccnet: Path) -> None:
     cs = np.clip(gf_acc_s, 0.0, 1.0)
     co = np.clip(gf_acc_o, 0.0, 1.0)
     gf_feat = np.concatenate([cs[:half_ab] * cs[half_ab:], co[:half_ab] * co[half_ab:]])
-    gf_cp_py = float(np.clip(gf_sez_cp + (float(np.dot(gf_feat, params["a_gf_w"][phase])) + float(params["a_gf_b"][phase])) * 400.0, -2500.0, 2500.0))
+    gf_skip_py = float(np.dot(gf_feat, params["a_gf_w"][phase])) + float(params["a_gf_b"][phase])
+    gf_h1 = np.clip(params["a_gf_l1_w"][phase] @ gf_feat + params["a_gf_l1_b"][phase], 0.0, 1.0) ** 2
+    gf_h2 = np.clip(params["a_gf_l2_w"][phase] @ gf_h1 + params["a_gf_l2_b"][phase], 0.0, 1.0) ** 2
+    gf_mlp_py = float(np.dot(gf_h2, params["a_gf_out_w"][phase])) + float(params["a_gf_out_b"][phase])
+    gf_cp_py = float(np.clip(gf_sez_cp + (gf_skip_py + gf_mlp_py) * 400.0, -2500.0, 2500.0))
 
     acc_s = np.sum(params["a_ft_weight"][sp_s[sp_s >= 0]], axis=0) + params["a_ft_bias"]
     acc_o = np.sum(params["a_ft_weight"][sp_o[sp_o >= 0]], axis=0) + params["a_ft_bias"]
